@@ -15,9 +15,18 @@ class Base(DeclarativeBase):
     metadata = default_metadata
 
 
+def _uses_supabase_pooler(url: str) -> bool:
+    lowered = url.lower()
+    return 'pooler.supabase.com' in lowered or ':6543' in lowered
+
+
 engine_kwargs: dict[str, object] = {'future': True}
 if settings.database_url.startswith('sqlite'):
     engine_kwargs['connect_args'] = {'check_same_thread': False}
+elif _uses_supabase_pooler(settings.database_url):
+    # Supabase pooler (PgBouncer transaction mode) is incompatible with
+    # psycopg prepared statements unless they are disabled.
+    engine_kwargs['connect_args'] = {'prepare_threshold': None}
 
 engine = create_engine(settings.database_url, **engine_kwargs)
 

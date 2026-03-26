@@ -24,6 +24,11 @@ target_metadata = Base.metadata
 version_table_name = 'alembic_version_teamtask_manager'
 
 
+def _uses_supabase_pooler(url: str) -> bool:
+    lowered = url.lower()
+    return 'pooler.supabase.com' in lowered or ':6543' in lowered
+
+
 def _version_table_ref(schema_name: str | None) -> str:
     if schema_name:
         return f'"{schema_name}"."{version_table_name}"'
@@ -61,10 +66,17 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    connect_args: dict[str, object] = {}
+    if not settings.database_url.startswith('sqlite') and _uses_supabase_pooler(settings.database_url):
+        # Supabase pooler (PgBouncer transaction mode) doesn't work well with
+        # psycopg prepared statements during migrations.
+        connect_args['prepare_threshold'] = None
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix='sqlalchemy.',
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
 
     with connectable.connect() as connection:
