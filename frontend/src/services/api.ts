@@ -14,7 +14,9 @@ import type {
   User
 } from '../types'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8010'
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL ??
+  (typeof window !== 'undefined' ? `${window.location.origin}/task-api` : 'http://localhost:8010')
 const TOKEN_STORAGE_KEY = 'team_task_token'
 
 export function getStoredToken(): string | null {
