@@ -19,7 +19,11 @@ const bulkAssigneeId = ref<string | null>(null)
 const bulkDueDate = ref('')
 
 const currentView = computed(() => store.view)
-const routeView = computed(() => (route.params.view as TaskView | undefined) ?? 'today')
+const supportedViews: TaskView[] = ['today', 'upcoming', 'inbox', 'anytime', 'review', 'logbook']
+const rawRouteView = computed(() => String(route.params.view ?? 'today').toLowerCase())
+const routeView = computed<TaskView>(() =>
+  supportedViews.includes(rawRouteView.value as TaskView) ? (rawRouteView.value as TaskView) : 'today'
+)
 
 const headingMap: Record<TaskView, string> = {
   today: 'Today',
@@ -34,6 +38,10 @@ const headingMap: Record<TaskView, string> = {
 const heading = computed(() => headingMap[currentView.value])
 
 async function syncRouteToStore() {
+  if (!supportedViews.includes(rawRouteView.value as TaskView)) {
+    await router.replace({ path: '/today' })
+    return
+  }
   if (routeView.value === 'review' && auth.user?.role !== 'admin') {
     await router.replace({ path: '/today' })
     return

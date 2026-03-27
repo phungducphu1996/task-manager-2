@@ -12,18 +12,22 @@ const routes = [
     component: LoginView
   },
   {
-    path: '/:view(today|upcoming|inbox|anytime|review|logbook)',
-    name: 'board',
-    component: TaskBoard
+    path: '/manage',
+    name: 'manage',
+    component: ManageCatalogView
   },
   {
     path: '/someday',
     redirect: '/today'
   },
   {
-    path: '/manage',
-    name: 'manage',
-    component: ManageCatalogView
+    path: '/:view',
+    name: 'board',
+    component: TaskBoard
+  },
+  {
+    path: '/:pathMatch(.*)*',
+    redirect: '/today'
   }
 ]
 
