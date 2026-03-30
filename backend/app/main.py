@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from logging import getLogger
 from re import sub
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
@@ -14,7 +15,24 @@ from sqlalchemy.orm import Session, joinedload
 from .auth import AuthError, create_access_token, decode_access_token, extract_bearer_token, verify_password
 from .config import get_settings
 from .database import Base, engine, get_db
-from .models import Shop, Subtask, Task, TaskAttachment, TaskComment, TaskStatus, TaskType, User
+from .models import (
+    NotificationDelivery,
+    NotificationEvent,
+    Shop,
+    Subtask,
+    Task,
+    TaskAttachment,
+    TaskComment,
+    TaskStatus,
+    TaskType,
+    User,
+)
+from .notifications import (
+    enqueue_task_created_notifications,
+    enqueue_task_status_transition_notifications,
+    is_internal_token_valid,
+    run_daily_notification_job,
+)
 from .schemas import (
     LoginRequest,
     LoginResponse,
@@ -109,6 +127,53 @@ def _attachment_out(attachment: TaskAttachment) -> TaskAttachmentOut:
 
 def _forbidden(message: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=message)
+
+
+def _trigger_task_created_notification(db: Session, task: Task) -> None:
+    try:
+        enqueue_task_created_notifications(db, task)
+    except Exception as exc:  # pragma: no cover - defensive guard for notification side effects
+        db.rollback()
+        logger.warning('Failed to enqueue/deliver task-created notification for task_id=%s: %s', task.id, exc)
+
+
+def _trigger_status_transition_notifications(
+    db: Session,
+    *,
+    task: Task,
+    previous_status: TaskStatus,
+    actor: User,
+) -> None:
+    try:
+        enqueue_task_status_transition_notifications(
+            db,
+            task=task,
+            previous_status=previous_status,
+            actor=actor,
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard for notification side effects
+        db.rollback()
+        logger.warning(
+            'Failed to enqueue/deliver task-status notifications for task_id=%s (%s -> %s): %s',
+            task.id,
+            previous_status.value,
+            task.status.value,
+            exc,
+        )
+
+
+def require_internal_token(
+    x_internal_token: str | None = Header(default=None, alias='X-Internal-Token'),
+) -> None:
+    if not settings.notify_internal_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Internal notification token is not configured.',
+        )
+    if not x_internal_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Missing X-Internal-Token.')
+    if not is_internal_token_valid(x_internal_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Invalid internal token.')
 
 
 def get_actor(
@@ -247,7 +312,16 @@ def on_startup() -> None:
                 connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'))
 
         inspector = inspect(engine)
-        required_tables = ['shops', 'task_types', 'tasks', 'subtasks', 'task_comments', 'task_attachments']
+        required_tables = [
+            'shops',
+            'task_types',
+            'tasks',
+            'subtasks',
+            'task_comments',
+            'task_attachments',
+            'notification_events',
+            'notification_deliveries',
+        ]
         if any(not inspector.has_table(table, schema=schema_name) for table in required_tables):
             # Safety fallback for local/dev environments where migrations are not yet aligned.
             Base.metadata.create_all(
@@ -259,6 +333,8 @@ def on_startup() -> None:
                     Subtask.__table__,
                     TaskComment.__table__,
                     TaskAttachment.__table__,
+                    NotificationEvent.__table__,
+                    NotificationDelivery.__table__,
                 ],
             )
 
@@ -306,6 +382,20 @@ def on_startup() -> None:
                 with engine.begin() as connection:
                     connection.execute(text(f'ALTER TABLE {target} ADD COLUMN parent_task_id INTEGER NULL'))
 
+        # Compatibility shim: old notification_events may have user_id as UUID
+        # while we now map social user IDs as VARCHAR.
+        if inspector.has_table('notification_events', schema=schema_name):
+            notif_columns = {
+                column['name']: column for column in inspector.get_columns('notification_events', schema=schema_name)
+            }
+            user_id_column = notif_columns.get('user_id')
+            if user_id_column and 'uuid' in str(user_id_column['type']).lower():
+                target = f'"{schema_name}"."notification_events"' if schema_name else '"notification_events"'
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(f'ALTER TABLE {target} ALTER COLUMN user_id TYPE VARCHAR(64) USING user_id::text')
+                    )
+
         with Session(engine) as db:
             seed_reference_data(db)
 
@@ -320,6 +410,22 @@ def on_startup() -> None:
 @app.get('/health')
 def healthcheck() -> dict[str, str]:
     return {'status': 'ok'}
+
+
+@app.post('/internal/notifications/run')
+def run_internal_notifications_job(
+    job: Literal['morning', 'evening'] = Query(...),
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return run_daily_notification_job(db, job=job)
+    except Exception as exc:
+        logger.exception('Internal notification job failed: job=%s', job)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Notification job failed: {exc}',
+        ) from exc
 
 
 @app.post('/auth/login', response_model=LoginResponse)
@@ -605,6 +711,8 @@ def create_task(
     full_task = get_task_or_404(db, task.id)
     if not full_task:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Unable to load created task.')
+
+    _trigger_task_created_notification(db, full_task)
     return full_task
 
 
@@ -629,6 +737,8 @@ def update_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
 
     update_values = _apply_role_on_update(task, payload.model_dump(exclude_unset=True), actor)
+    previous_status = task.status
+    status_changed = 'status' in update_values and update_values['status'] != previous_status
     for field, value in update_values.items():
         setattr(task, field, value)
 
@@ -636,6 +746,13 @@ def update_task(
     full_task = get_task_or_404(db, task_id)
     if not full_task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
+    if status_changed:
+        _trigger_status_transition_notifications(
+            db,
+            task=full_task,
+            previous_status=previous_status,
+            actor=actor,
+        )
     return full_task
 
 
@@ -652,12 +769,20 @@ def update_task_status(
 
     _ensure_task_access(task, actor)
     _validate_status_transition(task, payload.status, actor)
+    previous_status = task.status
     task.status = payload.status
     db.commit()
 
     full_task = get_task_or_404(db, task_id)
     if not full_task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
+    if previous_status != full_task.status:
+        _trigger_status_transition_notifications(
+            db,
+            task=full_task,
+            previous_status=previous_status,
+            actor=actor,
+        )
     return full_task
 
 

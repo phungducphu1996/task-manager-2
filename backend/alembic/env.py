@@ -9,7 +9,7 @@ from sqlalchemy import engine_from_config, pool, text
 
 from app.config import get_settings
 from app.database import Base
-from app.models import Shop, Subtask, Task, TaskType, User  # noqa: F401
+from app.models import NotificationDelivery, NotificationEvent, Shop, Subtask, Task, TaskType, User  # noqa: F401
 
 config = context.config
 settings = get_settings()

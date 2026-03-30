@@ -28,6 +28,18 @@ class TaskPriority(str, enum.Enum):
     urgent = 'urgent'
 
 
+class NotificationChannel(str, enum.Enum):
+    user = 'user'
+    group = 'group'
+
+
+class NotificationStatus(str, enum.Enum):
+    pending = 'pending'
+    sent = 'sent'
+    failed = 'failed'
+    skipped = 'skipped'
+
+
 class User(Base):
     __tablename__ = 'users'
     __table_args__ = {'schema': social_user_schema} if social_user_schema else {}
@@ -192,3 +204,63 @@ class TaskAttachment(Base):
         primaryjoin=lambda: cast(foreign(TaskAttachment.uploaded_by), String(64)) == User.id,
         viewonly=True,
     )
+
+
+class NotificationEvent(Base):
+    __tablename__ = 'notification_events'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    channel: Mapped[NotificationChannel] = mapped_column(
+        Enum(NotificationChannel, name='notification_channel', native_enum=False, validate_strings=True),
+        nullable=False,
+    )
+    target_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey('tasks.id', ondelete='SET NULL'), nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[NotificationStatus] = mapped_column(
+        Enum(NotificationStatus, name='notification_status', native_enum=False, validate_strings=True),
+        nullable=False,
+        default=NotificationStatus.pending,
+        index=True,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    task: Mapped[Task | None] = relationship('Task')
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(NotificationEvent.user_id) == User.id,
+        viewonly=True,
+    )
+    deliveries: Mapped[list[NotificationDelivery]] = relationship(
+        'NotificationDelivery',
+        back_populates='event',
+        cascade='all, delete-orphan',
+        order_by='NotificationDelivery.attempt.asc(), NotificationDelivery.id.asc()',
+    )
+
+
+class NotificationDelivery(Base):
+    __tablename__ = 'notification_deliveries'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey('notification_events.id', ondelete='CASCADE'), nullable=False, index=True
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    event: Mapped[NotificationEvent] = relationship('NotificationEvent', back_populates='deliveries')

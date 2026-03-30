@@ -11,6 +11,10 @@ os.environ['DB_SCHEMA'] = ''
 os.environ['SUPABASE_URL'] = ''
 os.environ['SUPABASE_SERVICE_ROLE_KEY'] = ''
 os.environ['SUPABASE_STORAGE_BUCKET'] = ''
+os.environ['NOTIFY_INTERNAL_TOKEN'] = 'test-internal-token'
+os.environ['ZALO_WORKER_URL'] = 'http://worker.local/notify'
+os.environ['ZALO_WORKER_TOKEN'] = 'test-zalo-worker-token'
+os.environ['ZALO_GROUP_ID'] = 'test-zalo-group'
 
 from app.database import Base, SessionLocal, engine, get_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -30,6 +34,7 @@ def clean_database() -> None:
                     id=str(uuid4()),
                     username='linh',
                     full_name='Linh',
+                    zalo_user_id='zalo-linh',
                     password_hash='linh123',
                     role='designer',
                     is_active=True,
@@ -38,6 +43,7 @@ def clean_database() -> None:
                     id=str(uuid4()),
                     username='quang',
                     full_name='Quang',
+                    zalo_user_id='zalo-quang',
                     password_hash='quang123',
                     role='content',
                     is_active=True,
@@ -46,6 +52,7 @@ def clean_database() -> None:
                     id=str(uuid4()),
                     username='trang',
                     full_name='Trang',
+                    zalo_user_id='zalo-trang',
                     password_hash='trang123',
                     role='admin',
                     is_active=True,
