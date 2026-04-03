@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from .config import get_settings
@@ -61,25 +61,18 @@ def _apply_filters(
     return stmt
 
 
+def _task_target_date(task: Task) -> date | None:
+    # Due date is canonical now; scheduled_date kept as legacy fallback.
+    return task.due_date or task.scheduled_date
+
+
 def build_task_groups(view: str, tasks: list[Task], today: date) -> list[TaskGroup]:
     if view == 'today':
-        overdue = [t for t in tasks if t.due_date and t.due_date < today]
-        current = [
-            t
-            for t in tasks
-            if not (t.due_date and t.due_date < today)
-            and ((t.scheduled_date == today) or (t.due_date == today) or (t.scheduled_date is None and t.due_date is None))
-        ]
-        future = [
-            t
-            for t in tasks
-            if not (t.due_date and t.due_date < today)
-            and ((t.scheduled_date and t.scheduled_date > today) or (t.due_date and t.due_date > today))
-        ]
+        current = [t for t in tasks if _task_target_date(t) == today]
+        overdue = [t for t in tasks if _task_target_date(t) and _task_target_date(t) < today]
         return [
             TaskGroup(key='today', title='Today', tasks=current),
             TaskGroup(key='overdue', title='Overdue', tasks=overdue),
-            TaskGroup(key='future', title='Future', tasks=future),
         ]
 
     if view == 'upcoming':
@@ -95,31 +88,33 @@ def build_task_groups(view: str, tasks: list[Task], today: date) -> list[TaskGro
         ]
 
     if view == 'inbox':
-        overdue: list[Task] = []
         today_bucket: list[Task] = []
-        review_bucket: list[Task] = []
+        overdue: list[Task] = []
+        future_bucket: list[Task] = []
         inbox_bucket: list[Task] = []
 
         for task in tasks:
-            if task.due_date and task.due_date < today:
-                overdue.append(task)
-                continue
+            target_date = _task_target_date(task)
 
-            if task.scheduled_date == today or task.due_date == today:
+            if target_date == today:
                 today_bucket.append(task)
                 continue
 
-            if task.status == TaskStatus.review:
-                review_bucket.append(task)
+            if target_date and target_date < today:
+                overdue.append(task)
+                continue
+
+            if target_date and target_date > today:
+                future_bucket.append(task)
                 continue
 
             inbox_bucket.append(task)
 
         return [
-            TaskGroup(key='overdue', title='Overdue', tasks=overdue),
             TaskGroup(key='today', title='Today', tasks=today_bucket),
-            TaskGroup(key='review', title='Review', tasks=review_bucket),
-            TaskGroup(key='inbox', title='Inbox', tasks=inbox_bucket),
+            TaskGroup(key='overdue', title='Overdue', tasks=overdue),
+            TaskGroup(key='future', title='Future', tasks=future_bucket),
+            TaskGroup(key='anytime', title='Anytime', tasks=inbox_bucket),
         ]
 
     if view == 'anytime':
@@ -147,6 +142,7 @@ def list_tasks(
     type_id: int | None = None,
 ) -> TaskListResponse:
     today = local_today()
+    target_date_expr = func.coalesce(Task.due_date, Task.scheduled_date)
 
     if view == 'logbook':
         stmt = _base_task_stmt().where(Task.status == TaskStatus.done)
@@ -155,28 +151,16 @@ def list_tasks(
         stmt = _base_task_stmt().where(Task.status != TaskStatus.done)
 
     if view == 'today':
-        stmt = stmt.where(
-            or_(
-                Task.assigned_to.is_not(None),
-                Task.scheduled_date == today,
-                Task.due_date <= today,
-                Task.scheduled_date > today,
-            )
-        )
+        stmt = stmt.where(and_(target_date_expr.is_not(None), target_date_expr <= today))
     elif view == 'upcoming':
-        stmt = stmt.where(or_(Task.scheduled_date > today, Task.due_date > today))
+        stmt = stmt.where(target_date_expr > today)
     elif view == 'inbox':
-        stmt = stmt.where(
-            or_(
-                Task.assigned_to.is_(None),
-                func.date(Task.created_at) == today,
-            )
-        )
+        # Inbox now includes all actionable buckets: today, overdue, future, and anytime.
+        pass
     elif view == 'anytime':
         stmt = stmt.where(
             and_(
-                Task.scheduled_date.is_(None),
-                Task.due_date.is_(None),
+                target_date_expr.is_(None),
                 Task.is_someday.is_(False),
             )
         )

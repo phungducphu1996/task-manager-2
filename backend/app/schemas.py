@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date as dt_date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 from .models import TaskPriority, TaskStatus
 
@@ -115,6 +115,11 @@ class TaskAttachmentOut(BaseModel):
     is_image: bool
     created_at: datetime
     uploader: UserOut | None = None
+
+
+class TaskAttachmentLinkCreate(BaseModel):
+    url: HttpUrl
+    name: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class TaskBase(BaseModel):

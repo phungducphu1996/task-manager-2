@@ -154,6 +154,14 @@ export const api = {
     form.set('file', payload.file)
     return request<TaskAttachment>(`/tasks/${taskId}/attachments`, { method: 'POST', body: form, actorId })
   },
+  createTaskAttachmentLink: (
+    taskId: number,
+    payload: {
+      url: string
+      name?: string | null
+    },
+    actorId: string | null
+  ) => request<TaskAttachment>(`/tasks/${taskId}/attachments/link`, { method: 'POST', body: JSON.stringify(payload), actorId }),
   deleteTaskAttachment: (taskId: number, attachmentId: number, actorId: string | null) =>
     request<void>(`/tasks/${taskId}/attachments/${attachmentId}`, { method: 'DELETE', actorId })
 }

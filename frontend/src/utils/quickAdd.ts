@@ -27,7 +27,7 @@ export interface QuickAddAnalysis {
   suggestions: QuickAddSuggestion[]
 }
 
-const PRIORITY_VALUES: TaskPriority[] = ['low', 'medium', 'high', 'urgent']
+const PRIORITY_VALUES: TaskPriority[] = ['low', 'medium', 'high']
 
 interface TokenMatchState {
   shop: Shop | null

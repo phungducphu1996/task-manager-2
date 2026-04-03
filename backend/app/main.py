@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 from logging import getLogger
+from os.path import basename
 from re import sub
 from typing import Any, Literal
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
@@ -43,6 +45,7 @@ from .schemas import (
     SubtaskOut,
     SubtaskUpdate,
     TaskAttachmentOut,
+    TaskAttachmentLinkCreate,
     TaskCommentCreate,
     TaskCommentOut,
     TaskConvertRequest,
@@ -96,6 +99,31 @@ def _build_storage_path(task_id: int, original_name: str) -> str:
 
 def _build_data_url(mime_type: str, content: bytes) -> str:
     return f'data:{mime_type};base64,{base64.b64encode(content).decode("ascii")}'
+
+
+def _default_link_attachment_name(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    path_name = unquote(basename(parsed.path or '')).strip()
+    if path_name:
+        return _safe_filename(path_name)
+    host_name = (parsed.netloc or '').strip()
+    if host_name:
+        return host_name
+    return 'Link'
+
+
+def _normalize_type_prefix(type_name: str) -> str:
+    cleaned = ' '.join(type_name.split()).strip()
+    return f'[{cleaned}]'
+
+
+def _auto_prefix_title_for_type(title: str, task_type: TaskType | None) -> str:
+    if not task_type or not title:
+        return title
+    prefix = _normalize_type_prefix(task_type.name)
+    if title.lower().startswith(prefix.lower()):
+        return title
+    return f'{prefix} {title}'
 
 
 def _resolve_attachment_url(attachment: TaskAttachment) -> str:
@@ -700,6 +728,13 @@ def create_task(
     actor: User = Depends(get_actor),
 ) -> Task:
     values = _apply_role_on_create(payload.model_dump(), actor)
+    values['title'] = values.get('title', '').strip()
+    if not values['title']:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Task title cannot be empty.')
+    task_type_id = values.get('type_id')
+    if task_type_id is not None:
+        task_type = db.get(TaskType, task_type_id)
+        values['title'] = _auto_prefix_title_for_type(values['title'], task_type)
     if values.get('list_order') is None:
         values['list_order'] = next_list_order(db)
 
@@ -1129,6 +1164,42 @@ def create_task_attachment(
         data_url=data_url,
         storage_path=storage_path,
         is_image=is_image,
+    )
+    db.add(attachment)
+    db.commit()
+
+    stmt = select(TaskAttachment).where(TaskAttachment.id == attachment.id).options(joinedload(TaskAttachment.uploader))
+    created = db.scalar(stmt)
+    if not created:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Unable to load created attachment.'
+        )
+    return _attachment_out(created)
+
+
+@app.post('/tasks/{task_id}/attachments/link', response_model=TaskAttachmentOut, status_code=status.HTTP_201_CREATED)
+def create_task_attachment_link(
+    task_id: int,
+    payload: TaskAttachmentLinkCreate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> TaskAttachmentOut:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
+    _ensure_task_access(task, actor)
+
+    name = (payload.name or '').strip() or _default_link_attachment_name(str(payload.url))
+
+    attachment = TaskAttachment(
+        task_id=task_id,
+        uploaded_by=actor.id,
+        name=name,
+        mime_type='text/uri-list',
+        size_bytes=0,
+        data_url=str(payload.url),
+        storage_path=None,
+        is_image=False,
     )
     db.add(attachment)
     db.commit()

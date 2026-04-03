@@ -16,6 +16,9 @@ import type {
 
 const MAX_ATTACHMENT_MB = 50
 const MAX_ATTACHMENT_BYTES = MAX_ATTACHMENT_MB * 1024 * 1024
+const SHOW_COMMENTS = false
+const SHOW_CHECKLIST = false
+const SHOW_NOTES = false
 
 const props = defineProps<{
   task: Task | null
@@ -63,6 +66,11 @@ const attachments = ref<TaskAttachment[]>([])
 const commentDraft = ref('')
 const commentInputRef = ref<HTMLTextAreaElement | null>(null)
 const attachmentInputRef = ref<HTMLInputElement | null>(null)
+const linkUrlInputRef = ref<HTMLInputElement | null>(null)
+const showLinkComposer = ref(false)
+const linkUrlDraft = ref('')
+const linkNameDraft = ref('')
+const isAddingLink = ref(false)
 const mentionState = ref<{ start: number; end: number; query: string } | null>(null)
 const isAttachmentDragOver = ref(false)
 const attachmentError = ref<string | null>(null)
@@ -131,6 +139,85 @@ const mentionSuggestions = computed(() => {
     .slice(0, 6)
 })
 
+function normalizeTitleTag(raw: string): string {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+  const stripped = trimmed
+    .replace(/^[^\p{L}\p{N}]+/gu, '')
+    .replace(/[^\p{L}\p{N}]+$/gu, '')
+    .trim()
+  return stripped || trimmed
+}
+
+function lowerTag(value: string): string {
+  return normalizeTitleTag(value).toLocaleLowerCase()
+}
+
+function tagEquals(left: string, right: string): boolean {
+  return lowerTag(left) === lowerTag(right)
+}
+
+function splitTitleTags(rawTitle: string): { tags: string[]; body: string } {
+  const match = rawTitle.match(/^\s*(?:\[[^\]]+\]\s*)+/u)
+  if (!match) {
+    return { tags: [], body: rawTitle.trim() }
+  }
+
+  const tagTokens = match[0].match(/\[[^\]]+\]/g) ?? []
+  const tags = tagTokens
+    .map((item) => normalizeTitleTag(item.slice(1, -1)))
+    .filter(Boolean)
+  const body = rawTitle.slice(match[0].length).trim()
+  return { tags, body }
+}
+
+function managedTagUniverse(): Set<string> {
+  const known = new Set<string>()
+  props.taskTypes.forEach((item) => {
+    const normalized = lowerTag(item.name)
+    if (normalized) known.add(normalized)
+  })
+  props.shops.forEach((item) => {
+    const normalized = lowerTag(item.name)
+    if (normalized) known.add(normalized)
+  })
+  return known
+}
+
+function syncManagedTitleTags() {
+  const currentTitle = form.title.trim()
+  if (!currentTitle) return
+
+  const selectedType = props.taskTypes.find((item) => item.id === form.type_id)?.name ?? null
+  const selectedShop = props.shops.find((item) => item.id === form.shop_id)?.name ?? null
+  const managedWantedRaw = [selectedType, selectedShop]
+    .map((item) => normalizeTitleTag(item ?? ''))
+    .filter(Boolean)
+
+  const managedWanted: string[] = []
+  for (const item of managedWantedRaw) {
+    if (!managedWanted.some((existing) => tagEquals(existing, item))) {
+      managedWanted.push(item)
+    }
+  }
+
+  const knownManaged = managedTagUniverse()
+  const { tags, body } = splitTitleTags(currentTitle)
+  const preservedManual = tags.filter((tag) => !knownManaged.has(lowerTag(tag)))
+  const finalTags = [...managedWanted, ...preservedManual]
+
+  const rebuilt = `${finalTags.map((tag) => `[${tag}]`).join(' ')}${body ? ` ${body}` : ''}`.trim()
+  form.title = rebuilt || body
+}
+
+function onTypeChanged() {
+  syncManagedTitleTags()
+}
+
+function onShopChanged() {
+  syncManagedTitleTags()
+}
+
 function dedupeComments(list: TaskComment[]): TaskComment[] {
   if (list.length <= 1) return list
 
@@ -162,21 +249,15 @@ async function loadTaskSideData(taskId: number): Promise<void> {
 
   const currentSeq = ++sideLoadSeq
   loadingSecondary.value = true
-  commentError.value = null
   attachmentError.value = null
 
   try {
-    const [fetchedComments, fetchedAttachments] = await Promise.all([
-      api.getTaskComments(taskId, props.currentUserId),
-      api.getTaskAttachments(taskId, props.currentUserId)
-    ])
+    const fetchedAttachments = await api.getTaskAttachments(taskId, props.currentUserId)
     if (currentSeq !== sideLoadSeq) return
-    comments.value = dedupeComments(fetchedComments)
     attachments.value = fetchedAttachments
   } catch (error) {
     if (currentSeq !== sideLoadSeq) return
-    const message = error instanceof Error ? error.message : 'Failed to load comments and attachments.'
-    commentError.value = message
+    const message = error instanceof Error ? error.message : 'Failed to load attachments.'
     attachmentError.value = message
   } finally {
     if (currentSeq !== sideLoadSeq) return
@@ -198,6 +279,10 @@ function payloadFromForm(): Partial<TaskPayload> {
     notes: form.notes || null,
     is_someday: false
   }
+}
+
+function normalizePriorityForUi(priority: TaskPriority): TaskPriority {
+  return priority === 'urgent' ? 'high' : priority
 }
 
 function payloadFromTask(task: Task): Partial<TaskPayload> {
@@ -619,6 +704,54 @@ function openAttachmentPicker() {
   attachmentInputRef.value?.click()
 }
 
+function openLinkComposer() {
+  showLinkComposer.value = true
+  setTimeout(() => {
+    linkUrlInputRef.value?.focus()
+  }, 0)
+}
+
+function closeLinkComposer() {
+  showLinkComposer.value = false
+  linkUrlDraft.value = ''
+  linkNameDraft.value = ''
+}
+
+async function addLinkAttachment() {
+  if (!props.currentUserId) {
+    attachmentError.value = 'Select an active member before adding a link.'
+    return
+  }
+  if (!props.task || isAddingLink.value || isUploadingAttachment.value) return
+
+  const url = linkUrlDraft.value.trim()
+  const name = linkNameDraft.value.trim()
+  if (!url) return
+  if (!/^https?:\/\//i.test(url)) {
+    attachmentError.value = 'Link must start with http:// or https://.'
+    return
+  }
+
+  attachmentError.value = null
+  isAddingLink.value = true
+  try {
+    const created = await api.createTaskAttachmentLink(
+      props.task.id,
+      {
+        url,
+        name: name || null,
+      },
+      props.currentUserId,
+    )
+    attachments.value.unshift(created)
+    closeLinkComposer()
+  } catch (error) {
+    attachmentError.value = error instanceof Error ? error.message : 'Failed to add link attachment.'
+  } finally {
+    isAddingLink.value = false
+  }
+}
+
 function onAttachmentInput(event: Event) {
   const input = event.target as HTMLInputElement
   const files = Array.from(input.files ?? [])
@@ -667,6 +800,21 @@ function onAttachmentPaste(event: ClipboardEvent) {
   void addAttachments(files)
 }
 
+function isLinkAttachment(attachment: TaskAttachment): boolean {
+  return attachment.mime_type === 'text/uri-list'
+}
+
+function attachmentMeta(attachment: TaskAttachment): string {
+  if (!isLinkAttachment(attachment)) {
+    return formatFileSize(attachment.size_bytes)
+  }
+  try {
+    return new URL(attachment.data_url).host
+  } catch {
+    return attachment.data_url
+  }
+}
+
 function syncSubtaskDraftsFromTask(task: Task) {
   const nextIds = new Set(task.subtasks.map((subtask) => subtask.id))
   Object.keys(subtaskDrafts).forEach((key) => {
@@ -689,7 +837,7 @@ function hydrateForm(task: Task) {
   form.shop_id = task.shop_id
   form.type_id = task.type_id
   form.due_date = task.due_date ?? ''
-  form.priority = task.priority
+  form.priority = normalizePriorityForUi(task.priority)
   form.notes = task.notes ?? ''
   syncSubtaskDraftsFromTask(task)
   lastSavedSerialized.value = JSON.stringify(payloadFromTask(task))
@@ -960,7 +1108,7 @@ onBeforeUnmount(() => {
 
           <label>
             Shop
-            <select v-model.number="form.shop_id">
+            <select v-model.number="form.shop_id" @change="onShopChanged">
               <option :value="null">None</option>
               <option v-for="shop in props.shops" :key="shop.id" :value="shop.id">{{ shop.name }}</option>
             </select>
@@ -968,7 +1116,7 @@ onBeforeUnmount(() => {
 
           <label>
             Type
-            <select v-model.number="form.type_id">
+            <select v-model.number="form.type_id" @change="onTypeChanged">
               <option :value="null">None</option>
               <option v-for="taskType in props.taskTypes" :key="taskType.id" :value="taskType.id">{{ taskType.name }}</option>
             </select>
@@ -981,23 +1129,22 @@ onBeforeUnmount(() => {
 
           <label>
             Priority
-            <select v-model="form.priority">
+            <select v-model="form.priority" class="priority-select" :class="`priority-${form.priority}`">
               <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high">high</option>
-              <option value="urgent">urgent</option>
             </select>
           </label>
 
         </div>
 
-        <label>
+        <label v-if="SHOW_NOTES">
           Notes
           <textarea v-model="form.notes" rows="3" />
         </label>
       </div>
 
-      <section class="checklist">
+      <section v-if="SHOW_CHECKLIST" class="checklist">
         <h3>Checklist</h3>
 
         <ul>
@@ -1023,7 +1170,7 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section class="detail-secondary comments-section">
+      <section v-if="SHOW_COMMENTS" class="detail-secondary comments-section">
         <h3>Comments</h3>
 
         <div class="comment-compose">
@@ -1105,20 +1252,68 @@ onBeforeUnmount(() => {
           </p>
         </div>
 
+        <div class="attachment-actions">
+          <button
+            v-if="!showLinkComposer"
+            class="link-btn"
+            :disabled="isAddingLink || isUploadingAttachment || loadingSecondary"
+            @click="openLinkComposer"
+          >
+            Add link
+          </button>
+
+          <div v-else class="attachment-link-form">
+            <input
+              ref="linkUrlInputRef"
+              v-model="linkUrlDraft"
+              class="attachment-link-url"
+              type="url"
+              placeholder="https://example.com"
+              :disabled="isAddingLink || isUploadingAttachment || loadingSecondary"
+              @keyup.enter.prevent="addLinkAttachment"
+            />
+            <input
+              v-model="linkNameDraft"
+              type="text"
+              placeholder="Label (optional)"
+              :disabled="isAddingLink || isUploadingAttachment || loadingSecondary"
+              @keyup.enter.prevent="addLinkAttachment"
+            />
+            <button
+              class="primary-btn"
+              type="button"
+              :disabled="!linkUrlDraft.trim() || isAddingLink || isUploadingAttachment || loadingSecondary"
+              @click="addLinkAttachment"
+            >
+              {{ isAddingLink ? 'Adding…' : 'Save link' }}
+            </button>
+            <button class="ghost-btn" type="button" :disabled="isAddingLink" @click="closeLinkComposer">Cancel</button>
+          </div>
+        </div>
+
         <p v-if="attachmentError" class="attachment-error">{{ attachmentError }}</p>
-        <p v-if="isUploadingAttachment" class="secondary-empty">Uploading…</p>
+        <p v-if="isUploadingAttachment || isAddingLink" class="secondary-empty">
+          {{ isAddingLink ? 'Adding link…' : 'Uploading…' }}
+        </p>
         <p v-if="loadingSecondary" class="secondary-empty">Loading attachments…</p>
 
         <ul v-if="!loadingSecondary && attachments.length > 0" class="attachment-grid">
           <li v-for="attachment in attachments" :key="attachment.id" class="attachment-item">
-            <a class="attachment-card" :href="attachment.data_url" :download="attachment.name" target="_blank" rel="noreferrer">
+            <a
+              class="attachment-card"
+              :class="{ link: isLinkAttachment(attachment) }"
+              :href="attachment.data_url"
+              :download="isLinkAttachment(attachment) ? undefined : attachment.name"
+              target="_blank"
+              rel="noreferrer noopener"
+            >
               <div class="attachment-thumb">
                 <img v-if="attachment.is_image" :src="attachment.data_url" :alt="attachment.name" />
-                <span v-else>FILE</span>
+                <span v-else>{{ isLinkAttachment(attachment) ? 'LINK' : 'FILE' }}</span>
               </div>
               <div class="attachment-info">
                 <strong>{{ attachment.name }}</strong>
-                <small>{{ formatFileSize(attachment.size_bytes) }}</small>
+                <small>{{ attachmentMeta(attachment) }}</small>
               </div>
             </a>
             <button class="attachment-remove" @click="removeAttachment(attachment.id)">×</button>

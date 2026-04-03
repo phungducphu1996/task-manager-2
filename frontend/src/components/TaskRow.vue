@@ -40,6 +40,13 @@ function isOverdue(task: Task): boolean {
   return task.due_date < todayIso
 }
 
+function isDueTodayOrOverdue(task: Task): boolean {
+  if (!task.due_date) return false
+  const today = new Date()
+  const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+  return task.due_date <= todayIso
+}
+
 function formatDueDate(raw: string | null): string {
   if (!raw) return 'Anytime'
   const [y, m, d] = raw.split('-').map(Number)
@@ -95,7 +102,8 @@ function avatarInitial(name: string): string {
       checked: props.checked,
       done: props.task.status === 'done',
       overdue: isOverdue(props.task),
-      'upcoming-view': props.view === 'upcoming'
+      'upcoming-view': props.view === 'upcoming',
+      [`priority-${props.task.priority}`]: true,
     }"
     @click="emit('select', props.task)"
     @dragover.prevent
@@ -120,7 +128,12 @@ function avatarInitial(name: string): string {
         <span v-if="props.view !== 'upcoming'" class="status-chip" :class="`status-${props.task.status}`">{{ statusLabel(props.task) }}</span>
       </div>
       <div class="task-meta-row">
-        <span v-for="entry in metaEntries(props.task)" :key="entry.key" class="meta-item">
+        <span
+          v-for="entry in metaEntries(props.task)"
+          :key="entry.key"
+          class="meta-item"
+          :class="{ 'meta-date-highlight': entry.key === 'date' && props.view === 'today' && isDueTodayOrOverdue(props.task) }"
+        >
           <span v-if="entry.key === 'assignee'" class="meta-avatar" aria-hidden="true">
             <img
               v-if="props.task.assignee?.avatar_url"
