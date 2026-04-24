@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
+from .bot_files import persona_text, profile_text
 from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
 from .config import get_settings
 from .bot_copilot import handle_zalo_chat
@@ -504,7 +505,8 @@ def _tool_specs() -> list[dict[str, Any]]:
 
 def _tool_system_prompt(actor: User) -> str:
     return (
-        'Bạn là trợ lý Zalo cho Task Manager. '
+        f'{persona_text()}\n\n'
+        'Bạn đang ở nhánh tool-calling của trợ lý Zalo cho Task Manager. '
         'Bạn có quyền dùng tools để tìm task, list task, tạo task, và approve task. '
         'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
@@ -518,6 +520,7 @@ def _tool_system_prompt(actor: User) -> str:
 def _tool_user_prompt(*, actor: User, text: str) -> str:
     return (
         f'Actor: {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n'
+        f'Profile markdown:\n{profile_text(actor)}\n\n'
         f'Message: {text}\n'
         'Nếu đây chỉ là chat thông thường, trả lời trực tiếp không cần tool. '
         'Nếu đây là thao tác task, hãy dùng tool phù hợp trước rồi mới trả lời.'

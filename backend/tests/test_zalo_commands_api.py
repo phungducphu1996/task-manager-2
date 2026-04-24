@@ -264,6 +264,46 @@ def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch
     assert 'approve task Bluey Collection' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_uses_shared_persona_and_profile(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+    settings = get_settings()
+    persona_path = Path(settings.resolve_runtime_path(settings.bot_persona_path))
+    persona_path.parent.mkdir(parents=True, exist_ok=True)
+    persona_path.write_text('# Custom Persona\nLuôn gọi user là bạn nhé.', encoding='utf-8')
+
+    captured: dict[str, list[dict]] = {}
+
+    def _fake_complete_bot_conversation(*, messages, tools, temperature):
+        captured['messages'] = messages
+        return _tool_response('Chào bạn, mình đã hiểu yêu cầu rồi.')
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', _fake_complete_bot_conversation)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'em ơi',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': linh['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-shared-persona',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'chat'
+    system_prompt = captured['messages'][0]['content']
+    user_prompt = captured['messages'][1]['content']
+    assert 'Custom Persona' in system_prompt
+    assert 'Luôn gọi user là bạn nhé.' in system_prompt
+    assert 'Profile markdown:' in user_prompt
+    assert linh['username'] in user_prompt
+    assert 'Chào bạn' in replies[-1]['message']
+
+
 def test_zalo_direct_add_without_alias_creates_task_for_sender(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     _, linh, _ = _users(client)
