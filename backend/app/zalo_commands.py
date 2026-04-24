@@ -399,9 +399,6 @@ def _parse_command(text: str, *, allow_plain_text: bool) -> ParsedZaloCommand | 
         return ParsedZaloCommand(action='list', view=view)  # type: ignore[arg-type]
 
     if action not in {'add', 'task', 'new'}:
-        natural_add = _parse_natural_add_command(body)
-        if natural_add is not None:
-            return natural_add
         return ParsedZaloCommand(action='chat', title=body)
 
     title_tokens: list[str] = []
@@ -931,6 +928,28 @@ def _handle_list_and_reply(
     return {'ok': True, 'action': 'list', 'view': view, 'reply': reply}
 
 
+def _maybe_handle_natural_add_fallback(
+    *,
+    db: Session,
+    text: str,
+    actor: User,
+    channel: NotificationChannel | None,
+    target_id: str | None,
+    record: ZaloIncomingCommand,
+) -> dict[str, Any] | None:
+    natural_add = _parse_natural_add_command(text)
+    if natural_add is None:
+        return None
+    return _handle_add_and_reply(
+        db=db,
+        parsed=natural_add,
+        actor=actor,
+        channel=channel,
+        target_id=target_id,
+        record=record,
+    )
+
+
 def _persist_command(
     db: Session,
     *,
@@ -1015,6 +1034,17 @@ def handle_zalo_incoming(
                 record.response_payload = {'message': message, 'reply': reply}
                 db.commit()
                 return {'ok': True, 'action': action, 'reply': reply}
+
+            fallback_add = _maybe_handle_natural_add_fallback(
+                db=db,
+                text=parsed.title or payload.text,
+                actor=actor,
+                channel=channel,
+                target_id=target_id,
+                record=record,
+            )
+            if fallback_add is not None:
+                return fallback_add
 
         if parsed.action == 'chat':
             chat = handle_zalo_chat(

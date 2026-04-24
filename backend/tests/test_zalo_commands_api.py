@@ -133,19 +133,25 @@ def test_zalo_llm_freeform_create_executes_task(client, db_session, monkeypatch)
     replies = _install_zalo_reply_stub(monkeypatch)
     _, linh, _ = _users(client)
 
-    monkeypatch.setattr(
-        'app.zalo_commands._run_tool_agent',
-        lambda *args, **kwargs: {
+    captured: dict[str, str] = {}
+
+    def _fake_tool_agent(*args, **kwargs):
+        captured['text'] = kwargs['text']
+        return {
             'handled': True,
             'action': 'add',
-            'message': 'Đã tạo task #1: Chuẩn bị ảnh hero',
-        },
+            'message': 'Đã tạo task #1: Nón Mario Kart',
+        }
+
+    monkeypatch.setattr(
+        'app.zalo_commands._run_tool_agent',
+        _fake_tool_agent,
     )
 
     response = client.post(
         '/zalo/incoming',
         json={
-            'text': 'Cho bot ghi nhận việc chuẩn bị ảnh hero cho ngày mai',
+            'text': 'thêm task Nón Mario Kart cho chị quỳnh anh',
             'from_uid': linh['zalo_user_id'],
             'conversation_id': linh['zalo_user_id'],
             'conversation_type': 'user',
@@ -157,7 +163,8 @@ def test_zalo_llm_freeform_create_executes_task(client, db_session, monkeypatch)
     assert response.status_code == 200
     assert response.json()['action'] == 'add'
     assert replies[-1]['channel'].value == 'user'
-    assert 'Chuẩn bị ảnh hero' in replies[-1]['message']
+    assert captured['text'] == 'thêm task Nón Mario Kart cho chị quỳnh anh'
+    assert 'Nón Mario Kart' in replies[-1]['message']
 
 
 def test_zalo_llm_freeform_create_can_ask_confirm(client, db_session, monkeypatch) -> None:
