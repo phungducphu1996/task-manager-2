@@ -341,7 +341,7 @@ def _resolve_user(db: Session, token: str | None) -> User | None:
         return None
     clean = _clean_token(token.removeprefix('@'))
     users = db.scalars(select(User).where(User.is_active.is_(True))).all()
-    return _resolve_unique_by_token(users, clean, lambda user: [user.username, user.name, user.zalo_user_id])
+    return _resolve_unique_by_token(users, clean, lambda user: [user.id, user.username, user.name, user.zalo_user_id])
 
 
 def _resolve_shop(db: Session, token: str | None) -> Shop | None:

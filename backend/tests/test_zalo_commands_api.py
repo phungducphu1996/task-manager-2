@@ -271,6 +271,51 @@ def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch
     assert 'approve task Bluey Collection' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_create_task_accepts_user_id_assignee_token(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, quang = _users(client)
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'create_task',
+                        {
+                            'title': 'Nón Mario Kart',
+                            'assignee_token': quang['id'],
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Đã tạo task Nón Mario Kart cho Quang rồi.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'em tạo task Nón Mario Kart cho chị Quỳnh Anh nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-create-user-id-assignee',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'add'
+    task = db_session.scalar(select(Task).where(Task.title == 'Nón Mario Kart'))
+    assert task is not None
+    assert task.assigned_to == quang['id']
+    assert 'Quang' in replies[-1]['message']
+
+
 def test_zalo_tool_agent_uses_shared_persona_and_profile(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     _, linh, quang = _users(client)
