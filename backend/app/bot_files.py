@@ -97,6 +97,12 @@ def profile_text(user: User) -> str:
     return path.read_text(encoding='utf-8').strip()
 
 
+def profile_summary_text(user: User, *, max_lines: int = 8) -> str:
+    content = profile_text(user)
+    lines = [line.rstrip() for line in content.splitlines() if line.strip()]
+    return '\n'.join(lines[:max_lines]).strip()
+
+
 def _insert_bullets(content: str, heading: str, bullets: Iterable[str]) -> str:
     bullet_lines = [f'- {bullet.strip()}' for bullet in bullets if bullet.strip()]
     if not bullet_lines:

@@ -266,7 +266,7 @@ def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch
 
 def test_zalo_tool_agent_uses_shared_persona_and_profile(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
-    _, linh, _ = _users(client)
+    _, linh, quang = _users(client)
     settings = get_settings()
     persona_path = Path(settings.resolve_runtime_path(settings.bot_persona_path))
     persona_path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,7 +300,9 @@ def test_zalo_tool_agent_uses_shared_persona_and_profile(client, monkeypatch) ->
     assert 'Custom Persona' in system_prompt
     assert 'Luôn gọi user là bạn nhé.' in system_prompt
     assert 'Profile markdown:' in user_prompt
+    assert 'Active user directory:' in user_prompt
     assert linh['username'] in user_prompt
+    assert quang['username'] in user_prompt
     assert 'Chào bạn' in replies[-1]['message']
 
 
@@ -525,7 +527,7 @@ def test_zalo_list_today_only_returns_member_tasks(client, db_session, monkeypat
 
 def test_zalo_chat_uses_memory_profiles_and_task_context(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
-    admin, linh, _ = _users(client)
+    admin, linh, quang = _users(client)
     today = local_today()
 
     db_session.add(
@@ -569,6 +571,8 @@ def test_zalo_chat_uses_memory_profiles_and_task_context(client, db_session, mon
     assert 'Need today summary' in captured['user']
     assert 'Profile markdown' in captured['user']
     assert 'Known memory facts' in captured['user']
+    assert 'Active user directory' in captured['user']
+    assert quang['username'] in captured['user']
     assert replies[-1]['message'].startswith('Linh ơi')
 
     stored_messages = db_session.scalars(
@@ -583,9 +587,9 @@ def test_zalo_chat_uses_memory_profiles_and_task_context(client, db_session, mon
 
     settings = get_settings()
     profile_dir = Path(settings.resolve_runtime_path(settings.bot_profiles_dir))
-    profile_files = list(profile_dir.glob('*.md'))
-    assert profile_files
-    profile_text = profile_files[0].read_text(encoding='utf-8')
+    profile_path = profile_dir / f"{linh['username']}.md"
+    assert profile_path.exists()
+    profile_text = profile_path.read_text(encoding='utf-8')
     assert 'thích trà sữa' in profile_text
 
 

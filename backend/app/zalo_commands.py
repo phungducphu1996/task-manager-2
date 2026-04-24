@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from .bot_files import persona_text, profile_text
+from .bot_files import persona_text, profile_summary_text, profile_text
 from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
 from .config import get_settings
 from .bot_copilot import handle_zalo_chat
@@ -503,6 +503,30 @@ def _tool_specs() -> list[dict[str, Any]]:
     ]
 
 
+def _active_user_directory_text(db: Session) -> str:
+    users = db.scalars(
+        select(User).where(User.is_active.is_(True)).order_by(User.full_name.asc(), User.username.asc())
+    ).all()
+    if not users:
+        return 'Không có user active nào.'
+
+    lines: list[str] = []
+    for user in users:
+        lines.append(
+            '- '
+            + ' | '.join(
+                [
+                    f'name={user.name}',
+                    f'username={user.username}',
+                    f'role={user.role or "unknown"}',
+                    f'zalo={user.zalo_user_id or "unknown"}',
+                ]
+            )
+        )
+        lines.append(f'  Profile:\n{profile_summary_text(user)}')
+    return '\n'.join(lines)
+
+
 def _tool_system_prompt(actor: User) -> str:
     return (
         f'{persona_text()}\n\n'
@@ -517,10 +541,11 @@ def _tool_system_prompt(actor: User) -> str:
     )
 
 
-def _tool_user_prompt(*, actor: User, text: str) -> str:
+def _tool_user_prompt(*, actor: User, text: str, user_directory_text: str) -> str:
     return (
         f'Actor: {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n'
         f'Profile markdown:\n{profile_text(actor)}\n\n'
+        f'Active user directory:\n{user_directory_text}\n\n'
         f'Message: {text}\n'
         'Nếu đây chỉ là chat thông thường, trả lời trực tiếp không cần tool. '
         'Nếu đây là thao tác task, hãy dùng tool phù hợp trước rồi mới trả lời.'
@@ -678,9 +703,10 @@ def _run_tool_agent(db: Session, *, actor: User, text: str) -> dict[str, Any] | 
     if not is_bot_llm_configured():
         return None
 
+    user_directory_text = _active_user_directory_text(db)
     messages: list[dict[str, Any]] = [
         {'role': 'system', 'content': _tool_system_prompt(actor)},
-        {'role': 'user', 'content': _tool_user_prompt(actor=actor, text=text)},
+        {'role': 'user', 'content': _tool_user_prompt(actor=actor, text=text, user_directory_text=user_directory_text)},
     ]
     last_tool_result: dict[str, Any] | None = None
     last_tool_name: str | None = None

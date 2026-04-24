@@ -5,7 +5,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .bot_files import append_event, ensure_bot_files, persona_text, profile_text, recent_events_text, update_profile_with_facts
+from .bot_files import (
+    append_event,
+    ensure_bot_files,
+    persona_text,
+    profile_summary_text,
+    profile_text,
+    recent_events_text,
+    update_profile_with_facts,
+)
 from .bot_llm import BotLLMError, generate_bot_reply, is_bot_llm_configured
 from .bot_memory import (
     extract_important_event,
@@ -19,6 +27,7 @@ from .config import get_settings
 from .models import NotificationChannel, User
 from .notifications import send_zalo_text
 from .services import list_tasks
+from sqlalchemy import select
 
 settings = get_settings()
 
@@ -71,6 +80,30 @@ def _task_context_text(db: Session, *, actor: User) -> str:
     return '\n\n'.join(parts)
 
 
+def _user_directory_text(db: Session) -> str:
+    users = db.scalars(
+        select(User).where(User.is_active.is_(True)).order_by(User.full_name.asc(), User.username.asc())
+    ).all()
+    if not users:
+        return 'Không có user active nào.'
+
+    blocks: list[str] = []
+    for user in users:
+        aliases = [user.name, user.username]
+        if user.zalo_user_id:
+            aliases.append(user.zalo_user_id)
+        identity = ' | '.join(
+            [
+                f'name={user.name}',
+                f'username={user.username}',
+                f'role={user.role or "unknown"}',
+                f'zalo={user.zalo_user_id or "unknown"}',
+            ]
+        )
+        blocks.append(f'- {identity}\n  Profile:\n{profile_summary_text(user)}')
+    return '\n'.join(blocks)
+
+
 def _fallback_reply(actor: User, incoming_text: str, *, task_context: str, memory_text: str) -> str:
     greeting = f'{actor.name} ơi, em nhận ra anh/chị đang hỏi em rồi nè.'
     task_block = task_context.split('\n\n', 1)[0].strip()
@@ -102,6 +135,7 @@ def _user_prompt(
     recent_conversation: str,
     events_text: str,
     task_context: str,
+    user_directory_text: str,
 ) -> str:
     return (
         f'Người đang hỏi:\n'
@@ -111,6 +145,7 @@ def _user_prompt(
         f'- Is admin: {"yes" if _is_admin(actor) else "no"}\n\n'
         f'Profile markdown:\n{profile_markdown}\n\n'
         f'Known memory facts:\n{memory_text}\n\n'
+        f'Active user directory:\n{user_directory_text}\n\n'
         f'Recent conversations:\n{recent_conversation}\n\n'
         f'Recent office events:\n{events_text}\n\n'
         f'Current task context:\n{task_context}\n\n'
@@ -184,6 +219,7 @@ def handle_zalo_chat(
 
     task_context = _task_context_text(db, actor=actor)
     profile_markdown = profile_text(actor)
+    user_directory_text = _user_directory_text(db)
     memory_text = recent_memory_text(db, user_id=actor.id)
     recent_conversation = recent_conversation_text(db, user_id=actor.id)
     events_text = recent_events_text()
@@ -198,6 +234,7 @@ def handle_zalo_chat(
                 actor=actor,
                 incoming_text=incoming_text,
                 profile_markdown=profile_markdown,
+                user_directory_text=user_directory_text,
                 memory_text=memory_text,
                 recent_conversation=recent_conversation,
                 events_text=events_text,
