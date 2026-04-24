@@ -4,17 +4,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
 import hmac
+import json
 import re
 import shlex
 from typing import Any, Callable, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from .bot_llm import BotLLMError, generate_bot_json, is_bot_llm_configured
+from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
 from .config import get_settings
 from .bot_copilot import handle_zalo_chat
 from .models import (
@@ -27,7 +28,7 @@ from .models import (
     User,
     ZaloIncomingCommand,
 )
-from .notifications import enqueue_task_created_notifications, send_zalo_text
+from .notifications import enqueue_task_created_notifications, enqueue_task_status_transition_notifications, send_zalo_text
 from .schemas import ZaloIncomingRequest
 from .services import get_task_or_404, list_tasks, local_today, next_list_order
 
@@ -45,17 +46,6 @@ class ParsedZaloCommand:
     due_token: str | None = None
     priority: TaskPriority = TaskPriority.medium
     view: Literal['today', 'inbox'] = 'today'
-
-
-@dataclass(slots=True)
-class IntentDecision:
-    intent: Literal['create_task', 'list_tasks', 'chat', 'unknown']
-    confidence: float
-    reply_mode: Literal['execute', 'confirm', 'chat']
-    reason: str = ''
-    reply_message: str | None = None
-    view: Literal['today', 'inbox'] | None = None
-
 
 def _is_admin(user: User) -> bool:
     return (user.role or '').lower() == 'admin'
@@ -440,156 +430,297 @@ def _parse_command(text: str, *, allow_plain_text: bool) -> ParsedZaloCommand | 
     return parsed
 
 
-def _llm_intent_system_prompt() -> str:
+def _tool_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            'type': 'function',
+            'function': {
+                'name': 'find_tasks',
+                'description': 'Find tasks by title, id, assignee, or review status before taking action.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'query': {'type': 'string'},
+                        'status': {'type': 'string', 'enum': ['todo', 'doing', 'review', 'ready', 'done']},
+                        'limit': {'type': 'integer', 'minimum': 1, 'maximum': 10},
+                    },
+                    'required': ['query'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'list_tasks',
+                'description': 'List tasks for the current actor in a known view.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'view': {'type': 'string', 'enum': ['today', 'inbox', 'review', 'logbook']},
+                    },
+                    'required': ['view'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'create_task',
+                'description': 'Create a new task for the actor or an allowed assignee.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'title': {'type': 'string'},
+                        'assignee_token': {'type': 'string'},
+                        'shop_token': {'type': 'string'},
+                        'type_token': {'type': 'string'},
+                        'due_token': {'type': 'string'},
+                        'priority': {'type': 'string', 'enum': ['low', 'medium', 'high']},
+                    },
+                    'required': ['title'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'approve_task',
+                'description': 'Approve a review task by moving it from review to ready. Only admins may do this.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'task_id': {'type': 'integer'},
+                    },
+                    'required': ['task_id'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+    ]
+
+
+def _tool_system_prompt(actor: User) -> str:
     return (
-        'You classify a Zalo office message into one intent. '
-        'Return strict JSON only. '
-        'Valid intents: create_task, list_tasks, chat, unknown. '
-        'Valid reply_mode: execute, confirm, chat. '
-        'Use create_task only when the user is actually asking to create/add a task, not when they are merely discussing or reminding. '
-        'Use list_tasks when they ask to see current tasks. '
-        'Use execute only when the request is explicit and safe to run without confirmation. '
-        'Use confirm when it sounds like task creation might be intended but is still ambiguous. '
-        'Use chat for general conversation, discussion, planning, reminders, or unclear cases.'
+        'Bạn là trợ lý Zalo cho Task Manager. '
+        'Bạn có quyền dùng tools để tìm task, list task, tạo task, và approve task. '
+        'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
+        'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
+        'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
+        'Nếu câu mơ hồ, không chắc, hoặc có nhiều task match, đừng tự quyết định; hãy hỏi lại ngắn gọn. '
+        f'Người dùng hiện tại: {actor.name} ({actor.username}), role={actor.role or "unknown"}. '
+        f'Admin={"yes" if _is_admin(actor) else "no"}.'
     )
 
 
-def _llm_intent_user_prompt(*, actor: User, text: str) -> str:
+def _tool_user_prompt(*, actor: User, text: str) -> str:
     return (
-        f'Actor name: {actor.name}\n'
-        f'Actor username: {actor.username}\n'
-        f'Actor role: {actor.role or "unknown"}\n'
-        f'Message: {text}\n\n'
-        'Return JSON object with keys:\n'
-        '- intent\n'
-        '- confidence (0..1)\n'
-        '- reply_mode\n'
-        '- reason\n'
-        '- reply_message\n'
-        '- view (today|inbox|null)\n'
+        f'Actor: {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n'
+        f'Message: {text}\n'
+        'Nếu đây chỉ là chat thông thường, trả lời trực tiếp không cần tool. '
+        'Nếu đây là thao tác task, hãy dùng tool phù hợp trước rồi mới trả lời.'
     )
 
 
-def _coerce_confidence(value: Any) -> float:
-    try:
-        confidence = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, confidence))
+def _tool_task_payload(task: Task) -> dict[str, Any]:
+    return {
+        'id': task.id,
+        'title': task.title,
+        'status': task.status.value,
+        'assignee': task.assignee.name if task.assignee else None,
+        'assigned_to': task.assigned_to,
+        'due_date': task.due_date.isoformat() if task.due_date else None,
+        'shop': task.shop.name if task.shop else None,
+        'type': task.task_type.name if task.task_type else None,
+    }
 
 
-def _llm_intent_decision(*, actor: User, text: str) -> IntentDecision | None:
-    if not is_bot_llm_configured():
-        return None
-    try:
-        payload = generate_bot_json(
-            system_prompt=_llm_intent_system_prompt(),
-            user_prompt=_llm_intent_user_prompt(actor=actor, text=text),
-        )
-    except BotLLMError:
-        return None
-
-    intent = str(payload.get('intent') or 'unknown').strip().lower()
-    if intent not in {'create_task', 'list_tasks', 'chat', 'unknown'}:
-        intent = 'unknown'
-    reply_mode = str(payload.get('reply_mode') or 'chat').strip().lower()
-    if reply_mode not in {'execute', 'confirm', 'chat'}:
-        reply_mode = 'chat'
-    view = str(payload.get('view') or '').strip().lower() or None
-    if view not in {'today', 'inbox', None}:
-        view = None
-    return IntentDecision(
-        intent=intent,  # type: ignore[arg-type]
-        confidence=_coerce_confidence(payload.get('confidence')),
-        reply_mode=reply_mode,  # type: ignore[arg-type]
-        reason=str(payload.get('reason') or '').strip(),
-        reply_message=str(payload.get('reply_message') or '').strip() or None,
-        view=view,  # type: ignore[arg-type]
+def _tool_find_tasks(db: Session, *, actor: User, query: str, status_token: str | None, limit: int) -> dict[str, Any]:
+    stmt = (
+        select(Task)
+        .options(joinedload(Task.assignee), joinedload(Task.shop), joinedload(Task.task_type))
+        .order_by(Task.updated_at.desc(), Task.id.desc())
     )
+    if not _is_admin(actor):
+        stmt = stmt.where(Task.assigned_to == actor.id)
+
+    normalized_query = (query or '').strip()
+    if normalized_query.startswith('#') and normalized_query[1:].isdigit():
+        stmt = stmt.where(Task.id == int(normalized_query[1:]))
+    elif normalized_query.isdigit():
+        stmt = stmt.where(Task.id == int(normalized_query))
+    else:
+        like_query = f'%{normalized_query.lower()}%'
+        stmt = stmt.where(func.lower(Task.title).like(like_query))
+
+    if status_token and status_token in {status.value for status in TaskStatus}:
+        stmt = stmt.where(Task.status == TaskStatus(status_token))
+
+    tasks = db.scalars(stmt.limit(max(1, min(limit, 10)))).unique().all()
+    return {
+        'ok': True,
+        'count': len(tasks),
+        'tasks': [_tool_task_payload(task) for task in tasks],
+    }
 
 
-def _llm_extract_system_prompt() -> str:
-    return (
-        'Extract a task payload from a Zalo office message. Return strict JSON only. '
-        'Do not invent missing data. '
-        'Priority must be one of low, medium, high. '
-        'Prefer due_token values like today, tomorrow, dd/mm, dd/mm/yyyy, yyyy-mm-dd when present.'
+def _tool_list_tasks(db: Session, *, actor: User, view: str) -> dict[str, Any]:
+    normalized_view = view if view in {'today', 'inbox', 'review', 'logbook'} else 'today'
+    result = list_tasks(
+        db,
+        normalized_view,
+        actor_id=actor.id,
+        actor_is_admin=_is_admin(actor),
     )
+    groups = [
+        {'key': group.key, 'title': group.title, 'tasks': [_tool_task_payload(task) for task in group.tasks]}
+        for group in result.groups
+    ]
+    return {'ok': True, 'view': normalized_view, 'groups': groups}
 
 
-def _llm_extract_user_prompt(
+def _tool_create_task(
+    db: Session,
     *,
     actor: User,
-    text: str,
-    users: list[User],
-    shops: list[Shop],
-    task_types: list[TaskType],
-) -> str:
-    user_lines = '\n'.join(f'- {user.name} | username={user.username} | zalo={user.zalo_user_id}' for user in users)
-    shop_lines = '\n'.join(f'- {shop.name}' for shop in shops) or '- none'
-    type_lines = '\n'.join(f'- {task_type.name}' for task_type in task_types) or '- none'
-    return (
-        f'Actor:\n- {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n\n'
-        f'Available users:\n{user_lines or "- none"}\n\n'
-        f'Available shops:\n{shop_lines}\n\n'
-        f'Available task types:\n{type_lines}\n\n'
-        f'Message:\n{text}\n\n'
-        'Return JSON object with keys:\n'
-        '- title\n'
-        '- assignee_token\n'
-        '- shop_token\n'
-        '- type_token\n'
-        '- due_token\n'
-        '- priority\n'
-        '- needs_confirmation\n'
-        '- confirmation_message\n'
-    )
-
-
-def _llm_extract_add_command(db: Session, *, actor: User, text: str) -> ParsedZaloCommand | tuple[str, None] | None:
-    if not is_bot_llm_configured():
-        return None
-    users = db.scalars(select(User).where(User.is_active.is_(True))).all()
-    shops = db.scalars(select(Shop)).all()
-    task_types = db.scalars(select(TaskType)).all()
-    try:
-        payload = generate_bot_json(
-            system_prompt=_llm_extract_system_prompt(),
-            user_prompt=_llm_extract_user_prompt(
-                actor=actor,
-                text=text,
-                users=users,
-                shops=shops,
-                task_types=task_types,
-            ),
-        )
-    except BotLLMError:
-        return None
-
-    title = str(payload.get('title') or '').strip()
-    if not title:
-        return None
-    confirmation_message = str(payload.get('confirmation_message') or '').strip() or None
-    needs_confirmation = bool(payload.get('needs_confirmation'))
-    priority_token = str(payload.get('priority') or 'medium').strip().lower()
-    if priority_token not in {'low', 'medium', 'high'}:
-        priority_token = 'medium'
+    title: str,
+    assignee_token: str | None,
+    shop_token: str | None,
+    type_token: str | None,
+    due_token: str | None,
+    priority_token: str | None,
+) -> dict[str, Any]:
+    priority_value = priority_token if priority_token in {'low', 'medium', 'high'} else 'medium'
     parsed = ParsedZaloCommand(
         action='add',
-        title=title,
-        assignee_token=str(payload.get('assignee_token') or '').strip() or None,
-        shop_token=str(payload.get('shop_token') or '').strip() or None,
-        type_token=str(payload.get('type_token') or '').strip() or None,
-        due_token=str(payload.get('due_token') or '').strip() or None,
-        priority=TaskPriority(priority_token),
+        title=title.strip(),
+        assignee_token=(assignee_token or '').strip() or None,
+        shop_token=(shop_token or '').strip() or None,
+        type_token=(type_token or '').strip() or None,
+        due_token=(due_token or '').strip() or None,
+        priority=TaskPriority(priority_value),
     )
-    if needs_confirmation:
-        return (
-            confirmation_message
-            or f'Tôi hiểu là bạn muốn tạo task "{title}", nhưng câu này còn hơi mơ hồ. Xác nhận lại giúp tôi nhé.',
-            None,
+    task = _create_zalo_task(db, parsed, actor)
+    db.commit()
+    full_task = get_task_or_404(db, task.id) or task
+    try:
+        enqueue_task_created_notifications(db, full_task)
+    except Exception:
+        db.rollback()
+    return {'ok': True, 'task': _tool_task_payload(full_task)}
+
+
+def _tool_approve_task(db: Session, *, actor: User, task_id: int) -> dict[str, Any]:
+    task = get_task_or_404(db, task_id)
+    if not task:
+        return {'ok': False, 'error': 'Task not found.'}
+    if not _is_admin(actor):
+        return {'ok': False, 'error': 'Only admins can approve review tasks.'}
+    if task.status != TaskStatus.review:
+        return {'ok': False, 'error': 'Only tasks in review can be approved to ready.'}
+    previous_status = task.status
+    task.status = TaskStatus.ready
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    try:
+        enqueue_task_status_transition_notifications(
+            db,
+            task=task,
+            previous_status=previous_status,
+            actor=actor,
         )
-    return parsed
+    except Exception:
+        db.rollback()
+    return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
+
+
+def _execute_tool_call(db: Session, *, actor: User, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        if name == 'find_tasks':
+            return _tool_find_tasks(
+                db,
+                actor=actor,
+                query=str(arguments.get('query') or ''),
+                status_token=str(arguments.get('status') or '').strip() or None,
+                limit=int(arguments.get('limit') or 5),
+            )
+        if name == 'list_tasks':
+            return _tool_list_tasks(db, actor=actor, view=str(arguments.get('view') or 'today'))
+        if name == 'create_task':
+            return _tool_create_task(
+                db,
+                actor=actor,
+                title=str(arguments.get('title') or ''),
+                assignee_token=str(arguments.get('assignee_token') or '').strip() or None,
+                shop_token=str(arguments.get('shop_token') or '').strip() or None,
+                type_token=str(arguments.get('type_token') or '').strip() or None,
+                due_token=str(arguments.get('due_token') or '').strip() or None,
+                priority_token=str(arguments.get('priority') or '').strip() or None,
+            )
+        if name == 'approve_task':
+            return _tool_approve_task(db, actor=actor, task_id=int(arguments.get('task_id')))
+    except (ValueError, TypeError) as exc:
+        return {'ok': False, 'error': str(exc)}
+    except PermissionError as exc:
+        return {'ok': False, 'error': str(exc)}
+    except HTTPException as exc:
+        return {'ok': False, 'error': str(exc.detail)}
+    return {'ok': False, 'error': f'Unknown tool: {name}'}
+
+
+def _run_tool_agent(db: Session, *, actor: User, text: str) -> dict[str, Any] | None:
+    if not is_bot_llm_configured():
+        return None
+
+    messages: list[dict[str, Any]] = [
+        {'role': 'system', 'content': _tool_system_prompt(actor)},
+        {'role': 'user', 'content': _tool_user_prompt(actor=actor, text=text)},
+    ]
+    last_tool_result: dict[str, Any] | None = None
+    last_tool_name: str | None = None
+
+    for _ in range(4):
+        try:
+            response = complete_bot_conversation(messages=messages, tools=_tool_specs(), temperature=0.2)
+        except BotLLMError:
+            return None
+
+        messages.append(response.assistant_message)
+        if not response.tool_calls:
+            final_text = response.content.strip()
+            if not final_text and last_tool_result:
+                if last_tool_result.get('ok') and 'task' in last_tool_result:
+                    task = last_tool_result['task']
+                    return {
+                        'handled': True,
+                        'action': 'add' if last_tool_result.get('previous_status') is None else 'approve',
+                        'message': f'Xong rồi. #{task["id"]} {task["title"]} hiện đang ở trạng thái {task["status"]}.',
+                    }
+                return None
+            action = 'chat'
+            if last_tool_name == 'create_task':
+                action = 'add'
+            elif last_tool_name == 'approve_task':
+                action = 'approve'
+            elif last_tool_name == 'list_tasks':
+                action = 'list'
+            return {'handled': True, 'action': action, 'message': final_text}
+
+        for tool_call in response.tool_calls:
+            last_tool_name = tool_call.name
+            result = _execute_tool_call(db, actor=actor, name=tool_call.name, arguments=tool_call.arguments)
+            last_tool_result = result
+            messages.append(
+                {
+                    'role': 'tool',
+                    'tool_call_id': tool_call.id,
+                    'content': json.dumps(result, ensure_ascii=False),
+                }
+            )
+    return None
 
 
 def _reply_to_conversation(
@@ -841,58 +972,20 @@ def handle_zalo_incoming(
 
     try:
         if parsed.action == 'chat':
-            decision = _llm_intent_decision(actor=actor, text=parsed.title or payload.text)
-            if decision and decision.intent == 'create_task':
-                if decision.reply_mode == 'confirm':
-                    message = (
-                        decision.reply_message
-                        or 'Tôi hiểu là bạn có thể muốn tạo task mới, nhưng câu này còn hơi mơ hồ. Xác nhận rõ hơn giúp tôi.'
-                    )
-                    reply = _reply_to_conversation(
-                        channel=channel,
-                        target_id=target_id,
-                        message=message,
-                        context={'source': 'zalo_command', 'command': 'confirm_add', 'message_id': payload.message_id},
-                    )
-                    record.command = 'confirm_add'
-                    record.response_payload = {'message': message, 'reply': reply, 'reason': decision.reason}
-                    db.commit()
-                    return {'ok': True, 'action': 'confirm', 'reply': reply}
-
-                if decision.reply_mode == 'execute' and decision.confidence >= 0.88:
-                    extracted = _llm_extract_add_command(db, actor=actor, text=parsed.title or payload.text)
-                    if isinstance(extracted, tuple):
-                        message, _ = extracted
-                        reply = _reply_to_conversation(
-                            channel=channel,
-                            target_id=target_id,
-                            message=message,
-                            context={'source': 'zalo_command', 'command': 'confirm_add', 'message_id': payload.message_id},
-                        )
-                        record.command = 'confirm_add'
-                        record.response_payload = {'message': message, 'reply': reply, 'reason': decision.reason}
-                        db.commit()
-                        return {'ok': True, 'action': 'confirm', 'reply': reply}
-                    if extracted is not None:
-                        return _handle_add_and_reply(
-                            db=db,
-                            parsed=extracted,
-                            actor=actor,
-                            channel=channel,
-                            target_id=target_id,
-                            record=record,
-                        )
-
-            if decision and decision.intent == 'list_tasks':
-                view = decision.view or 'today'
-                return _handle_list_and_reply(
-                    db=db,
-                    view=view,
-                    actor=actor,
+            tool_outcome = _run_tool_agent(db, actor=actor, text=parsed.title or payload.text)
+            if tool_outcome and tool_outcome.get('handled'):
+                action = str(tool_outcome.get('action') or 'chat')
+                message = str(tool_outcome.get('message') or '').strip()
+                reply = _reply_to_conversation(
                     channel=channel,
                     target_id=target_id,
-                    record=record,
+                    message=message,
+                    context={'source': 'zalo_tool_agent', 'command': action, 'message_id': payload.message_id},
                 )
+                record.command = action
+                record.response_payload = {'message': message, 'reply': reply}
+                db.commit()
+                return {'ok': True, 'action': action, 'reply': reply}
 
         if parsed.action == 'chat':
             chat = handle_zalo_chat(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from typing import Any
 
@@ -12,6 +13,20 @@ settings = get_settings()
 
 class BotLLMError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class BotLLMToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
+class BotLLMToolResponse:
+    content: str
+    tool_calls: list[BotLLMToolCall]
+    assistant_message: dict[str, Any]
 
 
 def is_bot_llm_configured() -> bool:
@@ -47,6 +62,29 @@ def generate_bot_json(*, system_prompt: str, user_prompt: str) -> dict[str, Any]
     return parsed
 
 
+def complete_bot_conversation(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    temperature: float = 0.3,
+) -> BotLLMToolResponse:
+    data = _request_llm_data(
+        messages=messages,
+        temperature=temperature,
+        tools=tools,
+    )
+    choices = data.get('choices') or []
+    if not choices:
+        raise BotLLMError('LLM returned no choices.')
+    message = choices[0].get('message') or {}
+    tool_calls = _extract_tool_calls(message)
+    return BotLLMToolResponse(
+        content=_extract_message_text_from_message(message).strip(),
+        tool_calls=tool_calls,
+        assistant_message=message,
+    )
+
+
 def _request_llm_text(
     *,
     system_prompt: str,
@@ -54,6 +92,27 @@ def _request_llm_text(
     temperature: float,
     response_format: dict[str, Any] | None = None,
 ) -> str:
+    data = _request_llm_data(
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ],
+        temperature=temperature,
+        response_format=response_format,
+    )
+    content = _extract_message_text(data)
+    if not content:
+        raise BotLLMError('LLM returned an empty response.')
+    return content.strip()
+
+
+def _request_llm_data(
+    *,
+    messages: list[dict[str, Any]],
+    temperature: float,
+    response_format: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     api_key = (settings.openai_api_key or '').strip()
     if not api_key:
         raise BotLLMError('OPENAI_API_KEY is not configured.')
@@ -63,13 +122,13 @@ def _request_llm_text(
     payload = {
         'model': settings.bot_llm_model,
         'temperature': temperature,
-        'messages': [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_prompt},
-        ],
+        'messages': messages,
     }
     if response_format:
         payload['response_format'] = response_format
+    if tools:
+        payload['tools'] = tools
+        payload['tool_choice'] = 'auto'
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
@@ -81,11 +140,7 @@ def _request_llm_text(
     except httpx.HTTPError as exc:
         raise BotLLMError(str(exc)) from exc
 
-    data = response.json()
-    content = _extract_message_text(data)
-    if not content:
-        raise BotLLMError('LLM returned an empty response.')
-    return content.strip()
+    return response.json()
 
 
 def _extract_message_text(data: dict[str, Any]) -> str:
@@ -93,6 +148,10 @@ def _extract_message_text(data: dict[str, Any]) -> str:
     if not choices:
         return ''
     message = choices[0].get('message') or {}
+    return _extract_message_text_from_message(message)
+
+
+def _extract_message_text_from_message(message: dict[str, Any]) -> str:
     content = message.get('content')
     if isinstance(content, str):
         return content
@@ -105,3 +164,31 @@ def _extract_message_text(data: dict[str, Any]) -> str:
                     parts.append(text.strip())
         return '\n'.join(parts)
     return ''
+
+
+def _extract_tool_calls(message: dict[str, Any]) -> list[BotLLMToolCall]:
+    result: list[BotLLMToolCall] = []
+    for raw_call in message.get('tool_calls') or []:
+        if not isinstance(raw_call, dict):
+            continue
+        if raw_call.get('type') != 'function':
+            continue
+        function = raw_call.get('function') or {}
+        name = str(function.get('name') or '').strip()
+        arguments_text = str(function.get('arguments') or '').strip() or '{}'
+        if not name:
+            continue
+        try:
+            arguments = json.loads(arguments_text)
+        except json.JSONDecodeError:
+            raise BotLLMError(f'LLM returned invalid tool arguments for {name}.')
+        if not isinstance(arguments, dict):
+            raise BotLLMError(f'LLM tool arguments for {name} must be an object.')
+        result.append(
+            BotLLMToolCall(
+                id=str(raw_call.get('id') or ''),
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return result

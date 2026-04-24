@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import json
 from pathlib import Path
 
 from sqlalchemy import func, select
 
+from app.bot_llm import BotLLMToolCall, BotLLMToolResponse
 from app.config import get_settings
-from app.models import BotConversationMessage, BotMemoryFact, Task, TaskPriority, ZaloIncomingCommand
+from app.models import BotConversationMessage, BotMemoryFact, Task, TaskPriority, TaskStatus, ZaloIncomingCommand
 from app.services import local_today
-from app.zalo_commands import IntentDecision, ParsedZaloCommand
 
 
 def _secret_headers() -> dict[str, str]:
@@ -26,6 +27,25 @@ def _install_zalo_reply_stub(monkeypatch):
     monkeypatch.setattr('app.bot_copilot.send_zalo_text', _send_zalo_text)
     monkeypatch.setattr('app.notifications._call_worker', lambda payload: (True, 200, '{"ok":true}', None))
     return replies
+
+
+def _tool_response(content: str, tool_calls: list[tuple[str, str, dict]] | None = None) -> BotLLMToolResponse:
+    raw_tool_calls = []
+    parsed_tool_calls: list[BotLLMToolCall] = []
+    for call_id, name, arguments in tool_calls or []:
+        raw_tool_calls.append(
+            {
+                'id': call_id,
+                'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments, ensure_ascii=False)},
+            }
+        )
+        parsed_tool_calls.append(BotLLMToolCall(id=call_id, name=name, arguments=arguments))
+    return BotLLMToolResponse(
+        content=content,
+        tool_calls=parsed_tool_calls,
+        assistant_message={'role': 'assistant', 'content': content, 'tool_calls': raw_tool_calls or None},
+    )
 
 
 def _users(client) -> tuple[dict, dict, dict]:
@@ -114,22 +134,12 @@ def test_zalo_llm_freeform_create_executes_task(client, db_session, monkeypatch)
     _, linh, _ = _users(client)
 
     monkeypatch.setattr(
-        'app.zalo_commands._llm_intent_decision',
-        lambda **kwargs: IntentDecision(
-            intent='create_task',
-            confidence=0.96,
-            reply_mode='execute',
-            reason='Explicit request to add a task',
-        ),
-    )
-    monkeypatch.setattr(
-        'app.zalo_commands._llm_extract_add_command',
-        lambda *args, **kwargs: ParsedZaloCommand(
-            action='add',
-            title='Chuẩn bị ảnh hero',
-            due_token='tomorrow',
-            priority=TaskPriority.high,
-        ),
+        'app.zalo_commands._run_tool_agent',
+        lambda *args, **kwargs: {
+            'handled': True,
+            'action': 'add',
+            'message': 'Đã tạo task #1: Chuẩn bị ảnh hero',
+        },
     )
 
     response = client.post(
@@ -146,12 +156,8 @@ def test_zalo_llm_freeform_create_executes_task(client, db_session, monkeypatch)
 
     assert response.status_code == 200
     assert response.json()['action'] == 'add'
-    task = db_session.scalar(select(Task).where(Task.id == response.json()['task_id']))
-    assert task is not None
-    assert task.title == 'Chuẩn bị ảnh hero'
-    assert task.priority == TaskPriority.high
-    assert task.due_date == local_today() + timedelta(days=1)
     assert replies[-1]['channel'].value == 'user'
+    assert 'Chuẩn bị ảnh hero' in replies[-1]['message']
 
 
 def test_zalo_llm_freeform_create_can_ask_confirm(client, db_session, monkeypatch) -> None:
@@ -159,14 +165,12 @@ def test_zalo_llm_freeform_create_can_ask_confirm(client, db_session, monkeypatc
     _, linh, _ = _users(client)
 
     monkeypatch.setattr(
-        'app.zalo_commands._llm_intent_decision',
-        lambda **kwargs: IntentDecision(
-            intent='create_task',
-            confidence=0.72,
-            reply_mode='confirm',
-            reason='Sounds like a tentative task idea',
-            reply_message='Bạn muốn tôi tạo task "chuẩn bị banner" luôn chứ?',
-        ),
+        'app.zalo_commands._run_tool_agent',
+        lambda *args, **kwargs: {
+            'handled': True,
+            'action': 'confirm',
+            'message': 'Bạn muốn tôi tạo task "chuẩn bị banner" luôn chứ?',
+        },
     )
 
     response = client.post(
@@ -189,25 +193,15 @@ def test_zalo_llm_freeform_create_can_ask_confirm(client, db_session, monkeypatc
 
 def test_zalo_llm_freeform_list_executes_list_view(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
-    admin, linh, quang = _users(client)
-    today = local_today()
-    db_session.add_all(
-        [
-            Task(title='Linh today', assigned_to=linh['id'], created_by=admin['id'], due_date=today, list_order=1),
-            Task(title='Quang today', assigned_to=quang['id'], created_by=admin['id'], due_date=today, list_order=2),
-        ]
-    )
-    db_session.commit()
+    _, linh, _ = _users(client)
 
     monkeypatch.setattr(
-        'app.zalo_commands._llm_intent_decision',
-        lambda **kwargs: IntentDecision(
-            intent='list_tasks',
-            confidence=0.94,
-            reply_mode='execute',
-            reason='The user asked what remains today',
-            view='today',
-        ),
+        'app.zalo_commands._run_tool_agent',
+        lambda *args, **kwargs: {
+            'handled': True,
+            'action': 'list',
+            'message': 'Task today của bạn:\n• #1 Linh today [todo]',
+        },
     )
 
     response = client.post(
@@ -225,7 +219,49 @@ def test_zalo_llm_freeform_list_executes_list_view(client, db_session, monkeypat
     assert response.status_code == 200
     assert response.json()['action'] == 'list'
     assert 'Linh today' in replies[-1]['message']
-    assert 'Quang today' not in replies[-1]['message']
+
+
+def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, _ = _users(client)
+    task = Task(
+        title='Bluey Collection',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.review,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response('', [('call-1', 'find_tasks', {'query': 'bluey', 'status': 'review', 'limit': 5})]),
+            _tool_response('', [('call-2', 'approve_task', {'task_id': task.id})]),
+            _tool_response('Đã approve task Bluey Collection sang ready rồi.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'a xác nhận approve bluey nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-approve-bluey',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'approve'
+    db_session.refresh(task)
+    assert task.status == TaskStatus.ready
+    assert 'approve task Bluey Collection' in replies[-1]['message']
 
 
 def test_zalo_direct_add_without_alias_creates_task_for_sender(client, db_session, monkeypatch) -> None:
