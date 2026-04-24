@@ -39,7 +39,7 @@ def test_build_today_groups() -> None:
 
     assert [task.title for task in group_map['overdue']] == ['Overdue']
     assert [task.title for task in group_map['today']] == ['Today']
-    assert [task.title for task in group_map['future']] == ['Future']
+    assert 'future' not in group_map
 
 
 def test_build_upcoming_groups_sorted_by_date() -> None:
@@ -60,13 +60,13 @@ def test_build_inbox_groups_with_exclusive_priority_order() -> None:
 
     overdue = make_task('Overdue first', due_date=today - timedelta(days=1), status=TaskStatus.review, task_id=1)
     today_due = make_task('Today due', due_date=today, status=TaskStatus.review, task_id=2)
-    review = make_task('Review bucket', status=TaskStatus.review, task_id=3)
+    future = make_task('Future bucket', due_date=today + timedelta(days=2), status=TaskStatus.review, task_id=3)
     plain = make_task('Inbox bucket', task_id=4)
 
-    groups = build_task_groups('inbox', [plain, review, today_due, overdue], today)
+    groups = build_task_groups('inbox', [plain, future, today_due, overdue], today)
 
-    assert [group.key for group in groups] == ['overdue', 'today', 'review', 'inbox']
-    assert [task.title for task in groups[0].tasks] == ['Overdue first']
-    assert [task.title for task in groups[1].tasks] == ['Today due']
-    assert [task.title for task in groups[2].tasks] == ['Review bucket']
+    assert [group.key for group in groups] == ['today', 'overdue', 'future', 'anytime']
+    assert [task.title for task in groups[0].tasks] == ['Today due']
+    assert [task.title for task in groups[1].tasks] == ['Overdue first']
+    assert [task.title for task in groups[2].tasks] == ['Future bucket']
     assert [task.title for task in groups[3].tasks] == ['Inbox bucket']

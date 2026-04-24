@@ -264,3 +264,61 @@ class NotificationDelivery(Base):
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     event: Mapped[NotificationEvent] = relationship('NotificationEvent', back_populates='deliveries')
+
+
+class ZaloIncomingCommand(Base):
+    __tablename__ = 'zalo_incoming_commands'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    message_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    conversation_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    from_uid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    command: Mapped[str] = mapped_column(String(32), nullable=False)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey('tasks.id', ondelete='SET NULL'), nullable=True, index=True)
+    response_payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    task: Mapped[Task | None] = relationship('Task')
+
+
+class BotConversationMessage(Base):
+    __tablename__ = 'bot_conversation_messages'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column('metadata', JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(BotConversationMessage.user_id) == User.id,
+        viewonly=True,
+    )
+
+
+class BotMemoryFact(Base):
+    __tablename__ = 'bot_memory_facts'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    fact: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    source_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(BotMemoryFact.user_id) == User.id,
+        viewonly=True,
+    )

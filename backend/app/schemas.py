@@ -206,3 +206,15 @@ class TaskGroup(BaseModel):
 class TaskListResponse(BaseModel):
     view: str
     groups: list[TaskGroup]
+
+
+class ZaloIncomingRequest(BaseModel):
+    text: str = Field(min_length=1)
+    from_uid: str | None = None
+    conversation_id: str | None = None
+    conversation_type: str | None = None
+    message_id: str | None = None
+    reply_to_message_id: str | None = None
+    reply_to_cli_message_id: str | None = None
+    quoted_text: str | None = None
+    mentions: list[dict] = Field(default_factory=list)

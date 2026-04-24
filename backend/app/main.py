@@ -15,9 +15,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from .auth import AuthError, create_access_token, decode_access_token, extract_bearer_token, verify_password
+from .bot_files import ensure_bot_files
 from .config import get_settings
 from .database import Base, engine, get_db
 from .models import (
+    BotConversationMessage,
+    BotMemoryFact,
     NotificationDelivery,
     NotificationEvent,
     Shop,
@@ -28,6 +31,7 @@ from .models import (
     TaskStatus,
     TaskType,
     User,
+    ZaloIncomingCommand,
 )
 from .notifications import (
     enqueue_task_created_notifications,
@@ -59,6 +63,7 @@ from .schemas import (
     TaskTypeUpdate,
     TaskUpdate,
     UserOut,
+    ZaloIncomingRequest,
 )
 from .services import (
     get_subtask_or_404,
@@ -71,6 +76,7 @@ from .services import (
 )
 from .storage import StorageError, delete_object, is_storage_enabled, sign_object_url, upload_bytes
 from .storage import ensure_bucket_exists
+from .zalo_commands import handle_zalo_incoming
 
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
@@ -341,6 +347,7 @@ def on_startup() -> None:
 
         inspector = inspect(engine)
         required_tables = [
+            'users',
             'shops',
             'task_types',
             'tasks',
@@ -349,12 +356,16 @@ def on_startup() -> None:
             'task_attachments',
             'notification_events',
             'notification_deliveries',
+            'zalo_incoming_commands',
+            'bot_conversation_messages',
+            'bot_memory_facts',
         ]
         if any(not inspector.has_table(table, schema=schema_name) for table in required_tables):
             # Safety fallback for local/dev environments where migrations are not yet aligned.
             Base.metadata.create_all(
                 bind=engine,
                 tables=[
+                    User.__table__,
                     Shop.__table__,
                     TaskType.__table__,
                     Task.__table__,
@@ -363,6 +374,9 @@ def on_startup() -> None:
                     TaskAttachment.__table__,
                     NotificationEvent.__table__,
                     NotificationDelivery.__table__,
+                    ZaloIncomingCommand.__table__,
+                    BotConversationMessage.__table__,
+                    BotMemoryFact.__table__,
                 ],
             )
 
@@ -429,6 +443,7 @@ def on_startup() -> None:
 
         if is_storage_enabled():
             ensure_bucket_exists()
+        ensure_bot_files()
     except SQLAlchemyError as exc:
         logger.warning(f'Database is not ready for seed data. Original error: {exc}')
     except StorageError as exc:
@@ -454,6 +469,15 @@ def run_internal_notifications_job(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f'Notification job failed: {exc}',
         ) from exc
+
+
+@app.post('/zalo/incoming')
+def receive_zalo_incoming(
+    payload: ZaloIncomingRequest,
+    x_internal_secret: str | None = Header(default=None, alias='X-Internal-Secret'),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return handle_zalo_incoming(db=db, payload=payload, x_internal_secret=x_internal_secret)
 
 
 @app.post('/auth/login', response_model=LoginResponse)

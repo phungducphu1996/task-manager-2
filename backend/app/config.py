@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 import re
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,10 +25,25 @@ class Settings(BaseSettings):
     zalo_worker_token: str | None = None
     zalo_shared_secret: str | None = None
     zalo_group_id: str | None = None
+    zalo_allowed_group_ids: str = ''
+    zalo_bot_aliases: str = '@TaskBot,@task'
+    task_public_base_url: str | None = None
+    openai_api_key: str | None = None
+    bot_llm_model: str = 'gpt-4.1-mini'
+    bot_llm_base_url: str = 'https://api.openai.com/v1'
+    bot_llm_timeout_seconds: float = 25.0
+    bot_enabled: bool = True
+    bot_persona_path: str = 'bot/persona/core.md'
+    bot_profiles_dir: str = 'bot/profiles'
+    bot_events_path: str = 'bot/events.md'
+    bot_recent_conversation_limit: int = 30
+    bot_task_context_limit: int = 12
+    bot_memory_facts_limit: int = 12
     notification_retry_delays_seconds: str = '5,30,120'
     notification_delivery_batch_limit: int = 100
     notification_http_timeout_seconds: float = 10.0
     notification_max_retries: int = 3
+    runtime_base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -57,6 +73,21 @@ class Settings(BaseSettings):
         if not values:
             return [5, 30, 120]
         return values
+
+    @property
+    def zalo_allowed_group_id_list(self) -> list[str]:
+        return [item.strip() for item in self.zalo_allowed_group_ids.split(',') if item.strip()]
+
+    @property
+    def zalo_bot_alias_list(self) -> list[str]:
+        aliases = [item.strip() for item in self.zalo_bot_aliases.split(',') if item.strip()]
+        return aliases or ['@TaskBot', '@task']
+
+    def resolve_runtime_path(self, raw_path: str) -> Path:
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return self.runtime_base_dir / path
 
 
 @lru_cache

@@ -256,14 +256,24 @@ def test_member_only_sees_own_tasks(client) -> None:
 
     task_a = client.post(
         '/tasks',
-        json={'title': 'Task A', 'assigned_to': member_a['id'], 'created_by': admin['id']},
+        json={
+            'title': 'Task A',
+            'assigned_to': member_a['id'],
+            'created_by': admin['id'],
+            'due_date': date.today().isoformat(),
+        },
         headers=actor_headers(admin['id']),
     )
     assert task_a.status_code == 201
 
     task_b = client.post(
         '/tasks',
-        json={'title': 'Task B', 'assigned_to': member_b['id'], 'created_by': admin['id']},
+        json={
+            'title': 'Task B',
+            'assigned_to': member_b['id'],
+            'created_by': admin['id'],
+            'due_date': date.today().isoformat(),
+        },
         headers=actor_headers(admin['id']),
     )
     assert task_b.status_code == 201

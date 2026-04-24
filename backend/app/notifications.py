@@ -214,6 +214,23 @@ def _call_worker(request_payload: dict[str, Any]) -> tuple[bool, int | None, str
     return False, response.status_code, body, f'Worker returned status {response.status_code}'
 
 
+def send_zalo_text(
+    *,
+    channel: NotificationChannel,
+    target_id: str | None,
+    message: str,
+    context: dict[str, Any] | None = None,
+) -> tuple[bool, int | None, str | None, str | None]:
+    return _call_worker(
+        {
+            'channel': channel.value,
+            'target_id': target_id,
+            'message': message,
+            'context': context or {},
+        }
+    )
+
+
 def _retry_delay_for_attempt(attempt_count: int) -> int:
     delays = settings.notification_retry_delays
     if not delays:
