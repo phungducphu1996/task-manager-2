@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .bot_llm import BotLLMError, generate_bot_json, is_bot_llm_configured
 from .config import get_settings
 from .bot_copilot import handle_zalo_chat
 from .models import (
@@ -44,6 +45,16 @@ class ParsedZaloCommand:
     due_token: str | None = None
     priority: TaskPriority = TaskPriority.medium
     view: Literal['today', 'inbox'] = 'today'
+
+
+@dataclass(slots=True)
+class IntentDecision:
+    intent: Literal['create_task', 'list_tasks', 'chat', 'unknown']
+    confidence: float
+    reply_mode: Literal['execute', 'confirm', 'chat']
+    reason: str = ''
+    reply_message: str | None = None
+    view: Literal['today', 'inbox'] | None = None
 
 
 def _is_admin(user: User) -> bool:
@@ -155,6 +166,156 @@ def _parse_date_token(token: str | None) -> date | None:
     return None
 
 
+def _strip_trailing_politeness(text: str) -> str:
+    cleaned = re.sub(
+        r'\b(nha|nhé|nhe|nho|nhờ|giup|giúp|voi|với|dum|dùm|di|đi|a|ạ|ha|hả)\b[\s.!?]*$',
+        '',
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r'\s+', ' ', cleaned).strip(' ,.;:!?')
+
+
+def _extract_natural_due_token(text: str) -> tuple[str | None, str]:
+    patterns = [
+        (r'\b(hôm nay|hom nay)\b', 'today'),
+        (r'\b(ngày mai|ngay mai|mai)\b', 'tomorrow'),
+        (r'\b(\d{4}-\d{2}-\d{2})\b', None),
+        (r'\b(\d{1,2}/\d{1,2}(?:/\d{4})?)\b', None),
+        (r'\b(\d{1,2}-\d{1,2}(?:-\d{4})?)\b', None),
+    ]
+    working = text
+    for pattern, normalized in patterns:
+        match = re.search(pattern, working, flags=re.IGNORECASE)
+        if not match:
+            continue
+        due_token = normalized or match.group(1)
+        working = f'{working[:match.start()]} {working[match.end():]}'
+        return due_token, re.sub(r'\s+', ' ', working).strip()
+    return None, text
+
+
+def _parse_natural_add_command(body: str) -> ParsedZaloCommand | None:
+    normalized = body.casefold()
+    has_create_intent = any(
+        phrase in normalized
+        for phrase in (
+            'thêm task',
+            'them task',
+            'tạo task',
+            'tao task',
+            'add task',
+            'new task',
+            'thêm việc',
+            'them viec',
+            'tạo việc',
+            'tao viec',
+            'thêm giúp',
+            'them giup',
+            'tạo giúp',
+            'tao giup',
+            'thêm cho em',
+            'them cho em',
+            'thêm cho anh',
+            'them cho anh',
+            'thêm cho mình',
+            'them cho minh',
+            'nhớ thêm',
+            'nho them',
+        )
+    )
+    if not has_create_intent:
+        return None
+
+    try:
+        tokens = shlex.split(body)
+    except ValueError:
+        tokens = body.split()
+
+    parsed = ParsedZaloCommand(action='add')
+    title_tokens: list[str] = []
+    filler_words = {
+        'thêm',
+        'them',
+        'tạo',
+        'tao',
+        'task',
+        'việc',
+        'viec',
+        'giúp',
+        'giup',
+        'cho',
+        'em',
+        'anh',
+        'chị',
+        'chi',
+        'mình',
+        'minh',
+        'nhớ',
+        'nho',
+        'new',
+        'add',
+        'giùm',
+        'dum',
+    }
+    skip_next_due_word = False
+    for token in tokens:
+        lower = token.casefold()
+        if lower.startswith('due:') or lower.startswith('date:'):
+            parsed.due_token = token.split(':', 1)[1]
+            continue
+        if lower.startswith('type:'):
+            parsed.type_token = token.split(':', 1)[1]
+            continue
+        if lower.startswith('!'):
+            priority_token = _clean_token(lower.removeprefix('!'))
+            if priority_token in {'low', 'medium', 'high'}:
+                parsed.priority = TaskPriority(priority_token)
+                continue
+        if token.startswith('@') and not parsed.assignee_token:
+            parsed.assignee_token = token
+            continue
+        if token.startswith('#') and not parsed.shop_token:
+            parsed.shop_token = token
+            continue
+        if lower in {'hôm', 'hom'}:
+            skip_next_due_word = True
+            parsed.due_token = parsed.due_token or 'today'
+            continue
+        if skip_next_due_word and lower == 'nay':
+            skip_next_due_word = False
+            continue
+        if lower in {'ngày', 'ngay'}:
+            skip_next_due_word = True
+            parsed.due_token = parsed.due_token or 'tomorrow'
+            continue
+        if skip_next_due_word and lower == 'mai':
+            skip_next_due_word = False
+            continue
+        if lower == 'mai':
+            parsed.due_token = parsed.due_token or 'tomorrow'
+            continue
+        if lower in filler_words:
+            continue
+        title_tokens.append(token)
+
+    title = ' '.join(title_tokens).strip()
+    if not parsed.due_token:
+        parsed.due_token, title = _extract_natural_due_token(title)
+
+    title = re.sub(
+        r'^(làm|lam|việc|viec|task)\s+',
+        '',
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = _strip_trailing_politeness(title)
+    parsed.title = title
+    if not parsed.title:
+        return None
+    return parsed
+
+
 def _resolve_unique_by_token(items: list[T], token: str, name_getter: Callable[[T], list[str]]) -> T | None:
     normalized = _normalize_lookup(token)
     if not normalized:
@@ -247,6 +408,9 @@ def _parse_command(text: str, *, allow_plain_text: bool) -> ParsedZaloCommand | 
         return ParsedZaloCommand(action='list', view=view)  # type: ignore[arg-type]
 
     if action not in {'add', 'task', 'new'}:
+        natural_add = _parse_natural_add_command(body)
+        if natural_add is not None:
+            return natural_add
         return ParsedZaloCommand(action='chat', title=body)
 
     title_tokens: list[str] = []
@@ -273,6 +437,158 @@ def _parse_command(text: str, *, allow_plain_text: bool) -> ParsedZaloCommand | 
         title_tokens.append(token)
 
     parsed.title = ' '.join(title_tokens).strip()
+    return parsed
+
+
+def _llm_intent_system_prompt() -> str:
+    return (
+        'You classify a Zalo office message into one intent. '
+        'Return strict JSON only. '
+        'Valid intents: create_task, list_tasks, chat, unknown. '
+        'Valid reply_mode: execute, confirm, chat. '
+        'Use create_task only when the user is actually asking to create/add a task, not when they are merely discussing or reminding. '
+        'Use list_tasks when they ask to see current tasks. '
+        'Use execute only when the request is explicit and safe to run without confirmation. '
+        'Use confirm when it sounds like task creation might be intended but is still ambiguous. '
+        'Use chat for general conversation, discussion, planning, reminders, or unclear cases.'
+    )
+
+
+def _llm_intent_user_prompt(*, actor: User, text: str) -> str:
+    return (
+        f'Actor name: {actor.name}\n'
+        f'Actor username: {actor.username}\n'
+        f'Actor role: {actor.role or "unknown"}\n'
+        f'Message: {text}\n\n'
+        'Return JSON object with keys:\n'
+        '- intent\n'
+        '- confidence (0..1)\n'
+        '- reply_mode\n'
+        '- reason\n'
+        '- reply_message\n'
+        '- view (today|inbox|null)\n'
+    )
+
+
+def _coerce_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, confidence))
+
+
+def _llm_intent_decision(*, actor: User, text: str) -> IntentDecision | None:
+    if not is_bot_llm_configured():
+        return None
+    try:
+        payload = generate_bot_json(
+            system_prompt=_llm_intent_system_prompt(),
+            user_prompt=_llm_intent_user_prompt(actor=actor, text=text),
+        )
+    except BotLLMError:
+        return None
+
+    intent = str(payload.get('intent') or 'unknown').strip().lower()
+    if intent not in {'create_task', 'list_tasks', 'chat', 'unknown'}:
+        intent = 'unknown'
+    reply_mode = str(payload.get('reply_mode') or 'chat').strip().lower()
+    if reply_mode not in {'execute', 'confirm', 'chat'}:
+        reply_mode = 'chat'
+    view = str(payload.get('view') or '').strip().lower() or None
+    if view not in {'today', 'inbox', None}:
+        view = None
+    return IntentDecision(
+        intent=intent,  # type: ignore[arg-type]
+        confidence=_coerce_confidence(payload.get('confidence')),
+        reply_mode=reply_mode,  # type: ignore[arg-type]
+        reason=str(payload.get('reason') or '').strip(),
+        reply_message=str(payload.get('reply_message') or '').strip() or None,
+        view=view,  # type: ignore[arg-type]
+    )
+
+
+def _llm_extract_system_prompt() -> str:
+    return (
+        'Extract a task payload from a Zalo office message. Return strict JSON only. '
+        'Do not invent missing data. '
+        'Priority must be one of low, medium, high. '
+        'Prefer due_token values like today, tomorrow, dd/mm, dd/mm/yyyy, yyyy-mm-dd when present.'
+    )
+
+
+def _llm_extract_user_prompt(
+    *,
+    actor: User,
+    text: str,
+    users: list[User],
+    shops: list[Shop],
+    task_types: list[TaskType],
+) -> str:
+    user_lines = '\n'.join(f'- {user.name} | username={user.username} | zalo={user.zalo_user_id}' for user in users)
+    shop_lines = '\n'.join(f'- {shop.name}' for shop in shops) or '- none'
+    type_lines = '\n'.join(f'- {task_type.name}' for task_type in task_types) or '- none'
+    return (
+        f'Actor:\n- {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n\n'
+        f'Available users:\n{user_lines or "- none"}\n\n'
+        f'Available shops:\n{shop_lines}\n\n'
+        f'Available task types:\n{type_lines}\n\n'
+        f'Message:\n{text}\n\n'
+        'Return JSON object with keys:\n'
+        '- title\n'
+        '- assignee_token\n'
+        '- shop_token\n'
+        '- type_token\n'
+        '- due_token\n'
+        '- priority\n'
+        '- needs_confirmation\n'
+        '- confirmation_message\n'
+    )
+
+
+def _llm_extract_add_command(db: Session, *, actor: User, text: str) -> ParsedZaloCommand | tuple[str, None] | None:
+    if not is_bot_llm_configured():
+        return None
+    users = db.scalars(select(User).where(User.is_active.is_(True))).all()
+    shops = db.scalars(select(Shop)).all()
+    task_types = db.scalars(select(TaskType)).all()
+    try:
+        payload = generate_bot_json(
+            system_prompt=_llm_extract_system_prompt(),
+            user_prompt=_llm_extract_user_prompt(
+                actor=actor,
+                text=text,
+                users=users,
+                shops=shops,
+                task_types=task_types,
+            ),
+        )
+    except BotLLMError:
+        return None
+
+    title = str(payload.get('title') or '').strip()
+    if not title:
+        return None
+    confirmation_message = str(payload.get('confirmation_message') or '').strip() or None
+    needs_confirmation = bool(payload.get('needs_confirmation'))
+    priority_token = str(payload.get('priority') or 'medium').strip().lower()
+    if priority_token not in {'low', 'medium', 'high'}:
+        priority_token = 'medium'
+    parsed = ParsedZaloCommand(
+        action='add',
+        title=title,
+        assignee_token=str(payload.get('assignee_token') or '').strip() or None,
+        shop_token=str(payload.get('shop_token') or '').strip() or None,
+        type_token=str(payload.get('type_token') or '').strip() or None,
+        due_token=str(payload.get('due_token') or '').strip() or None,
+        priority=TaskPriority(priority_token),
+    )
+    if needs_confirmation:
+        return (
+            confirmation_message
+            or f'Tôi hiểu là bạn muốn tạo task "{title}", nhưng câu này còn hơi mơ hồ. Xác nhận lại giúp tôi nhé.',
+            None,
+        )
     return parsed
 
 
@@ -397,6 +713,64 @@ def _format_list_response(view: str, groups) -> str:
     return '\n'.join(lines)
 
 
+def _handle_add_and_reply(
+    *,
+    db: Session,
+    parsed: ParsedZaloCommand,
+    actor: User,
+    channel: NotificationChannel | None,
+    target_id: str | None,
+    record: ZaloIncomingCommand,
+) -> dict[str, Any]:
+    task = _create_zalo_task(db, parsed, actor)
+    db.commit()
+    full_task = get_task_or_404(db, task.id) or task
+    try:
+        enqueue_task_created_notifications(db, full_task)
+    except Exception:
+        db.rollback()
+    message = _format_task_created(full_task)
+    reply = _reply_to_conversation(
+        channel=channel,
+        target_id=target_id,
+        message=message,
+        context={'source': 'zalo_command', 'command': 'add', 'task_id': task.id},
+    )
+    record.task_id = task.id
+    record.command = 'add'
+    record.response_payload = {'message': message, 'reply': reply}
+    db.commit()
+    return {'ok': True, 'action': 'add', 'task_id': task.id, 'reply': reply}
+
+
+def _handle_list_and_reply(
+    *,
+    db: Session,
+    view: Literal['today', 'inbox'],
+    actor: User,
+    channel: NotificationChannel | None,
+    target_id: str | None,
+    record: ZaloIncomingCommand,
+) -> dict[str, Any]:
+    result = list_tasks(
+        db,
+        view,
+        actor_id=actor.id,
+        actor_is_admin=_is_admin(actor),
+    )
+    message = _format_list_response(view, result.groups)
+    reply = _reply_to_conversation(
+        channel=channel,
+        target_id=target_id,
+        message=message,
+        context={'source': 'zalo_command', 'command': 'list', 'view': view},
+    )
+    record.command = 'list'
+    record.response_payload = {'message': message, 'reply': reply}
+    db.commit()
+    return {'ok': True, 'action': 'list', 'view': view, 'reply': reply}
+
+
 def _persist_command(
     db: Session,
     *,
@@ -467,6 +841,60 @@ def handle_zalo_incoming(
 
     try:
         if parsed.action == 'chat':
+            decision = _llm_intent_decision(actor=actor, text=parsed.title or payload.text)
+            if decision and decision.intent == 'create_task':
+                if decision.reply_mode == 'confirm':
+                    message = (
+                        decision.reply_message
+                        or 'Tôi hiểu là bạn có thể muốn tạo task mới, nhưng câu này còn hơi mơ hồ. Xác nhận rõ hơn giúp tôi.'
+                    )
+                    reply = _reply_to_conversation(
+                        channel=channel,
+                        target_id=target_id,
+                        message=message,
+                        context={'source': 'zalo_command', 'command': 'confirm_add', 'message_id': payload.message_id},
+                    )
+                    record.command = 'confirm_add'
+                    record.response_payload = {'message': message, 'reply': reply, 'reason': decision.reason}
+                    db.commit()
+                    return {'ok': True, 'action': 'confirm', 'reply': reply}
+
+                if decision.reply_mode == 'execute' and decision.confidence >= 0.88:
+                    extracted = _llm_extract_add_command(db, actor=actor, text=parsed.title or payload.text)
+                    if isinstance(extracted, tuple):
+                        message, _ = extracted
+                        reply = _reply_to_conversation(
+                            channel=channel,
+                            target_id=target_id,
+                            message=message,
+                            context={'source': 'zalo_command', 'command': 'confirm_add', 'message_id': payload.message_id},
+                        )
+                        record.command = 'confirm_add'
+                        record.response_payload = {'message': message, 'reply': reply, 'reason': decision.reason}
+                        db.commit()
+                        return {'ok': True, 'action': 'confirm', 'reply': reply}
+                    if extracted is not None:
+                        return _handle_add_and_reply(
+                            db=db,
+                            parsed=extracted,
+                            actor=actor,
+                            channel=channel,
+                            target_id=target_id,
+                            record=record,
+                        )
+
+            if decision and decision.intent == 'list_tasks':
+                view = decision.view or 'today'
+                return _handle_list_and_reply(
+                    db=db,
+                    view=view,
+                    actor=actor,
+                    channel=channel,
+                    target_id=target_id,
+                    record=record,
+                )
+
+        if parsed.action == 'chat':
             chat = handle_zalo_chat(
                 db=db,
                 actor=actor,
@@ -481,41 +909,23 @@ def handle_zalo_incoming(
             return {'ok': True, 'action': 'chat', 'used_llm': chat.used_llm, 'reply': chat.reply}
 
         if parsed.action == 'add':
-            task = _create_zalo_task(db, parsed, actor)
-            db.commit()
-            full_task = get_task_or_404(db, task.id) or task
-            try:
-                enqueue_task_created_notifications(db, full_task)
-            except Exception:
-                db.rollback()
-            message = _format_task_created(full_task)
-            reply = _reply_to_conversation(
+            return _handle_add_and_reply(
+                db=db,
+                parsed=parsed,
+                actor=actor,
                 channel=channel,
                 target_id=target_id,
-                message=message,
-                context={'source': 'zalo_command', 'command': 'add', 'task_id': task.id},
+                record=record,
             )
-            record.task_id = task.id
-            record.response_payload = {'message': message, 'reply': reply}
-            db.commit()
-            return {'ok': True, 'action': 'add', 'task_id': task.id, 'reply': reply}
 
-        result = list_tasks(
-            db,
-            parsed.view,
-            actor_id=actor.id,
-            actor_is_admin=_is_admin(actor),
-        )
-        message = _format_list_response(parsed.view, result.groups)
-        reply = _reply_to_conversation(
+        return _handle_list_and_reply(
+            db=db,
+            view=parsed.view,
+            actor=actor,
             channel=channel,
             target_id=target_id,
-            message=message,
-            context={'source': 'zalo_command', 'command': 'list', 'view': parsed.view},
+            record=record,
         )
-        record.response_payload = {'message': message, 'reply': reply}
-        db.commit()
-        return {'ok': True, 'action': 'list', 'view': parsed.view, 'reply': reply}
     except PermissionError as exc:
         db.rollback()
         message = str(exc)

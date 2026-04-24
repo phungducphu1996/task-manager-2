@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from app.config import get_settings
 from app.models import BotConversationMessage, BotMemoryFact, Task, TaskPriority, ZaloIncomingCommand
 from app.services import local_today
+from app.zalo_commands import IntentDecision, ParsedZaloCommand
 
 
 def _secret_headers() -> dict[str, str]:
@@ -108,6 +109,125 @@ def test_zalo_direct_chat_without_alias_replies_to_user(client, monkeypatch) -> 
     assert replies[-1]['target_id'] == linh['zalo_user_id']
 
 
+def test_zalo_llm_freeform_create_executes_task(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+
+    monkeypatch.setattr(
+        'app.zalo_commands._llm_intent_decision',
+        lambda **kwargs: IntentDecision(
+            intent='create_task',
+            confidence=0.96,
+            reply_mode='execute',
+            reason='Explicit request to add a task',
+        ),
+    )
+    monkeypatch.setattr(
+        'app.zalo_commands._llm_extract_add_command',
+        lambda *args, **kwargs: ParsedZaloCommand(
+            action='add',
+            title='Chuẩn bị ảnh hero',
+            due_token='tomorrow',
+            priority=TaskPriority.high,
+        ),
+    )
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'Cho bot ghi nhận việc chuẩn bị ảnh hero cho ngày mai',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': linh['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-llm-create',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'add'
+    task = db_session.scalar(select(Task).where(Task.id == response.json()['task_id']))
+    assert task is not None
+    assert task.title == 'Chuẩn bị ảnh hero'
+    assert task.priority == TaskPriority.high
+    assert task.due_date == local_today() + timedelta(days=1)
+    assert replies[-1]['channel'].value == 'user'
+
+
+def test_zalo_llm_freeform_create_can_ask_confirm(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+
+    monkeypatch.setattr(
+        'app.zalo_commands._llm_intent_decision',
+        lambda **kwargs: IntentDecision(
+            intent='create_task',
+            confidence=0.72,
+            reply_mode='confirm',
+            reason='Sounds like a tentative task idea',
+            reply_message='Bạn muốn tôi tạo task "chuẩn bị banner" luôn chứ?',
+        ),
+    )
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'hay là thêm vụ chuẩn bị banner ha',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': linh['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-llm-confirm',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'confirm'
+    assert db_session.scalar(select(func.count(Task.id))) == 0
+    assert 'tạo task' in replies[-1]['message']
+
+
+def test_zalo_llm_freeform_list_executes_list_view(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, quang = _users(client)
+    today = local_today()
+    db_session.add_all(
+        [
+            Task(title='Linh today', assigned_to=linh['id'], created_by=admin['id'], due_date=today, list_order=1),
+            Task(title='Quang today', assigned_to=quang['id'], created_by=admin['id'], due_date=today, list_order=2),
+        ]
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        'app.zalo_commands._llm_intent_decision',
+        lambda **kwargs: IntentDecision(
+            intent='list_tasks',
+            confidence=0.94,
+            reply_mode='execute',
+            reason='The user asked what remains today',
+            view='today',
+        ),
+    )
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'hôm nay em còn task nào chưa xong?',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': linh['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-llm-list',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'list'
+    assert 'Linh today' in replies[-1]['message']
+    assert 'Quang today' not in replies[-1]['message']
+
+
 def test_zalo_direct_add_without_alias_creates_task_for_sender(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     _, linh, _ = _users(client)
@@ -133,6 +253,60 @@ def test_zalo_direct_add_without_alias_creates_task_for_sender(client, db_sessio
     assert task.assigned_to == linh['id']
     assert replies[-1]['channel'].value == 'user'
     assert replies[-1]['target_id'] == linh['zalo_user_id']
+
+
+def test_zalo_direct_natural_add_creates_task(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'nhớ thêm cho em task làm banner sale ngày mai nha',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': linh['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-direct-natural-add',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['action'] == 'add'
+    task = db_session.scalar(select(Task).where(Task.id == body['task_id']))
+    assert task is not None
+    assert task.title == 'banner sale'
+    assert task.assigned_to == linh['id']
+    assert task.due_date == local_today() + timedelta(days=1)
+    assert replies[-1]['channel'].value == 'user'
+
+
+def test_zalo_group_natural_add_with_alias_creates_task(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, _ = _users(client)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': '@TaskBot thêm giúp task chốt layout homepage hôm nay',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': 'test-zalo-group',
+            'conversation_type': 'group',
+            'message_id': 'msg-group-natural-add',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['action'] == 'add'
+    task = db_session.scalar(select(Task).where(Task.id == body['task_id']))
+    assert task is not None
+    assert task.title == 'chốt layout homepage'
+    assert task.due_date == local_today()
+    assert replies[-1]['channel'].value == 'group'
+    assert replies[-1]['target_id'] == 'test-zalo-group'
 
 
 def test_zalo_add_creates_task_and_dedupes_message_id(client, db_session, monkeypatch) -> None:
@@ -359,4 +533,27 @@ def test_zalo_chat_falls_back_without_llm(client, monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()['action'] == 'chat'
     assert response.json()['used_llm'] is False
+    assert 'chế độ cơ bản' in replies[-1]['message']
+
+
+def test_zalo_plain_question_does_not_create_task(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+    monkeypatch.setattr('app.bot_copilot.is_bot_llm_configured', lambda: False)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'hôm nay em còn gì cần làm?',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': linh['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-plain-question',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'chat'
+    assert db_session.scalar(select(func.count(Task.id))) == 0
     assert 'chế độ cơ bản' in replies[-1]['message']

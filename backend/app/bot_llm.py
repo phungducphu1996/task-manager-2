@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -18,6 +19,41 @@ def is_bot_llm_configured() -> bool:
 
 
 def generate_bot_reply(*, system_prompt: str, user_prompt: str) -> str:
+    return _request_llm_text(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.5,
+    )
+
+
+def generate_bot_json(*, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    content = _request_llm_text(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.1,
+        response_format={'type': 'json_object'},
+    )
+    normalized = content.strip()
+    if normalized.startswith('```'):
+        normalized = normalized.strip('`')
+        if normalized.lower().startswith('json'):
+            normalized = normalized[4:].strip()
+    try:
+        parsed = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise BotLLMError(f'LLM returned invalid JSON: {exc}') from exc
+    if not isinstance(parsed, dict):
+        raise BotLLMError('LLM JSON response must be an object.')
+    return parsed
+
+
+def _request_llm_text(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    response_format: dict[str, Any] | None = None,
+) -> str:
     api_key = (settings.openai_api_key or '').strip()
     if not api_key:
         raise BotLLMError('OPENAI_API_KEY is not configured.')
@@ -26,12 +62,14 @@ def generate_bot_reply(*, system_prompt: str, user_prompt: str) -> str:
     url = f'{base_url}/chat/completions'
     payload = {
         'model': settings.bot_llm_model,
-        'temperature': 0.5,
+        'temperature': temperature,
         'messages': [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},
         ],
     }
+    if response_format:
+        payload['response_format'] = response_format
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
