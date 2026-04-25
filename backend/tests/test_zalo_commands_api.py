@@ -228,6 +228,39 @@ def test_zalo_llm_freeform_list_executes_list_view(client, db_session, monkeypat
     assert 'Linh today' in replies[-1]['message']
 
 
+def test_zalo_explicit_list_routes_through_tool_agent_when_available(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+    captured: dict[str, str] = {}
+
+    def _fake_tool_agent(*args, **kwargs):
+        captured['text'] = kwargs['text']
+        return {
+            'handled': True,
+            'action': 'list',
+            'message': 'Tool-agent list reply',
+        }
+
+    monkeypatch.setattr('app.zalo_commands._run_tool_agent', _fake_tool_agent)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': '@TaskBot list today',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': 'test-zalo-group',
+            'conversation_type': 'group',
+            'message_id': 'msg-explicit-list-tool',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'list'
+    assert captured['text'] == 'list today'
+    assert replies[-1]['message'] == 'Tool-agent list reply'
+
+
 def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, linh, _ = _users(client)
@@ -316,9 +349,21 @@ def test_zalo_tool_agent_create_task_accepts_user_id_assignee_token(client, db_s
     assert 'Quang' in replies[-1]['message']
 
 
-def test_zalo_tool_agent_uses_shared_persona_and_profile(client, monkeypatch) -> None:
+def test_zalo_tool_agent_uses_shared_persona_profile_and_thread_history(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     _, linh, quang = _users(client)
+    db_session.add(
+        BotConversationMessage(
+            user_id=linh['id'],
+            conversation_id=linh['zalo_user_id'],
+            message_id='previous-direct-message',
+            role='user',
+            content='hôm qua em có nhắc chuyện Mario Kart',
+            metadata_json={'source': 'test'},
+        )
+    )
+    db_session.commit()
+
     settings = get_settings()
     persona_path = Path(settings.resolve_runtime_path(settings.bot_persona_path))
     persona_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,6 +398,8 @@ def test_zalo_tool_agent_uses_shared_persona_and_profile(client, monkeypatch) ->
     assert 'Luôn gọi user là bạn nhé.' in system_prompt
     assert 'Profile markdown:' in user_prompt
     assert 'Active user directory:' in user_prompt
+    assert 'Recent conversation in this thread:' in user_prompt
+    assert 'hôm qua em có nhắc chuyện Mario Kart' in user_prompt
     assert linh['username'] in user_prompt
     assert quang['username'] in user_prompt
     assert 'Chào bạn' in replies[-1]['message']

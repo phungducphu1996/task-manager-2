@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from .bot_files import persona_text, profile_summary_text, profile_text
 from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
+from .bot_memory import recent_conversation_text, recent_memory_text, store_conversation_message
 from .config import get_settings
 from .bot_copilot import handle_zalo_chat
 from .models import (
@@ -538,11 +539,20 @@ def _tool_system_prompt(actor: User) -> str:
     )
 
 
-def _tool_user_prompt(*, actor: User, text: str, user_directory_text: str) -> str:
+def _tool_user_prompt(
+    *,
+    actor: User,
+    text: str,
+    user_directory_text: str,
+    recent_conversation: str,
+    memory_text: str,
+) -> str:
     return (
         f'Actor: {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n'
         f'Profile markdown:\n{profile_text(actor)}\n\n'
         f'Active user directory:\n{user_directory_text}\n\n'
+        f'Known memory facts:\n{memory_text}\n\n'
+        f'Recent conversation in this thread:\n{recent_conversation}\n\n'
         f'Message: {text}\n'
         'Nếu đây chỉ là chat thông thường, trả lời trực tiếp không cần tool. '
         'Nếu đây là thao tác task, hãy dùng tool phù hợp trước rồi mới trả lời.'
@@ -696,14 +706,35 @@ def _execute_tool_call(db: Session, *, actor: User, name: str, arguments: dict[s
     return {'ok': False, 'error': f'Unknown tool: {name}'}
 
 
-def _run_tool_agent(db: Session, *, actor: User, text: str) -> dict[str, Any] | None:
+def _run_tool_agent(
+    db: Session,
+    *,
+    actor: User,
+    text: str,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
     if not is_bot_llm_configured():
         return None
 
     user_directory_text = _active_user_directory_text(db)
+    recent_conversation = recent_conversation_text(
+        db,
+        user_id=actor.id,
+        conversation_id=conversation_id,
+    )
+    memory_text = recent_memory_text(db, user_id=actor.id)
     messages: list[dict[str, Any]] = [
         {'role': 'system', 'content': _tool_system_prompt(actor)},
-        {'role': 'user', 'content': _tool_user_prompt(actor=actor, text=text, user_directory_text=user_directory_text)},
+        {
+            'role': 'user',
+            'content': _tool_user_prompt(
+                actor=actor,
+                text=text,
+                user_directory_text=user_directory_text,
+                recent_conversation=recent_conversation,
+                memory_text=memory_text,
+            ),
+        },
     ]
     last_tool_result: dict[str, Any] | None = None
     last_tool_name: str | None = None
@@ -1019,22 +1050,42 @@ def handle_zalo_incoming(
         return {'ok': False, 'error': 'unmapped_sender', 'reply': reply}
 
     try:
-        if parsed.action == 'chat':
-            tool_outcome = _run_tool_agent(db, actor=actor, text=parsed.title or payload.text)
-            if tool_outcome and tool_outcome.get('handled'):
-                action = str(tool_outcome.get('action') or 'chat')
-                message = str(tool_outcome.get('message') or '').strip()
-                reply = _reply_to_conversation(
-                    channel=channel,
-                    target_id=target_id,
-                    message=message,
-                    context={'source': 'zalo_tool_agent', 'command': action, 'message_id': payload.message_id},
-                )
-                record.command = action
-                record.response_payload = {'message': message, 'reply': reply}
-                db.commit()
-                return {'ok': True, 'action': action, 'reply': reply}
+        tool_text = _strip_bot_alias(payload.text, allow_plain_text=_is_direct_conversation(payload)) or payload.text
+        conversation_id = payload.conversation_id or payload.from_uid
+        tool_outcome = _run_tool_agent(db, actor=actor, text=tool_text, conversation_id=conversation_id)
+        if tool_outcome and tool_outcome.get('handled'):
+            action = str(tool_outcome.get('action') or 'chat')
+            message = str(tool_outcome.get('message') or '').strip()
+            reply = _reply_to_conversation(
+                channel=channel,
+                target_id=target_id,
+                message=message,
+                context={'source': 'zalo_tool_agent', 'command': action, 'message_id': payload.message_id},
+            )
+            store_conversation_message(
+                db,
+                user_id=actor.id,
+                conversation_id=conversation_id,
+                message_id=payload.message_id,
+                role='user',
+                content=tool_text,
+                metadata={'source': 'zalo_tool_agent', 'command': action},
+            )
+            store_conversation_message(
+                db,
+                user_id=actor.id,
+                conversation_id=conversation_id,
+                message_id=payload.message_id,
+                role='assistant',
+                content=message,
+                metadata={'source': 'zalo_tool_agent', 'command': action},
+            )
+            record.command = action
+            record.response_payload = {'message': message, 'reply': reply}
+            db.commit()
+            return {'ok': True, 'action': action, 'reply': reply}
 
+        if parsed.action == 'chat':
             fallback_add = _maybe_handle_natural_add_fallback(
                 db=db,
                 text=parsed.title or payload.text,

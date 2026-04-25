@@ -53,11 +53,33 @@ def store_conversation_message(
     )
     db.add(message)
     db.flush()
-    _trim_recent_messages(db, user_id=user_id, limit=settings.bot_recent_conversation_limit)
+    _trim_recent_messages(
+        db,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        limit=settings.bot_recent_conversation_limit,
+    )
     return message
 
 
-def _trim_recent_messages(db: Session, *, user_id: str | None, limit: int) -> None:
+def _trim_recent_messages(
+    db: Session,
+    *,
+    user_id: str | None,
+    conversation_id: str | None = None,
+    limit: int,
+) -> None:
+    if conversation_id:
+        ids = db.scalars(
+            select(BotConversationMessage.id)
+            .where(BotConversationMessage.conversation_id == conversation_id)
+            .order_by(BotConversationMessage.created_at.desc(), BotConversationMessage.id.desc())
+            .offset(limit)
+        ).all()
+        if ids:
+            db.execute(delete(BotConversationMessage).where(BotConversationMessage.id.in_(ids)))
+        return
+
     if not user_id:
         return
     ids = db.scalars(
@@ -70,13 +92,26 @@ def _trim_recent_messages(db: Session, *, user_id: str | None, limit: int) -> No
         db.execute(delete(BotConversationMessage).where(BotConversationMessage.id.in_(ids)))
 
 
-def recent_conversation_text(db: Session, *, user_id: str | None, limit: int | None = None) -> str:
+def recent_conversation_text(
+    db: Session,
+    *,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+    limit: int | None = None,
+) -> str:
     actual_limit = limit or settings.bot_recent_conversation_limit
-    if not user_id:
+    if not user_id and not conversation_id:
         return 'Chưa có lịch sử hội thoại.'
+
+    conditions = []
+    if conversation_id:
+        conditions.append(BotConversationMessage.conversation_id == conversation_id)
+    elif user_id:
+        conditions.append(BotConversationMessage.user_id == user_id)
+
     rows = db.scalars(
         select(BotConversationMessage)
-        .where(BotConversationMessage.user_id == user_id)
+        .where(*conditions)
         .order_by(BotConversationMessage.created_at.desc(), BotConversationMessage.id.desc())
         .limit(actual_limit)
     ).all()
