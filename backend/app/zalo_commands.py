@@ -36,6 +36,7 @@ from .services import get_task_or_404, list_tasks, local_today, next_list_order
 
 settings = get_settings()
 T = TypeVar('T')
+MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
 
 
 @dataclass(slots=True)
@@ -125,6 +126,58 @@ def _strip_bot_alias(text: str, *, allow_plain_text: bool) -> str | None:
             return stripped[len(prefix):].strip()
     if allow_plain_text:
         return stripped
+    return None
+
+
+def _mention_values(mention: dict) -> list[str]:
+    values: list[str] = []
+    for key in ('uid', 'id', 'user_id', 'userId', 'zalo_user_id', 'zaloUserId', 'label', 'name', 'displayName'):
+        value = mention.get(key)
+        if value is not None:
+            values.append(str(value).strip())
+    return [value for value in values if value]
+
+
+def _is_bot_mentioned(payload: ZaloIncomingRequest) -> bool:
+    if not payload.mentions:
+        return False
+
+    configured_ids = {item.casefold() for item in settings.zalo_bot_user_id_list}
+    aliases = {alias.strip().lstrip('@').casefold() for alias in settings.zalo_bot_alias_list}
+    for mention in payload.mentions:
+        values = _mention_values(mention)
+        folded = {value.casefold() for value in values}
+        if configured_ids and folded & configured_ids:
+            return True
+        labels = {value.lstrip('@').casefold() for value in values}
+        if aliases & labels:
+            return True
+    return False
+
+
+def _strip_leading_mention(text: str, payload: ZaloIncomingRequest) -> str:
+    stripped = text.strip()
+    for mention in payload.mentions:
+        for value in _mention_values(mention):
+            label = value.strip()
+            if not label:
+                continue
+            candidates = {label, f'@{label.lstrip("@")}'}
+            for candidate in candidates:
+                prefix = f'{candidate} '
+                if stripped.casefold().startswith(prefix.casefold()):
+                    return stripped[len(prefix):].strip()
+                if stripped.casefold() == candidate.casefold():
+                    return ''
+    return stripped
+
+
+def _message_body_for_bot(payload: ZaloIncomingRequest) -> str | None:
+    alias_body = _strip_bot_alias(payload.text, allow_plain_text=_is_direct_conversation(payload))
+    if alias_body is not None:
+        return alias_body
+    if _conversation_type(payload) == 'group' and _is_bot_mentioned(payload):
+        return _strip_leading_mention(payload.text, payload)
     return None
 
 
@@ -429,6 +482,52 @@ def _parse_command(text: str, *, allow_plain_text: bool) -> ParsedZaloCommand | 
     return parsed
 
 
+def _parse_command_body(body: str) -> ParsedZaloCommand | None:
+    try:
+        tokens = shlex.split(body)
+    except ValueError:
+        tokens = body.split()
+
+    if not tokens:
+        return ParsedZaloCommand(action='chat', title='')
+
+    action = tokens[0].casefold()
+    if action in {'list', 'ls'}:
+        view = tokens[1].casefold() if len(tokens) > 1 else 'today'
+        if view not in {'today', 'inbox'}:
+            view = 'today'
+        return ParsedZaloCommand(action='list', view=view)  # type: ignore[arg-type]
+
+    if action not in {'add', 'task', 'new'}:
+        return ParsedZaloCommand(action='chat', title=body)
+
+    title_tokens: list[str] = []
+    parsed = ParsedZaloCommand(action='add')
+    for token in tokens[1:]:
+        lower = token.casefold()
+        if lower.startswith('due:') or lower.startswith('date:'):
+            parsed.due_token = token.split(':', 1)[1]
+            continue
+        if lower.startswith('type:'):
+            parsed.type_token = token.split(':', 1)[1]
+            continue
+        if lower.startswith('!'):
+            priority_token = _clean_token(lower.removeprefix('!'))
+            if priority_token in {'low', 'medium', 'high'}:
+                parsed.priority = TaskPriority(priority_token)
+                continue
+        if token.startswith('@') and not parsed.assignee_token:
+            parsed.assignee_token = token
+            continue
+        if token.startswith('#') and not parsed.shop_token:
+            parsed.shop_token = token
+            continue
+        title_tokens.append(token)
+
+    parsed.title = ' '.join(title_tokens).strip()
+    return parsed
+
+
 def _tool_specs() -> list[dict[str, Any]]:
     return [
         {
@@ -498,6 +597,25 @@ def _tool_specs() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'update_task_status',
+                'description': (
+                    'Move a task to todo, doing, review, ready, or done. Use find_tasks first when the task is not '
+                    'identified by id. Backend enforces member/admin status rules.'
+                ),
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'task_id': {'type': 'integer'},
+                        'status': {'type': 'string', 'enum': ['todo', 'doing', 'review', 'ready', 'done']},
+                    },
+                    'required': ['task_id', 'status'],
+                    'additionalProperties': False,
+                },
+            },
+        },
     ]
 
 
@@ -529,9 +647,10 @@ def _tool_system_prompt(actor: User) -> str:
     return (
         f'{persona_text()}\n\n'
         'Bạn đang ở nhánh tool-calling của trợ lý Zalo cho Task Manager. '
-        'Bạn có quyền dùng tools để tìm task, list task, tạo task, và approve task. '
+        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, và đổi status task. '
         'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
+        'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
         'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
         'Nếu câu mơ hồ, không chắc, hoặc có nhiều task match, đừng tự quyết định; hãy hỏi lại ngắn gọn. '
         f'Người dùng hiện tại: {actor.name} ({actor.username}), role={actor.role or "unknown"}. '
@@ -672,6 +791,54 @@ def _tool_approve_task(db: Session, *, actor: User, task_id: int) -> dict[str, A
     return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
 
 
+def _validate_tool_status_transition(task: Task, next_status: TaskStatus, actor: User) -> str | None:
+    if next_status == task.status:
+        return None
+
+    if _is_admin(actor):
+        if next_status == TaskStatus.ready and task.status != TaskStatus.review:
+            return 'Only tasks in review can be approved to ready.'
+        return None
+
+    if task.assigned_to != actor.id:
+        return 'Members can only update their own tasks.'
+    if next_status in MEMBER_ALLOWED_STATUSES:
+        return None
+    if task.status == TaskStatus.ready and next_status == TaskStatus.done:
+        return None
+    return 'Members can only move tasks up to review, or mark ready tasks as done.'
+
+
+def _tool_update_task_status(db: Session, *, actor: User, task_id: int, status_token: str) -> dict[str, Any]:
+    task = get_task_or_404(db, task_id)
+    if not task:
+        return {'ok': False, 'error': 'Task not found.'}
+    if status_token not in {status.value for status in TaskStatus}:
+        return {'ok': False, 'error': f'Unknown status: {status_token}'}
+
+    next_status = TaskStatus(status_token)
+    error = _validate_tool_status_transition(task, next_status, actor)
+    if error:
+        return {'ok': False, 'error': error}
+
+    previous_status = task.status
+    task.status = next_status
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    if previous_status != task.status:
+        try:
+            enqueue_task_status_transition_notifications(
+                db,
+                task=task,
+                previous_status=previous_status,
+                actor=actor,
+            )
+        except Exception:
+            db.rollback()
+    return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
+
+
 def _execute_tool_call(db: Session, *, actor: User, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         if name == 'find_tasks':
@@ -697,6 +864,13 @@ def _execute_tool_call(db: Session, *, actor: User, name: str, arguments: dict[s
             )
         if name == 'approve_task':
             return _tool_approve_task(db, actor=actor, task_id=int(arguments.get('task_id')))
+        if name == 'update_task_status':
+            return _tool_update_task_status(
+                db,
+                actor=actor,
+                task_id=int(arguments.get('task_id')),
+                status_token=str(arguments.get('status') or '').strip(),
+            )
     except (ValueError, TypeError) as exc:
         return {'ok': False, 'error': str(exc)}
     except PermissionError as exc:
@@ -762,6 +936,8 @@ def _run_tool_agent(
                 action = 'add'
             elif last_tool_name == 'approve_task':
                 action = 'approve'
+            elif last_tool_name == 'update_task_status':
+                action = 'status'
             elif last_tool_name == 'list_tasks':
                 action = 'list'
             return {'handled': True, 'action': action, 'message': final_text}
@@ -1027,7 +1203,11 @@ def handle_zalo_incoming(
 
     channel = _conversation_channel(payload)
     target_id = _reply_target_id(payload)
-    parsed = _parse_command(payload.text, allow_plain_text=_is_direct_conversation(payload))
+    body = _message_body_for_bot(payload)
+    if body is None:
+        return {'ok': True, 'ignored': True, 'reason': 'missing_bot_alias'}
+
+    parsed = _parse_command_body(body)
     if parsed is None:
         return {'ok': True, 'ignored': True, 'reason': 'missing_bot_alias'}
 
@@ -1050,7 +1230,7 @@ def handle_zalo_incoming(
         return {'ok': False, 'error': 'unmapped_sender', 'reply': reply}
 
     try:
-        tool_text = _strip_bot_alias(payload.text, allow_plain_text=_is_direct_conversation(payload)) or payload.text
+        tool_text = body
         conversation_id = payload.conversation_id or payload.from_uid
         tool_outcome = _run_tool_agent(db, actor=actor, text=tool_text, conversation_id=conversation_id)
         if tool_outcome and tool_outcome.get('handled'):

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     zalo_group_id: str | None = None
     zalo_allowed_group_ids: str = ''
     zalo_bot_aliases: str = '@TaskBot,@task'
+    zalo_bot_user_ids: str = ''
     task_public_base_url: str | None = None
     openai_api_key: str | None = None
     bot_llm_model: str = 'gpt-4.1-mini'
@@ -82,6 +83,10 @@ class Settings(BaseSettings):
     def zalo_bot_alias_list(self) -> list[str]:
         aliases = [item.strip() for item in self.zalo_bot_aliases.split(',') if item.strip()]
         return aliases or ['@TaskBot', '@task']
+
+    @property
+    def zalo_bot_user_id_list(self) -> list[str]:
+        return [item.strip() for item in self.zalo_bot_user_ids.split(',') if item.strip()]
 
     def resolve_runtime_path(self, raw_path: str) -> Path:
         path = Path(raw_path)

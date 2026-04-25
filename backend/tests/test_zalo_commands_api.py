@@ -261,6 +261,41 @@ def test_zalo_explicit_list_routes_through_tool_agent_when_available(client, db_
     assert replies[-1]['message'] == 'Tool-agent list reply'
 
 
+def test_zalo_group_native_mention_routes_to_tool_agent(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    _, linh, _ = _users(client)
+    captured: dict[str, str] = {}
+
+    def _fake_tool_agent(*args, **kwargs):
+        captured['text'] = kwargs['text']
+        return {
+            'handled': True,
+            'action': 'chat',
+            'message': 'Em nghe rồi nha.',
+        }
+
+    monkeypatch.setattr('app.zalo_commands._run_tool_agent', _fake_tool_agent)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'hôm nay chị Quỳnh có gì chưa xong?',
+            'from_uid': linh['zalo_user_id'],
+            'conversation_id': 'test-zalo-group',
+            'conversation_type': 'group',
+            'message_id': 'msg-native-mention',
+            'mentions': [{'label': 'TaskBot'}],
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'chat'
+    assert captured['text'] == 'hôm nay chị Quỳnh có gì chưa xong?'
+    assert replies[-1]['channel'].value == 'group'
+    assert replies[-1]['message'] == 'Em nghe rồi nha.'
+
+
 def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, linh, _ = _users(client)
@@ -302,6 +337,49 @@ def test_zalo_tool_agent_can_approve_review_task(client, db_session, monkeypatch
     db_session.refresh(task)
     assert task.status == TaskStatus.ready
     assert 'approve task Bluey Collection' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_can_update_task_status(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, _ = _users(client)
+    task = Task(
+        title='Move this task',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.todo,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response('', [('call-1', 'find_tasks', {'query': 'move this', 'limit': 5})]),
+            _tool_response('', [('call-2', 'update_task_status', {'task_id': task.id, 'status': 'doing'})]),
+            _tool_response('Đã chuyển task Move this task sang doing rồi.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'chuyển task move this sang doing nha',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-update-status',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'status'
+    db_session.refresh(task)
+    assert task.status == TaskStatus.doing
+    assert 'sang doing' in replies[-1]['message']
 
 
 def test_zalo_tool_agent_create_task_accepts_user_id_assignee_token(client, db_session, monkeypatch) -> None:

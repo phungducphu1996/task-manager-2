@@ -44,6 +44,7 @@ Required env:
 - `ZALO_GROUP_ID`
 - `ZALO_ALLOWED_GROUP_IDS` (comma-separated group ids that may send commands)
 - `ZALO_BOT_ALIASES` (default `@TaskBot,@task`)
+- `ZALO_BOT_USER_IDS` (comma-separated Zalo ids for native mention detection)
 - `TASK_PUBLIC_BASE_URL` (for example `https://hazeleo.com/task`)
 
 Example crontab (server-side, Asia/Ho_Chi_Minh):
@@ -55,7 +56,7 @@ Example crontab (server-side, Asia/Ho_Chi_Minh):
 
 ## Zalo Group Commands V1
 
-The `zalo-worker` listener can forward group messages to `POST /zalo/incoming`. The backend only handles messages that start with a configured bot alias.
+The `zalo-worker` listener can forward group messages to `POST /zalo/incoming`. The backend handles messages that start with a configured bot alias, or native mention payloads that match `ZALO_BOT_USER_IDS` / `ZALO_BOT_ALIASES`.
 
 ```text
 @TaskBot add Fix mockup @quang #AmzMage type:Design due:tomorrow !high
