@@ -35,7 +35,10 @@ class Settings(BaseSettings):
     bot_llm_timeout_seconds: float = 25.0
     bot_enabled: bool = True
     bot_persona_path: str = 'bot/persona/core.md'
+    bot_notification_prompt_path: str = 'bot/persona/notifications.md'
     bot_profiles_dir: str = 'bot/profiles'
+    bot_contacts_path: str = 'bot/contacts.md'
+    bot_contact_prompts_dir: str = 'bot/contact-prompts'
     bot_events_path: str = 'bot/events.md'
     bot_recent_conversation_limit: int = 30
     bot_task_context_limit: int = 12
@@ -87,6 +90,13 @@ class Settings(BaseSettings):
     @property
     def zalo_bot_user_id_list(self) -> list[str]:
         return [item.strip() for item in self.zalo_bot_user_ids.split(',') if item.strip()]
+
+    @property
+    def zalo_group_entries(self) -> list[tuple[str, str]]:
+        group_ids = self.zalo_allowed_group_id_list
+        if self.zalo_group_id and self.zalo_group_id not in group_ids:
+            group_ids = [self.zalo_group_id, *group_ids]
+        return [(group_id, f'Zalo group {index + 1}') for index, group_id in enumerate(group_ids)]
 
     def resolve_runtime_path(self, raw_path: str) -> Path:
         path = Path(raw_path)

@@ -35,7 +35,9 @@ from .models import (
 )
 from .notifications import (
     enqueue_task_created_notifications,
+    enqueue_task_deleted_notifications,
     enqueue_task_status_transition_notifications,
+    enqueue_task_updated_notifications,
     is_internal_token_valid,
     run_daily_notification_job,
 )
@@ -194,6 +196,22 @@ def _trigger_status_transition_notifications(
             task.status.value,
             exc,
         )
+
+
+def _trigger_task_updated_notification(db: Session, *, task: Task, actor: User, changed_fields: list[str]) -> None:
+    try:
+        enqueue_task_updated_notifications(db, task=task, actor=actor, changed_fields=changed_fields)
+    except Exception as exc:  # pragma: no cover - defensive guard for notification side effects
+        db.rollback()
+        logger.warning('Failed to enqueue/deliver task-updated notification for task_id=%s: %s', task.id, exc)
+
+
+def _trigger_task_deleted_notification(db: Session, *, task: Task, actor: User) -> None:
+    try:
+        enqueue_task_deleted_notifications(db, task=task, actor=actor)
+    except Exception as exc:  # pragma: no cover - defensive guard for notification side effects
+        db.rollback()
+        logger.warning('Failed to enqueue/deliver task-deleted notification for task_id=%s: %s', task.id, exc)
 
 
 def require_internal_token(
@@ -798,6 +816,7 @@ def update_task(
     update_values = _apply_role_on_update(task, payload.model_dump(exclude_unset=True), actor)
     previous_status = task.status
     status_changed = 'status' in update_values and update_values['status'] != previous_status
+    changed_fields = [field for field in update_values if field != 'status']
     for field, value in update_values.items():
         setattr(task, field, value)
 
@@ -812,6 +831,8 @@ def update_task(
             previous_status=previous_status,
             actor=actor,
         )
+    if changed_fields:
+        _trigger_task_updated_notification(db, task=full_task, actor=actor, changed_fields=changed_fields)
     return full_task
 
 
@@ -963,6 +984,8 @@ def delete_task(task_id: int, db: Session = Depends(get_db), actor: User = Depen
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
     _ensure_task_access(task, actor)
 
+    full_task = get_task_or_404(db, task_id) or task
+    _trigger_task_deleted_notification(db, task=full_task, actor=actor)
     db.delete(task)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

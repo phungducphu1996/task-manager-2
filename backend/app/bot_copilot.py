@@ -7,6 +7,9 @@ from sqlalchemy.orm import Session
 
 from .bot_files import (
     append_event,
+    contact_prompt_text_for_group,
+    contact_prompt_text_for_user,
+    contact_registry_text,
     ensure_bot_files,
     persona_text,
     profile_summary_text,
@@ -104,6 +107,26 @@ def _user_directory_text(db: Session) -> str:
     return '\n'.join(blocks)
 
 
+def _contact_context_text(
+    db: Session,
+    *,
+    actor: User,
+    reply_channel: NotificationChannel | None,
+    reply_target_id: str | None,
+) -> str:
+    users = db.scalars(
+        select(User).where(User.is_active.is_(True)).order_by(User.full_name.asc(), User.username.asc())
+    ).all()
+    parts = [
+        contact_registry_text(users, settings.zalo_group_entries),
+        f'Actor personal custom prompt:\n{contact_prompt_text_for_user(actor)}',
+    ]
+    if reply_channel == NotificationChannel.group and reply_target_id:
+        group_name = dict(settings.zalo_group_entries).get(reply_target_id, reply_target_id)
+        parts.append(f'Current group custom prompt:\n{contact_prompt_text_for_group(reply_target_id, group_name)}')
+    return '\n\n'.join(parts)
+
+
 def _fallback_reply(actor: User, incoming_text: str, *, task_context: str, memory_text: str) -> str:
     greeting = f'{actor.name} ơi, em nhận ra anh/chị đang hỏi em rồi nè.'
     task_block = task_context.split('\n\n', 1)[0].strip()
@@ -136,6 +159,7 @@ def _user_prompt(
     events_text: str,
     task_context: str,
     user_directory_text: str,
+    contact_context_text: str,
 ) -> str:
     return (
         f'Người đang hỏi:\n'
@@ -146,6 +170,7 @@ def _user_prompt(
         f'Profile markdown:\n{profile_markdown}\n\n'
         f'Known memory facts:\n{memory_text}\n\n'
         f'Active user directory:\n{user_directory_text}\n\n'
+        f'Contact registry and custom prompts:\n{contact_context_text}\n\n'
         f'Recent conversations:\n{recent_conversation}\n\n'
         f'Recent office events:\n{events_text}\n\n'
         f'Current task context:\n{task_context}\n\n'
@@ -220,6 +245,12 @@ def handle_zalo_chat(
     task_context = _task_context_text(db, actor=actor)
     profile_markdown = profile_text(actor)
     user_directory_text = _user_directory_text(db)
+    contact_context = _contact_context_text(
+        db,
+        actor=actor,
+        reply_channel=reply_channel,
+        reply_target_id=reply_target_id,
+    )
     memory_text = recent_memory_text(db, user_id=actor.id)
     recent_conversation = recent_conversation_text(db, user_id=actor.id)
     events_text = recent_events_text()
@@ -235,6 +266,7 @@ def handle_zalo_chat(
                 incoming_text=incoming_text,
                 profile_markdown=profile_markdown,
                 user_directory_text=user_directory_text,
+                contact_context_text=contact_context,
                 memory_text=memory_text,
                 recent_conversation=recent_conversation,
                 events_text=events_text,

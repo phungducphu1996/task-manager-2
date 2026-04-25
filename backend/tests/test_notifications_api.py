@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -61,6 +62,53 @@ def test_realtime_create_assignment_notification(client, db_session, monkeypatch
     assert calls and calls[0]['channel'] == 'user'
 
 
+def test_realtime_notification_message_can_be_rendered_by_llm(client, db_session, monkeypatch) -> None:
+    install_worker_success_stub(monkeypatch)
+    settings = get_settings()
+    settings.openai_api_key = 'test-openai-key'
+    prompt_path = Path(settings.bot_notification_prompt_path)
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text('# Custom Notify Voice\nNói chuyện duyên dáng kiểu Hazel.', encoding='utf-8')
+
+    captured: dict[str, str] = {}
+
+    def _fake_generate_bot_reply(*, system_prompt: str, user_prompt: str) -> str:
+        captured['system_prompt'] = system_prompt
+        captured['user_prompt'] = user_prompt
+        return 'LLM: task mới tới rồi, xử lý nhẹ nhàng nha.'
+
+    monkeypatch.setattr('app.notifications.generate_bot_reply', _fake_generate_bot_reply)
+
+    users = client.get('/users').json()
+    admin, member, _ = select_users(users)
+    prompt_dir = Path(settings.bot_contact_prompts_dir) / 'personal'
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    (prompt_dir / f'{member["username"]}.md').write_text(
+        '# Custom Prompt: member\nNói với member bằng giọng cực ngắn.',
+        encoding='utf-8',
+    )
+    created = client.post(
+        '/tasks',
+        json={
+            'title': 'LLM assign',
+            'assigned_to': member['id'],
+            'created_by': admin['id'],
+        },
+        headers=actor_headers(admin['id']),
+    )
+
+    assert created.status_code == 201
+    event = db_session.scalar(
+        select(NotificationEvent).where(NotificationEvent.event_type == 'task_assigned_on_create')
+    )
+    assert event is not None
+    assert event.payload['message'] == 'LLM: task mới tới rồi, xử lý nhẹ nhàng nha.'
+    assert event.payload['context']['llm_rendered'] is True
+    assert 'Custom Notify Voice' in captured['system_prompt']
+    assert 'LLM assign' in captured['user_prompt']
+    assert 'Nói với member bằng giọng cực ngắn.' in captured['user_prompt']
+
+
 def test_realtime_status_transition_notifications(client, db_session, monkeypatch) -> None:
     install_worker_success_stub(monkeypatch)
 
@@ -113,6 +161,44 @@ def test_realtime_status_transition_notifications(client, db_session, monkeypatc
     assert by_type.get('task_submitted_for_review', 0) == 1
     assert by_type.get('task_approved_ready', 0) == 1
     assert by_type.get('task_done_by_member', 0) == 1
+
+
+def test_realtime_update_and_delete_notifications(client, db_session, monkeypatch) -> None:
+    install_worker_success_stub(monkeypatch)
+
+    users = client.get('/users').json()
+    admin, member, _ = select_users(users)
+    created = client.post(
+        '/tasks',
+        json={'title': 'Mutable task', 'assigned_to': member['id'], 'created_by': admin['id']},
+        headers=actor_headers(admin['id']),
+    )
+    assert created.status_code == 201
+    task_id = created.json()['id']
+
+    updated = client.patch(
+        f'/tasks/{task_id}',
+        json={'due_date': '2026-04-30'},
+        headers=actor_headers(admin['id']),
+    )
+    assert updated.status_code == 200
+
+    deleted = client.delete(f'/tasks/{task_id}', headers=actor_headers(admin['id']))
+    assert deleted.status_code == 204
+
+    updated_event = db_session.scalar(
+        select(NotificationEvent).where(NotificationEvent.event_type == 'task_updated')
+    )
+    deleted_event = db_session.scalar(
+        select(NotificationEvent).where(NotificationEvent.event_type == 'task_deleted')
+    )
+
+    assert updated_event is not None
+    assert updated_event.target_id == member['zalo_user_id']
+    assert updated_event.payload['context']['changed_fields'] == ['due_date']
+    assert deleted_event is not None
+    assert deleted_event.target_id == member['zalo_user_id']
+    assert deleted_event.payload['context']['task_id'] == task_id
 
 
 def test_internal_notification_job_requires_token(client) -> None:

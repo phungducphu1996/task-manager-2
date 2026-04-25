@@ -11,11 +11,11 @@ from typing import Any, Callable, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from .bot_files import persona_text, profile_summary_text, profile_text
+from .bot_files import contact_prompt_text_for_group, contact_prompt_text_for_user, contact_registry_text, persona_text, profile_summary_text, profile_text
 from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
 from .bot_memory import recent_conversation_text, recent_memory_text, store_conversation_message
 from .config import get_settings
@@ -398,6 +398,22 @@ def _resolve_user(db: Session, token: str | None) -> User | None:
     return _resolve_unique_by_token(users, clean, lambda user: [user.id, user.username, user.name, user.zalo_user_id])
 
 
+def _matching_users_for_token(db: Session, token: str | None) -> list[User]:
+    clean = _clean_token((token or '').removeprefix('@'))
+    normalized = _normalize_lookup(clean)
+    if not normalized:
+        return []
+
+    users = db.scalars(select(User).where(User.is_active.is_(True))).all()
+    matches: list[User] = []
+    for user in users:
+        names = [user.id, user.username, user.name, user.zalo_user_id]
+        keys = [_normalize_lookup(str(value or '')) for value in names if value]
+        if normalized in keys or any(key.startswith(normalized) for key in keys):
+            matches.append(user)
+    return matches
+
+
 def _resolve_shop(db: Session, token: str | None) -> Shop | None:
     if not token:
         return None
@@ -616,6 +632,29 @@ def _tool_specs() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'send_message',
+                'description': (
+                    'Send a Zalo message to a specific user or group when the current actor asks the bot to relay a '
+                    'message. Use user target tokens from the active user directory when possible.'
+                ),
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'channel': {'type': 'string', 'enum': ['user', 'group']},
+                        'target_token': {
+                            'type': 'string',
+                            'description': 'User id, username, name, zalo_user_id, "current_group", or "default_group".',
+                        },
+                        'message': {'type': 'string'},
+                    },
+                    'required': ['channel', 'target_token', 'message'],
+                    'additionalProperties': False,
+                },
+            },
+        },
     ]
 
 
@@ -626,7 +665,7 @@ def _active_user_directory_text(db: Session) -> str:
     if not users:
         return 'Không có user active nào.'
 
-    lines: list[str] = []
+    lines: list[str] = ['# Active User Directory']
     for user in users:
         lines.append(
             '- '
@@ -640,6 +679,7 @@ def _active_user_directory_text(db: Session) -> str:
             )
         )
         lines.append(f'  Profile:\n{profile_summary_text(user)}')
+    lines.extend(['', '# Contact Registry', contact_registry_text(users, settings.zalo_group_entries)])
     return '\n'.join(lines)
 
 
@@ -647,8 +687,9 @@ def _tool_system_prompt(actor: User) -> str:
     return (
         f'{persona_text()}\n\n'
         'Bạn đang ở nhánh tool-calling của trợ lý Zalo cho Task Manager. '
-        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, và đổi status task. '
+        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, đổi status task, và gửi tin nhắn Zalo hộ người dùng. '
         'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
+        'Luôn dùng send_message khi người dùng yêu cầu nhắn/gửi/chuyển lời cho một người hoặc group. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
         'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
         'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
@@ -665,10 +706,18 @@ def _tool_user_prompt(
     user_directory_text: str,
     recent_conversation: str,
     memory_text: str,
+    current_channel: NotificationChannel | None = None,
+    current_target_id: str | None = None,
 ) -> str:
+    contact_parts = [f'Actor custom prompt:\n{contact_prompt_text_for_user(actor)}']
+    if current_channel == NotificationChannel.group and current_target_id:
+        group_name = dict(settings.zalo_group_entries).get(current_target_id, current_target_id)
+        contact_parts.append(f'Current group custom prompt:\n{contact_prompt_text_for_group(current_target_id, group_name)}')
+    contact_context = '\n\n'.join(contact_parts)
     return (
         f'Actor: {actor.name} | username={actor.username} | role={actor.role or "unknown"}\n'
         f'Profile markdown:\n{profile_text(actor)}\n\n'
+        f'Contact custom context:\n{contact_context}\n\n'
         f'Active user directory:\n{user_directory_text}\n\n'
         f'Known memory facts:\n{memory_text}\n\n'
         f'Recent conversation in this thread:\n{recent_conversation}\n\n'
@@ -707,7 +756,11 @@ def _tool_find_tasks(db: Session, *, actor: User, query: str, status_token: str 
         stmt = stmt.where(Task.id == int(normalized_query))
     else:
         like_query = f'%{normalized_query.lower()}%'
-        stmt = stmt.where(func.lower(Task.title).like(like_query))
+        matched_user_ids = [user.id for user in _matching_users_for_token(db, normalized_query)]
+        search_filters = [func.lower(Task.title).like(like_query)]
+        if matched_user_ids:
+            search_filters.append(Task.assigned_to.in_(matched_user_ids))
+        stmt = stmt.where(or_(*search_filters))
 
     if status_token and status_token in {status.value for status in TaskStatus}:
         stmt = stmt.where(Task.status == TaskStatus(status_token))
@@ -839,7 +892,110 @@ def _tool_update_task_status(db: Session, *, actor: User, task_id: int, status_t
     return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
 
 
-def _execute_tool_call(db: Session, *, actor: User, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def _resolve_group_message_target(
+    *,
+    target_token: str | None,
+    current_channel: NotificationChannel | None,
+    current_target_id: str | None,
+) -> str | None:
+    token = (target_token or '').strip().casefold()
+    if token in {'current', 'current_group', 'group hiện tại', 'nhóm hiện tại'}:
+        if current_channel == NotificationChannel.group:
+            return current_target_id
+        return settings.zalo_group_id
+    if token in {'default', 'default_group', 'main_group', 'group', 'nhóm'}:
+        return settings.zalo_group_id or (current_target_id if current_channel == NotificationChannel.group else None)
+    if target_token and target_token.strip():
+        return target_token.strip()
+    return settings.zalo_group_id or (current_target_id if current_channel == NotificationChannel.group else None)
+
+
+def _tool_send_message(
+    db: Session,
+    *,
+    actor: User,
+    channel_token: str,
+    target_token: str | None,
+    message: str,
+    current_channel: NotificationChannel | None,
+    current_target_id: str | None,
+) -> dict[str, Any]:
+    normalized_channel = (channel_token or '').strip().casefold()
+    clean_message = (message or '').strip()
+    if not clean_message:
+        return {'ok': False, 'error': 'Message is empty.'}
+
+    if normalized_channel == NotificationChannel.user.value:
+        target_user = _resolve_user(db, target_token)
+        if not target_user:
+            return {'ok': False, 'error': f'Không tìm thấy người nhận {target_token}.'}
+        if not target_user.zalo_user_id:
+            return {'ok': False, 'error': f'{target_user.name} chưa có zalo_user_id.'}
+
+        ok, status_code, body, error = send_zalo_text(
+            channel=NotificationChannel.user,
+            target_id=target_user.zalo_user_id,
+            message=clean_message,
+            context={
+                'source': 'zalo_tool_agent',
+                'command': 'send_message',
+                'actor_id': actor.id,
+                'target_user_id': target_user.id,
+            },
+        )
+        return {
+            'ok': ok,
+            'channel': NotificationChannel.user.value,
+            'target_id': target_user.zalo_user_id,
+            'target_name': target_user.name,
+            'status_code': status_code,
+            'body': body,
+            'error': error,
+        }
+
+    if normalized_channel == NotificationChannel.group.value:
+        target_id = _resolve_group_message_target(
+            target_token=target_token,
+            current_channel=current_channel,
+            current_target_id=current_target_id,
+        )
+        if not target_id:
+            return {'ok': False, 'error': 'Không tìm thấy group để gửi tin.'}
+        allowed_groups = settings.zalo_allowed_group_id_list
+        if allowed_groups and target_id not in allowed_groups:
+            return {'ok': False, 'error': 'Group này không nằm trong ZALO_ALLOWED_GROUP_IDS.'}
+
+        ok, status_code, body, error = send_zalo_text(
+            channel=NotificationChannel.group,
+            target_id=target_id,
+            message=clean_message,
+            context={
+                'source': 'zalo_tool_agent',
+                'command': 'send_message',
+                'actor_id': actor.id,
+            },
+        )
+        return {
+            'ok': ok,
+            'channel': NotificationChannel.group.value,
+            'target_id': target_id,
+            'status_code': status_code,
+            'body': body,
+            'error': error,
+        }
+
+    return {'ok': False, 'error': f'Unknown send_message channel: {channel_token}'}
+
+
+def _execute_tool_call(
+    db: Session,
+    *,
+    actor: User,
+    name: str,
+    arguments: dict[str, Any],
+    current_channel: NotificationChannel | None = None,
+    current_target_id: str | None = None,
+) -> dict[str, Any]:
     try:
         if name == 'find_tasks':
             return _tool_find_tasks(
@@ -871,6 +1027,16 @@ def _execute_tool_call(db: Session, *, actor: User, name: str, arguments: dict[s
                 task_id=int(arguments.get('task_id')),
                 status_token=str(arguments.get('status') or '').strip(),
             )
+        if name == 'send_message':
+            return _tool_send_message(
+                db,
+                actor=actor,
+                channel_token=str(arguments.get('channel') or '').strip(),
+                target_token=str(arguments.get('target_token') or '').strip() or None,
+                message=str(arguments.get('message') or ''),
+                current_channel=current_channel,
+                current_target_id=current_target_id,
+            )
     except (ValueError, TypeError) as exc:
         return {'ok': False, 'error': str(exc)}
     except PermissionError as exc:
@@ -886,6 +1052,8 @@ def _run_tool_agent(
     actor: User,
     text: str,
     conversation_id: str | None = None,
+    current_channel: NotificationChannel | None = None,
+    current_target_id: str | None = None,
 ) -> dict[str, Any] | None:
     if not is_bot_llm_configured():
         return None
@@ -907,6 +1075,8 @@ def _run_tool_agent(
                 user_directory_text=user_directory_text,
                 recent_conversation=recent_conversation,
                 memory_text=memory_text,
+                current_channel=current_channel,
+                current_target_id=current_target_id,
             ),
         },
     ]
@@ -940,11 +1110,20 @@ def _run_tool_agent(
                 action = 'status'
             elif last_tool_name == 'list_tasks':
                 action = 'list'
+            elif last_tool_name == 'send_message':
+                action = 'send_message'
             return {'handled': True, 'action': action, 'message': final_text}
 
         for tool_call in response.tool_calls:
             last_tool_name = tool_call.name
-            result = _execute_tool_call(db, actor=actor, name=tool_call.name, arguments=tool_call.arguments)
+            result = _execute_tool_call(
+                db,
+                actor=actor,
+                name=tool_call.name,
+                arguments=tool_call.arguments,
+                current_channel=current_channel,
+                current_target_id=current_target_id,
+            )
             last_tool_result = result
             messages.append(
                 {
@@ -1232,7 +1411,14 @@ def handle_zalo_incoming(
     try:
         tool_text = body
         conversation_id = payload.conversation_id or payload.from_uid
-        tool_outcome = _run_tool_agent(db, actor=actor, text=tool_text, conversation_id=conversation_id)
+        tool_outcome = _run_tool_agent(
+            db,
+            actor=actor,
+            text=tool_text,
+            conversation_id=conversation_id,
+            current_channel=channel,
+            current_target_id=target_id,
+        )
         if tool_outcome and tool_outcome.get('handled'):
             action = str(tool_outcome.get('action') or 'chat')
             message = str(tool_outcome.get('message') or '').strip()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import json
 from logging import getLogger
 import hmac
 import random
@@ -15,6 +16,8 @@ from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
+from .bot_files import contact_prompt_text_for_user, notification_prompt_text
+from .bot_llm import BotLLMError, generate_bot_reply, is_bot_llm_configured
 from .config import get_settings
 from .models import (
     NotificationChannel,
@@ -359,6 +362,96 @@ def _task_title(task: Task) -> str:
     return task.title.strip() if task.title else f'Task #{task.id}'
 
 
+def _task_url(task_id: int | None) -> str | None:
+    if task_id is None:
+        return None
+    base_url = (settings.task_public_base_url or '').strip().rstrip('/')
+    if not base_url:
+        return None
+    return f'{base_url}/tasks/{task_id}'
+
+
+def _task_notification_payload(
+    *,
+    event_type: str,
+    task: Task,
+    recipient: User | None,
+    actor: User | None,
+    previous_status: TaskStatus | None = None,
+    changed_fields: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        'event_type': event_type,
+        'recipient': {
+            'id': recipient.id,
+            'name': recipient.name,
+            'username': recipient.username,
+            'role': recipient.role,
+        }
+        if recipient
+        else None,
+        'actor': {
+            'id': actor.id,
+            'name': actor.name,
+            'username': actor.username,
+            'role': actor.role,
+        }
+        if actor
+        else None,
+        'task': {
+            'id': task.id,
+            'title': _task_title(task),
+            'status': task.status.value,
+            'previous_status': previous_status.value if previous_status else None,
+            'assignee': task.assignee.name if task.assignee else None,
+            'assigned_to': task.assigned_to,
+            'shop': task.shop.name if task.shop else None,
+            'type': task.task_type.name if task.task_type else None,
+            'due_date': task.due_date.isoformat() if task.due_date else None,
+            'priority': task.priority.value if task.priority else None,
+            'url': _task_url(task.id),
+        },
+        'changed_fields': changed_fields or [],
+        'recipient_custom_prompt': contact_prompt_text_for_user(recipient) if recipient else '',
+        'actor_custom_prompt': contact_prompt_text_for_user(actor) if actor else '',
+    }
+
+
+def _render_realtime_notification_message(
+    *,
+    event_type: str,
+    task: Task,
+    recipient: User | None,
+    actor: User | None,
+    fallback: str,
+    previous_status: TaskStatus | None = None,
+    changed_fields: list[str] | None = None,
+) -> str:
+    if not is_bot_llm_configured():
+        return fallback
+
+    event_payload = _task_notification_payload(
+        event_type=event_type,
+        task=task,
+        recipient=recipient,
+        actor=actor,
+        previous_status=previous_status,
+        changed_fields=changed_fields,
+    )
+    user_prompt = (
+        'Viết một thông báo Zalo cho realtime task event dưới đây.\n'
+        'Trả về duy nhất nội dung tin nhắn, không markdown fence, không JSON.\n\n'
+        f'{json.dumps(event_payload, ensure_ascii=False, default=str)}'
+    )
+    try:
+        message = generate_bot_reply(system_prompt=notification_prompt_text(), user_prompt=user_prompt).strip()
+    except BotLLMError as exc:
+        logger.warning('Failed to render notification with LLM for task_id=%s event=%s: %s', task.id, event_type, exc)
+        return fallback
+
+    return message[:1200] if message else fallback
+
+
 def _assigned_to_user_clause(user_id: str):
     if settings.database_url.startswith('sqlite'):
         return Task.assigned_to == user_id
@@ -381,10 +474,17 @@ def enqueue_task_created_notifications(db: Session, task: Task) -> dict[str, int
     target_id = assignee.zalo_user_id if assignee else None
     assignee_name = assignee.name if assignee else 'Bạn'
 
-    message = (
+    fallback_message = (
         f'Chào {assignee_name} 👋\n'
         f'Bạn vừa được giao task mới: "{_task_title(task)}".\n'
         'Vào Task Manager để bắt đầu xử lý nha 💪'
+    )
+    message = _render_realtime_notification_message(
+        event_type='task_assigned_on_create',
+        task=task,
+        recipient=assignee,
+        actor=task.creator,
+        fallback=fallback_message,
     )
 
     created_at = task.created_at or now_local()
@@ -400,10 +500,102 @@ def enqueue_task_created_notifications(db: Session, task: Task) -> dict[str, int
             'context': {
                 'source': 'realtime',
                 'reason': 'task_created_assigned',
+                'llm_rendered': message != fallback_message,
             },
         },
     )
 
+    event, created = enqueue_notification_event(db, spec)
+    db.commit()
+    dispatch_due_notification_events(db, limit=1)
+    return {'created': int(created), 'deduped': int(not created), 'event_id': event.id}
+
+
+def enqueue_task_updated_notifications(
+    db: Session,
+    *,
+    task: Task,
+    actor: User,
+    changed_fields: list[str],
+) -> dict[str, int]:
+    if not task.assigned_to or actor.id == task.assigned_to:
+        return {'created': 0, 'deduped': 0}
+
+    assignee = task.assignee or db.get(User, task.assigned_to)
+    target_id = assignee.zalo_user_id if assignee else None
+    field_text = ', '.join(changed_fields) if changed_fields else 'một vài thông tin'
+    fallback_message = (
+        f'{assignee.name if assignee else "Bạn"} ơi, task "{_task_title(task)}" vừa được cập nhật.\n'
+        f'Mục thay đổi: {field_text}.'
+    )
+    message = _render_realtime_notification_message(
+        event_type='task_updated',
+        task=task,
+        recipient=assignee,
+        actor=actor,
+        fallback=fallback_message,
+        changed_fields=changed_fields,
+    )
+    event_time = task.updated_at or now_local()
+    spec = NotificationSpec(
+        event_key=f'task:{task.id}:updated:{task.assigned_to}:{event_time.isoformat()}',
+        event_type='task_updated',
+        channel=NotificationChannel.user,
+        target_id=target_id,
+        task_id=task.id,
+        user_id=task.assigned_to,
+        payload={
+            'message': message,
+            'context': {
+                'source': 'realtime',
+                'reason': 'task_updated',
+                'changed_fields': changed_fields,
+                'actor_id': actor.id,
+                'llm_rendered': message != fallback_message,
+            },
+        },
+    )
+    event, created = enqueue_notification_event(db, spec)
+    db.commit()
+    dispatch_due_notification_events(db, limit=1)
+    return {'created': int(created), 'deduped': int(not created), 'event_id': event.id}
+
+
+def enqueue_task_deleted_notifications(db: Session, *, task: Task, actor: User) -> dict[str, int]:
+    if not task.assigned_to or actor.id == task.assigned_to:
+        return {'created': 0, 'deduped': 0}
+
+    assignee = task.assignee or db.get(User, task.assigned_to)
+    target_id = assignee.zalo_user_id if assignee else None
+    fallback_message = (
+        f'{assignee.name if assignee else "Bạn"} ơi, task "{_task_title(task)}" vừa được xoá bởi {actor.name}.'
+    )
+    message = _render_realtime_notification_message(
+        event_type='task_deleted',
+        task=task,
+        recipient=assignee,
+        actor=actor,
+        fallback=fallback_message,
+    )
+    event_time = now_local()
+    spec = NotificationSpec(
+        event_key=f'task:{task.id}:deleted:{task.assigned_to}:{event_time.isoformat()}',
+        event_type='task_deleted',
+        channel=NotificationChannel.user,
+        target_id=target_id,
+        task_id=None,
+        user_id=task.assigned_to,
+        payload={
+            'message': message,
+            'context': {
+                'source': 'realtime',
+                'reason': 'task_deleted',
+                'task_id': task.id,
+                'actor_id': actor.id,
+                'llm_rendered': message != fallback_message,
+            },
+        },
+    )
     event, created = enqueue_notification_event(db, spec)
     db.commit()
     dispatch_due_notification_events(db, limit=1)
@@ -425,6 +617,19 @@ def enqueue_task_status_transition_notifications(
         assignee = task.assignee or db.get(User, task.assigned_to)
         target_id = assignee.zalo_user_id if assignee else None
         assignee_name = assignee.name if assignee else 'Bạn'
+        fallback_message = (
+            f'Chúc mừng {assignee_name} 🎉\n'
+            f'Task "{_task_title(task)}" đã được admin duyệt (ready).\n'
+            'Bạn có thể triển khai tiếp ngay nha 😎'
+        )
+        message = _render_realtime_notification_message(
+            event_type='task_approved_ready',
+            task=task,
+            recipient=assignee,
+            actor=actor,
+            fallback=fallback_message,
+            previous_status=previous_status,
+        )
         specs.append(
             NotificationSpec(
                 event_key=f'task:{task.id}:review-ready:{task.assigned_to}:{event_time.isoformat()}',
@@ -434,12 +639,8 @@ def enqueue_task_status_transition_notifications(
                 task_id=task.id,
                 user_id=task.assigned_to,
                 payload={
-                    'message': (
-                        f'Chúc mừng {assignee_name} 🎉\n'
-                        f'Task "{_task_title(task)}" đã được admin duyệt (ready).\n'
-                        'Bạn có thể triển khai tiếp ngay nha 😎'
-                    ),
-                    'context': {'source': 'realtime', 'reason': 'review_to_ready'},
+                    'message': message,
+                    'context': {'source': 'realtime', 'reason': 'review_to_ready', 'llm_rendered': message != fallback_message},
                 },
             )
         )
@@ -447,6 +648,19 @@ def enqueue_task_status_transition_notifications(
     if current_status == TaskStatus.review:
         admins = _active_admins(db)
         for admin in admins:
+            fallback_message = (
+                f'Admin ơi 👑\n'
+                f'Task "{_task_title(task)}" vừa được chuyển sang review.\n'
+                'Vào duyệt giúp team khi rảnh nhé 🔍'
+            )
+            message = _render_realtime_notification_message(
+                event_type='task_submitted_for_review',
+                task=task,
+                recipient=admin,
+                actor=actor,
+                fallback=fallback_message,
+                previous_status=previous_status,
+            )
             specs.append(
                 NotificationSpec(
                     event_key=f'task:{task.id}:to-review:admin:{admin.id}:{event_time.isoformat()}',
@@ -456,12 +670,8 @@ def enqueue_task_status_transition_notifications(
                     task_id=task.id,
                     user_id=admin.id,
                     payload={
-                        'message': (
-                            f'Admin ơi 👑\n'
-                            f'Task "{_task_title(task)}" vừa được chuyển sang review.\n'
-                            'Vào duyệt giúp team khi rảnh nhé 🔍'
-                        ),
-                        'context': {'source': 'realtime', 'reason': 'moved_to_review'},
+                        'message': message,
+                        'context': {'source': 'realtime', 'reason': 'moved_to_review', 'llm_rendered': message != fallback_message},
                     },
                 )
             )
@@ -471,6 +681,18 @@ def enqueue_task_status_transition_notifications(
         admins = _active_admins(db)
         assignee_name = task.assignee.name if task.assignee else (task.assigned_to or 'member')
         for admin in admins:
+            fallback_message = (
+                f'Admin update ✅\n'
+                f'Task "{_task_title(task)}" đã được {assignee_name} chuyển sang done.'
+            )
+            message = _render_realtime_notification_message(
+                event_type='task_done_by_member',
+                task=task,
+                recipient=admin,
+                actor=actor,
+                fallback=fallback_message,
+                previous_status=previous_status,
+            )
             specs.append(
                 NotificationSpec(
                     event_key=f'task:{task.id}:done-by-member:admin:{admin.id}:{event_time.isoformat()}',
@@ -480,11 +702,8 @@ def enqueue_task_status_transition_notifications(
                     task_id=task.id,
                     user_id=admin.id,
                     payload={
-                        'message': (
-                            f'Admin update ✅\n'
-                            f'Task "{_task_title(task)}" đã được {assignee_name} chuyển sang done.'
-                        ),
-                        'context': {'source': 'realtime', 'reason': 'member_done'},
+                        'message': message,
+                        'context': {'source': 'realtime', 'reason': 'member_done', 'llm_rendered': message != fallback_message},
                     },
                 )
             )

@@ -46,7 +46,10 @@ main_module.engine = test_engine
 def isolated_bot_paths(tmp_path) -> None:
     settings = get_settings()
     settings.bot_persona_path = str(tmp_path / 'bot' / 'persona' / 'core.md')
+    settings.bot_notification_prompt_path = str(tmp_path / 'bot' / 'persona' / 'notifications.md')
     settings.bot_profiles_dir = str(tmp_path / 'bot' / 'profiles')
+    settings.bot_contacts_path = str(tmp_path / 'bot' / 'contacts.md')
+    settings.bot_contact_prompts_dir = str(tmp_path / 'bot' / 'contact-prompts')
     settings.bot_events_path = str(tmp_path / 'bot' / 'events.md')
     settings.openai_api_key = None
 

@@ -382,6 +382,148 @@ def test_zalo_tool_agent_can_update_task_status(client, db_session, monkeypatch)
     assert 'sang doing' in replies[-1]['message']
 
 
+def test_zalo_find_tasks_matches_assignee_token(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, quang = _users(client)
+    task = Task(
+        title='Unrelated title',
+        assigned_to=quang['id'],
+        created_by=admin['id'],
+        status=TaskStatus.todo,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+
+    calls = {'count': 0}
+
+    def fake_complete_bot_conversation(**kwargs):
+        calls['count'] += 1
+        if calls['count'] == 1:
+            return _tool_response('', [('call-1', 'find_tasks', {'query': quang['username'], 'limit': 10})])
+
+        tool_message = next(message for message in kwargs['messages'] if message.get('role') == 'tool')
+        tool_payload = json.loads(tool_message['content'])
+        assert tool_payload['count'] == 1
+        assert tool_payload['tasks'][0]['title'] == 'Unrelated title'
+        assert tool_payload['tasks'][0]['assigned_to'] == quang['id']
+        return _tool_response('Em thấy task Unrelated title đang giao cho Quang.')
+
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', fake_complete_bot_conversation)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': f'{quang["username"]} đang có task gì?',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-find-by-assignee',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'chat'
+    assert 'Unrelated title' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_can_relay_message_to_user(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, quang = _users(client)
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'send_message',
+                        {
+                            'channel': 'user',
+                            'target_token': quang['username'],
+                            'message': 'Quang ơi cập nhật task due date giúp anh Phú nha.',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Em nhắn Quang rồi anh Phú nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'hãy nhắn cho Quang cập nhật task due date đi nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-user',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert replies[0]['channel'].value == 'user'
+    assert replies[0]['target_id'] == quang['zalo_user_id']
+    assert 'due date' in replies[0]['message']
+    assert replies[-1]['target_id'] == admin['zalo_user_id']
+    assert 'nhắn Quang rồi' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_can_relay_message_to_default_group(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, _ = _users(client)
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'send_message',
+                        {
+                            'channel': 'group',
+                            'target_token': 'default_group',
+                            'message': 'Team ơi nhớ cập nhật due date task hôm nay nha.',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Em nhắn lên group rồi anh Phú nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'nhắn lên group nhắc mọi người cập nhật due date nha',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-group',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert replies[0]['channel'].value == 'group'
+    assert replies[0]['target_id'] == 'test-zalo-group'
+    assert 'Team ơi' in replies[0]['message']
+    assert replies[-1]['target_id'] == admin['zalo_user_id']
+    assert 'group rồi' in replies[-1]['message']
+
+
 def test_zalo_tool_agent_create_task_accepts_user_id_assignee_token(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, quang = _users(client)
@@ -476,6 +618,8 @@ def test_zalo_tool_agent_uses_shared_persona_profile_and_thread_history(client, 
     assert 'Luôn gọi user là bạn nhé.' in system_prompt
     assert 'Profile markdown:' in user_prompt
     assert 'Active user directory:' in user_prompt
+    assert 'Contact Registry' in user_prompt
+    assert 'Actor custom prompt:' in user_prompt
     assert 'Recent conversation in this thread:' in user_prompt
     assert 'hôm qua em có nhắc chuyện Mario Kart' in user_prompt
     assert linh['username'] in user_prompt
@@ -768,6 +912,9 @@ def test_zalo_chat_uses_memory_profiles_and_task_context(client, db_session, mon
     assert profile_path.exists()
     profile_text = profile_path.read_text(encoding='utf-8')
     assert 'thích trà sữa' in profile_text
+    assert 'Contact registry and custom prompts:' in captured['user']
+    assert 'Current group custom prompt:' in captured['user']
+    assert 'test-zalo-group' in captured['user']
 
 
 def test_zalo_chat_falls_back_without_llm(client, monkeypatch) -> None:

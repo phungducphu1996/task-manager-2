@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Iterable
 
 from .config import get_settings
@@ -36,9 +37,39 @@ DEFAULT_EVENTS = """# Office Events
 Các sự kiện đáng nhớ của văn phòng sẽ được append ở đây.
 """
 
+DEFAULT_CONTACTS = """# Hazel Contact Registry
+
+File này được sync từ database user và env group của Task Manager.
+Bạn có thể chỉnh các file custom prompt được link ở từng contact; registry này có thể được ghi lại khi bot sync.
+"""
+
+DEFAULT_NOTIFICATION_PROMPT = """# Hazel Notification Writer
+
+Bạn viết thông báo Zalo ngắn cho Task Manager của văn phòng Hazel.
+
+## Giọng văn
+- Tiếng Việt tự nhiên, ấm, lanh, hơi vui nhưng không lố.
+- Xưng "em" khi phù hợp, gọi người nhận theo tên.
+- Không dài dòng. Mục tiêu là người nhận hiểu ngay cần làm gì.
+
+## Quy tắc
+- Bám sát JSON event được đưa vào, không bịa task, không bịa người.
+- Giữ thông báo 1-4 dòng.
+- Nếu là task mới: nói rõ người nhận vừa được giao task.
+- Nếu task được sửa: nói rõ các field chính vừa đổi, nếu có.
+- Nếu task bị xoá: nói rõ task đã bị xoá bởi ai.
+- Nếu review/approve/done: nói rõ trạng thái mới và hành động mong muốn.
+- Có thể dùng emoji rất ít, tối đa 1 emoji nếu hợp.
+"""
+
 
 def _resolve(raw_path: str) -> Path:
     return settings.resolve_runtime_path(raw_path)
+
+
+def _slug(value: str) -> str:
+    normalized = re.sub(r'[^A-Za-z0-9._-]+', '-', value.strip())
+    return normalized.strip('-') or 'unknown'
 
 
 def ensure_bot_files() -> None:
@@ -47,8 +78,22 @@ def ensure_bot_files() -> None:
     if not persona_path.exists():
         persona_path.write_text(DEFAULT_PERSONA, encoding='utf-8')
 
+    notification_prompt_path = _resolve(settings.bot_notification_prompt_path)
+    notification_prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    if not notification_prompt_path.exists():
+        notification_prompt_path.write_text(DEFAULT_NOTIFICATION_PROMPT, encoding='utf-8')
+
     profiles_dir = _resolve(settings.bot_profiles_dir)
     profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    contacts_path = _resolve(settings.bot_contacts_path)
+    contacts_path.parent.mkdir(parents=True, exist_ok=True)
+    if not contacts_path.exists():
+        contacts_path.write_text(DEFAULT_CONTACTS, encoding='utf-8')
+
+    contact_prompts_dir = _resolve(settings.bot_contact_prompts_dir)
+    (contact_prompts_dir / 'personal').mkdir(parents=True, exist_ok=True)
+    (contact_prompts_dir / 'groups').mkdir(parents=True, exist_ok=True)
 
     events_path = _resolve(settings.bot_events_path)
     events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +104,134 @@ def ensure_bot_files() -> None:
 def persona_text() -> str:
     ensure_bot_files()
     return _resolve(settings.bot_persona_path).read_text(encoding='utf-8').strip()
+
+
+def notification_prompt_text() -> str:
+    ensure_bot_files()
+    return _resolve(settings.bot_notification_prompt_path).read_text(encoding='utf-8').strip()
+
+
+def user_contact_prompt_path(user: User) -> Path:
+    ensure_bot_files()
+    filename = f'{_slug(user.username or user.id or user.name)}.md'
+    return _resolve(settings.bot_contact_prompts_dir) / 'personal' / filename
+
+
+def group_contact_prompt_path(group_id: str, group_name: str | None = None) -> Path:
+    ensure_bot_files()
+    filename = f'{_slug(group_name or group_id)}.md'
+    return _resolve(settings.bot_contact_prompts_dir) / 'groups' / filename
+
+
+def ensure_user_contact_prompt(user: User) -> Path:
+    path = user_contact_prompt_path(user)
+    if path.exists():
+        return path
+    path.write_text(
+        (
+            f'# Custom Prompt: {user.name}\n\n'
+            '## Identity\n'
+            f'- Name: {user.name}\n'
+            f'- Username: {user.username}\n'
+            f'- Role: {user.role or "unknown"}\n'
+            f'- User ID: {user.id}\n'
+            f'- Zalo User ID: {user.zalo_user_id or "unknown"}\n\n'
+            '## How to Talk to This Person\n'
+            '- Chưa có custom riêng.\n\n'
+            '## Notification Style\n'
+            '- Ngắn gọn, rõ việc cần làm.\n'
+        ),
+        encoding='utf-8',
+    )
+    return path
+
+
+def ensure_group_contact_prompt(group_id: str, group_name: str) -> Path:
+    path = group_contact_prompt_path(group_id, group_name)
+    if path.exists():
+        return path
+    path.write_text(
+        (
+            f'# Custom Prompt: {group_name}\n\n'
+            '## Identity\n'
+            f'- Group Name: {group_name}\n'
+            f'- Group ID: {group_id}\n\n'
+            '## How to Talk in This Group\n'
+            '- Nói gọn, tự nhiên, hợp văn phòng.\n'
+            '- Nếu nhắc task chung, ưu tiên rõ người chịu trách nhiệm và deadline.\n\n'
+            '## Notification Style\n'
+            '- Có thể thân mật hơn chat riêng, nhưng không spam.\n'
+        ),
+        encoding='utf-8',
+    )
+    return path
+
+
+def contact_prompt_text_for_user(user: User, *, max_chars: int = 1800) -> str:
+    path = ensure_user_contact_prompt(user)
+    return path.read_text(encoding='utf-8').strip()[:max_chars]
+
+
+def contact_prompt_text_for_group(group_id: str, group_name: str | None = None, *, max_chars: int = 1800) -> str:
+    path = ensure_group_contact_prompt(group_id, group_name or group_id)
+    return path.read_text(encoding='utf-8').strip()[:max_chars]
+
+
+def sync_contact_registry(users: Iterable[User], group_entries: Iterable[tuple[str, str]]) -> str:
+    ensure_bot_files()
+    sorted_users = sorted(users, key=lambda user: ((user.name or '').casefold(), (user.username or '').casefold()))
+    sorted_groups = sorted(group_entries, key=lambda item: (item[1].casefold(), item[0]))
+
+    lines = [
+        '# Hazel Contact Registry',
+        '',
+        'File này được sync từ database user và env group của Task Manager.',
+        'Custom prompt riêng nằm ở từng file được link bên dưới; bot sẽ đọc các file đó khi chat hoặc gửi notification.',
+        '',
+        '## Personal Contacts',
+        '',
+    ]
+    if not sorted_users:
+        lines.append('- Chưa có user active nào.')
+    for user in sorted_users:
+        prompt_path = ensure_user_contact_prompt(user)
+        relative_prompt = prompt_path.relative_to(_resolve('.')) if prompt_path.is_relative_to(_resolve('.')) else prompt_path
+        lines.extend(
+            [
+                f'### {user.name}',
+                f'- Type: personal',
+                f'- User ID: {user.id}',
+                f'- Username: {user.username}',
+                f'- Role: {user.role or "unknown"}',
+                f'- Zalo User ID: {user.zalo_user_id or "unknown"}',
+                f'- Custom Prompt File: {relative_prompt}',
+                '',
+            ]
+        )
+
+    lines.extend(['## Group Contacts', ''])
+    if not sorted_groups:
+        lines.append('- Chưa cấu hình group nào trong ZALO_GROUP_ID/ZALO_ALLOWED_GROUP_IDS.')
+    for group_id, group_name in sorted_groups:
+        prompt_path = ensure_group_contact_prompt(group_id, group_name)
+        relative_prompt = prompt_path.relative_to(_resolve('.')) if prompt_path.is_relative_to(_resolve('.')) else prompt_path
+        lines.extend(
+            [
+                f'### {group_name}',
+                f'- Type: group',
+                f'- Group ID: {group_id}',
+                f'- Custom Prompt File: {relative_prompt}',
+                '',
+            ]
+        )
+
+    content = '\n'.join(lines).rstrip() + '\n'
+    _resolve(settings.bot_contacts_path).write_text(content, encoding='utf-8')
+    return content
+
+
+def contact_registry_text(users: Iterable[User], group_entries: Iterable[tuple[str, str]], *, max_chars: int = 6000) -> str:
+    return sync_contact_registry(users, group_entries).strip()[:max_chars]
 
 
 def user_profile_path(user: User) -> Path:
