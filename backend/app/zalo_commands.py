@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import shlex
+import unicodedata
 from typing import Any, Callable, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -15,7 +16,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from .bot_files import contact_prompt_text_for_group, contact_prompt_text_for_user, contact_registry_text, persona_text, profile_summary_text, profile_text
+from .bot_files import (
+    contact_prompt_text_for_group,
+    contact_prompt_text_for_user,
+    contact_registry_text,
+    persona_text,
+    profile_summary_text,
+    profile_text,
+    user_contact_aliases,
+)
 from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
 from .bot_memory import recent_conversation_text, recent_memory_text, store_conversation_message
 from .config import get_settings
@@ -55,7 +64,9 @@ def _is_admin(user: User) -> bool:
 
 
 def _normalize_lookup(value: str) -> str:
-    return re.sub(r'[\W_]+', '', value.casefold(), flags=re.UNICODE)
+    folded = value.casefold().replace('đ', 'd')
+    ascii_text = unicodedata.normalize('NFKD', folded).encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'[\W_]+', '', ascii_text, flags=re.UNICODE)
 
 
 def _clean_token(value: str) -> str:
@@ -395,7 +406,11 @@ def _resolve_user(db: Session, token: str | None) -> User | None:
         return None
     clean = _clean_token(token.removeprefix('@'))
     users = db.scalars(select(User).where(User.is_active.is_(True))).all()
-    return _resolve_unique_by_token(users, clean, lambda user: [user.id, user.username, user.name, user.zalo_user_id])
+    return _resolve_unique_by_token(
+        users,
+        clean,
+        lambda user: [user.id, user.username, user.name, user.zalo_user_id, *user_contact_aliases(user)],
+    )
 
 
 def _matching_users_for_token(db: Session, token: str | None) -> list[User]:
@@ -407,11 +422,29 @@ def _matching_users_for_token(db: Session, token: str | None) -> list[User]:
     users = db.scalars(select(User).where(User.is_active.is_(True))).all()
     matches: list[User] = []
     for user in users:
-        names = [user.id, user.username, user.name, user.zalo_user_id]
+        names = [user.id, user.username, user.name, user.zalo_user_id, *user_contact_aliases(user)]
         keys = [_normalize_lookup(str(value or '')) for value in names if value]
         if normalized in keys or any(key.startswith(normalized) for key in keys):
             matches.append(user)
     return matches
+
+
+def _user_is_mentioned_in_text(user: User, text: str | None) -> bool:
+    normalized_text = _normalize_lookup(text or '')
+    if not normalized_text:
+        return False
+
+    direct_values = [user.id, user.username, user.name, user.zalo_user_id, *user_contact_aliases(user)]
+    for value in direct_values:
+        normalized_value = _normalize_lookup(str(value or ''))
+        if normalized_value and normalized_value in normalized_text:
+            return True
+
+    for part in re.split(r'\s+', user.name or ''):
+        normalized_part = _normalize_lookup(part)
+        if len(normalized_part) >= 3 and normalized_part in normalized_text:
+            return True
+    return False
 
 
 def _resolve_shop(db: Session, token: str | None) -> Shop | None:
@@ -638,7 +671,9 @@ def _tool_specs() -> list[dict[str, Any]]:
                 'name': 'send_message',
                 'description': (
                     'Send a Zalo message to a specific user or group when the current actor asks the bot to relay a '
-                    'message. Use user target tokens from the active user directory when possible.'
+                    'message. Only send to a user that appears in the active user directory and is explicitly named '
+                    'in the latest user message. If the requested recipient is missing from the directory, do not '
+                    'guess; ask the actor to add that person first.'
                 ),
                 'parameters': {
                     'type': 'object',
@@ -675,6 +710,7 @@ def _active_user_directory_text(db: Session) -> str:
                     f'username={user.username}',
                     f'role={user.role or "unknown"}',
                     f'zalo={user.zalo_user_id or "unknown"}',
+                    f'aliases={", ".join(user_contact_aliases(user)) or "none"}',
                 ]
             )
         )
@@ -919,6 +955,7 @@ def _tool_send_message(
     message: str,
     current_channel: NotificationChannel | None,
     current_target_id: str | None,
+    original_text: str | None,
 ) -> dict[str, Any]:
     normalized_channel = (channel_token or '').strip().casefold()
     clean_message = (message or '').strip()
@@ -929,6 +966,14 @@ def _tool_send_message(
         target_user = _resolve_user(db, target_token)
         if not target_user:
             return {'ok': False, 'error': f'Không tìm thấy người nhận {target_token}.'}
+        if original_text and not _user_is_mentioned_in_text(target_user, original_text):
+            return {
+                'ok': False,
+                'error': (
+                    f'Người nhận {target_user.name} không xuất hiện rõ trong yêu cầu gốc. '
+                    'Không gửi để tránh nhắn nhầm người.'
+                ),
+            }
         if not target_user.zalo_user_id:
             return {'ok': False, 'error': f'{target_user.name} chưa có zalo_user_id.'}
 
@@ -995,6 +1040,7 @@ def _execute_tool_call(
     arguments: dict[str, Any],
     current_channel: NotificationChannel | None = None,
     current_target_id: str | None = None,
+    original_text: str | None = None,
 ) -> dict[str, Any]:
     try:
         if name == 'find_tasks':
@@ -1036,6 +1082,7 @@ def _execute_tool_call(
                 message=str(arguments.get('message') or ''),
                 current_channel=current_channel,
                 current_target_id=current_target_id,
+                original_text=original_text,
             )
     except (ValueError, TypeError) as exc:
         return {'ok': False, 'error': str(exc)}
@@ -1123,6 +1170,7 @@ def _run_tool_agent(
                 arguments=tool_call.arguments,
                 current_channel=current_channel,
                 current_target_id=current_target_id,
+                original_text=text,
             )
             last_tool_result = result
             messages.append(

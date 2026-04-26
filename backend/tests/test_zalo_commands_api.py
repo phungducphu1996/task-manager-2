@@ -477,6 +477,111 @@ def test_zalo_tool_agent_can_relay_message_to_user(client, monkeypatch) -> None:
     assert 'nhắn Quang rồi' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_does_not_relay_to_wrong_user_when_recipient_is_missing(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, _ = _users(client)
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'send_message',
+                        {
+                            'channel': 'user',
+                            'target_token': admin['username'],
+                            'message': 'Chị Ngọc ơi, tuần sau làm plan Social nhé.',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Anh Phú ơi, em chưa thấy chị Ngọc trong danh bạ nên em chưa nhắn để tránh gửi nhầm nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'em nhắn chị Ngọc giúp anh tuần sau phải làm Social nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-missing-user',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert len(replies) == 1
+    assert replies[-1]['target_id'] == admin['zalo_user_id']
+    assert 'chưa thấy chị Ngọc' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_can_relay_message_using_personal_md_alias(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, quang = _users(client)
+    settings = get_settings()
+    alias_path = Path(settings.bot_contact_prompts_dir) / 'personal' / f'{quang["username"]}.md'
+    alias_path.parent.mkdir(parents=True, exist_ok=True)
+    alias_path.write_text(
+        (
+            '# Custom Prompt: Quang\n\n'
+            '## Aliases\n'
+            '- chị Ngọc\n'
+            '- mama tổng quản\n\n'
+            '## How to Talk to This Person\n'
+            '- Nói gọn, rõ việc.\n'
+        ),
+        encoding='utf-8',
+    )
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'send_message',
+                        {
+                            'channel': 'user',
+                            'target_token': 'chị Ngọc',
+                            'message': 'Chị Ngọc ơi, tuần sau làm plan Social giúp anh Phú nha.',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Em nhắn chị Ngọc rồi anh Phú nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'em nhắn chị Ngọc giúp anh tuần sau phải làm Social nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-user-alias',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert replies[0]['channel'].value == 'user'
+    assert replies[0]['target_id'] == quang['zalo_user_id']
+    assert 'plan Social' in replies[0]['message']
+    assert 'chị Ngọc rồi' in replies[-1]['message']
+
+
 def test_zalo_tool_agent_can_relay_message_to_default_group(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, _ = _users(client)

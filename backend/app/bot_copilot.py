@@ -16,6 +16,7 @@ from .bot_files import (
     profile_text,
     recent_events_text,
     update_profile_with_facts,
+    user_contact_aliases,
 )
 from .bot_llm import BotLLMError, generate_bot_reply, is_bot_llm_configured
 from .bot_memory import (
@@ -95,12 +96,14 @@ def _user_directory_text(db: Session) -> str:
         aliases = [user.name, user.username]
         if user.zalo_user_id:
             aliases.append(user.zalo_user_id)
+        aliases.extend(user_contact_aliases(user))
         identity = ' | '.join(
             [
                 f'name={user.name}',
                 f'username={user.username}',
                 f'role={user.role or "unknown"}',
                 f'zalo={user.zalo_user_id or "unknown"}',
+                f'aliases={", ".join(user_contact_aliases(user)) or "none"}',
             ]
         )
         blocks.append(f'- {identity}\n  Profile:\n{profile_summary_text(user)}')

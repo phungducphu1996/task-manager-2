@@ -136,6 +136,8 @@ def ensure_user_contact_prompt(user: User) -> Path:
             f'- Role: {user.role or "unknown"}\n'
             f'- User ID: {user.id}\n'
             f'- Zalo User ID: {user.zalo_user_id or "unknown"}\n\n'
+            '## Aliases\n'
+            '- Chưa có biệt danh.\n\n'
             '## How to Talk to This Person\n'
             '- Chưa có custom riêng.\n\n'
             '## Notification Style\n'
@@ -172,6 +174,25 @@ def contact_prompt_text_for_user(user: User, *, max_chars: int = 1800) -> str:
     return path.read_text(encoding='utf-8').strip()[:max_chars]
 
 
+def user_contact_aliases(user: User) -> list[str]:
+    path = ensure_user_contact_prompt(user)
+    content = path.read_text(encoding='utf-8')
+    aliases: list[str] = []
+    in_aliases = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if line.startswith('## '):
+            in_aliases = line.casefold() in {'## aliases', '## biệt danh', '## biet danh'}
+            continue
+        if not in_aliases or not line.startswith('- '):
+            continue
+        value = line[2:].strip()
+        if not value or value.casefold().startswith('chưa có') or value.casefold().startswith('chua co'):
+            continue
+        aliases.append(value)
+    return aliases
+
+
 def contact_prompt_text_for_group(group_id: str, group_name: str | None = None, *, max_chars: int = 1800) -> str:
     path = ensure_group_contact_prompt(group_id, group_name or group_id)
     return path.read_text(encoding='utf-8').strip()[:max_chars]
@@ -204,6 +225,7 @@ def sync_contact_registry(users: Iterable[User], group_entries: Iterable[tuple[s
                 f'- Username: {user.username}',
                 f'- Role: {user.role or "unknown"}',
                 f'- Zalo User ID: {user.zalo_user_id or "unknown"}',
+                f'- Aliases: {", ".join(user_contact_aliases(user)) or "none"}',
                 f'- Custom Prompt File: {relative_prompt}',
                 '',
             ]
