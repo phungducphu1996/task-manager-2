@@ -250,6 +250,79 @@ def test_attachment_crud_and_size_limit(client, monkeypatch) -> None:
     assert all_attachments_after.json() == []
 
 
+def test_full_edit_task_updates_fields_and_adds_link(client) -> None:
+    users = client.get('/users').json()
+    admin, member, other_member = select_users(users)
+    shops = client.get('/shops').json()
+    types = client.get('/task-types').json()
+
+    task = client.post(
+        '/tasks',
+        json={
+            'title': 'Full edit task',
+            'assigned_to': member['id'],
+            'created_by': admin['id'],
+        },
+        headers=actor_headers(admin['id']),
+    ).json()
+
+    due_date = (date.today() + timedelta(days=3)).isoformat()
+    edit = client.patch(
+        f"/tasks/{task['id']}/full-edit",
+        json={
+            'title': 'Full edit task updated',
+            'description': 'Updated description',
+            'assigned_to': other_member['id'],
+            'shop_id': shops[0]['id'],
+            'type_id': types[0]['id'],
+            'due_date': due_date,
+            'priority': 'high',
+            'notes': 'Updated notes',
+            'attachment_links': [{'url': 'https://example.com/brief', 'name': 'Brief'}],
+        },
+        headers=actor_headers(admin['id']),
+    )
+
+    assert edit.status_code == 200
+    body = edit.json()
+    assert body['task']['title'] == 'Full edit task updated'
+    assert body['task']['description'] == 'Updated description'
+    assert body['task']['assigned_to'] == other_member['id']
+    assert body['task']['shop_id'] == shops[0]['id']
+    assert body['task']['type_id'] == types[0]['id']
+    assert body['task']['due_date'] == due_date
+    assert body['task']['priority'] == 'high'
+    assert body['attachments_added'][0]['name'] == 'Brief'
+    assert body['attachments_added'][0]['data_url'] == 'https://example.com/brief'
+
+    attachments = client.get(f"/tasks/{task['id']}/attachments", headers=actor_headers(other_member['id']))
+    assert attachments.status_code == 200
+    assert attachments.json()[0]['mime_type'] == 'text/uri-list'
+
+
+def test_member_full_edit_cannot_reassign_task(client) -> None:
+    users = client.get('/users').json()
+    admin, member, other_member = select_users(users)
+
+    task = client.post(
+        '/tasks',
+        json={
+            'title': 'Member edit task',
+            'assigned_to': member['id'],
+            'created_by': admin['id'],
+        },
+        headers=actor_headers(admin['id']),
+    ).json()
+
+    edit = client.patch(
+        f"/tasks/{task['id']}/full-edit",
+        json={'assigned_to': other_member['id']},
+        headers=actor_headers(member['id']),
+    )
+
+    assert edit.status_code == 403
+
+
 def test_member_only_sees_own_tasks(client) -> None:
     users = client.get('/users').json()
     admin, member_a, member_b = select_users(users)

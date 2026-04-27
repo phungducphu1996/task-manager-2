@@ -157,6 +157,10 @@ class TaskUpdate(BaseModel):
     list_order: int | None = None
 
 
+class TaskFullEdit(TaskUpdate):
+    attachment_links: list[TaskAttachmentLinkCreate] = Field(default_factory=list)
+
+
 class TaskStatusUpdate(BaseModel):
     status: TaskStatus
 
@@ -190,6 +194,11 @@ class TaskOut(BaseModel):
     shop: ShopOut | None = None
     task_type: TaskTypeOut | None = None
     subtasks: list[SubtaskOut] = Field(default_factory=list)
+
+
+class TaskFullEditOut(BaseModel):
+    task: TaskOut
+    attachments_added: list[TaskAttachmentOut] = Field(default_factory=list)
 
 
 class TaskReorderRequest(BaseModel):

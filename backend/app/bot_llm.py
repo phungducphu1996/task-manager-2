@@ -67,11 +67,13 @@ def complete_bot_conversation(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
     temperature: float = 0.3,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> BotLLMToolResponse:
     data = _request_llm_data(
         messages=messages,
         temperature=temperature,
         tools=tools,
+        tool_choice=tool_choice,
     )
     choices = data.get('choices') or []
     if not choices:
@@ -112,6 +114,7 @@ def _request_llm_data(
     temperature: float,
     response_format: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     api_key = (settings.openai_api_key or '').strip()
     if not api_key:
@@ -128,7 +131,7 @@ def _request_llm_data(
         payload['response_format'] = response_format
     if tools:
         payload['tools'] = tools
-        payload['tool_choice'] = 'auto'
+        payload['tool_choice'] = tool_choice or 'auto'
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',

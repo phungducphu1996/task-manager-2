@@ -56,6 +56,8 @@ from .schemas import (
     TaskCommentOut,
     TaskConvertRequest,
     TaskCreate,
+    TaskFullEdit,
+    TaskFullEditOut,
     TaskListResponse,
     TaskOut,
     TaskReorderRequest,
@@ -159,6 +161,29 @@ def _attachment_out(attachment: TaskAttachment) -> TaskAttachmentOut:
         created_at=attachment.created_at,
         uploader=uploader,
     )
+
+
+def _create_link_attachment_record(
+    db: Session,
+    *,
+    task_id: int,
+    actor_id: str,
+    url: str,
+    name: str | None = None,
+) -> TaskAttachment:
+    clean_url = url.strip()
+    attachment = TaskAttachment(
+        task_id=task_id,
+        uploaded_by=actor_id,
+        name=(name or '').strip() or _default_link_attachment_name(clean_url),
+        mime_type='text/uri-list',
+        size_bytes=0,
+        data_url=clean_url,
+        storage_path=None,
+        is_image=False,
+    )
+    db.add(attachment)
+    return attachment
 
 
 def _forbidden(message: str) -> HTTPException:
@@ -352,6 +377,24 @@ def _apply_role_on_update(task: Task, update_values: dict, actor: User) -> dict:
         _validate_status_transition(task, normalized['status'], actor)
 
     return normalized
+
+
+def _validate_task_update_references(db: Session, update_values: dict) -> None:
+    assigned_to = update_values.get('assigned_to')
+    if assigned_to is not None and not db.get(User, assigned_to):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Assignee not found.')
+
+    created_by = update_values.get('created_by')
+    if created_by is not None and not db.get(User, created_by):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Creator not found.')
+
+    shop_id = update_values.get('shop_id')
+    if shop_id is not None and not db.get(Shop, shop_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Shop not found.')
+
+    type_id = update_values.get('type_id')
+    if type_id is not None and not db.get(TaskType, type_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task type not found.')
 
 
 @app.on_event('startup')
@@ -814,6 +857,7 @@ def update_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
 
     update_values = _apply_role_on_update(task, payload.model_dump(exclude_unset=True), actor)
+    _validate_task_update_references(db, update_values)
     previous_status = task.status
     status_changed = 'status' in update_values and update_values['status'] != previous_status
     changed_fields = [field for field in update_values if field != 'status']
@@ -834,6 +878,79 @@ def update_task(
     if changed_fields:
         _trigger_task_updated_notification(db, task=full_task, actor=actor, changed_fields=changed_fields)
     return full_task
+
+
+@app.patch('/tasks/{task_id}/full-edit', response_model=TaskFullEditOut)
+def full_edit_task(
+    task_id: int,
+    payload: TaskFullEdit,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> TaskFullEditOut:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
+
+    payload_values = payload.model_dump(exclude_unset=True)
+    attachment_links = payload_values.pop('attachment_links', [])
+    update_values = _apply_role_on_update(task, payload_values, actor)
+    _validate_task_update_references(db, update_values)
+
+    if 'title' in update_values:
+        update_values['title'] = update_values['title'].strip()
+        if not update_values['title']:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Task title cannot be empty.')
+
+    previous_status = task.status
+    status_changed = 'status' in update_values and update_values['status'] != previous_status
+    changed_fields = [field for field in update_values if field != 'status']
+
+    for field, value in update_values.items():
+        setattr(task, field, value)
+
+    added_attachments: list[TaskAttachment] = []
+    for link in attachment_links:
+        attachment = _create_link_attachment_record(
+            db,
+            task_id=task_id,
+            actor_id=actor.id,
+            url=str(link['url']),
+            name=link.get('name'),
+        )
+        added_attachments.append(attachment)
+
+    if added_attachments:
+        changed_fields.append('attachment_links')
+
+    db.commit()
+    full_task = get_task_or_404(db, task_id)
+    if not full_task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
+
+    if status_changed:
+        _trigger_status_transition_notifications(
+            db,
+            task=full_task,
+            previous_status=previous_status,
+            actor=actor,
+        )
+    if changed_fields:
+        _trigger_task_updated_notification(db, task=full_task, actor=actor, changed_fields=changed_fields)
+
+    created_ids = [attachment.id for attachment in added_attachments]
+    created_attachments = []
+    if created_ids:
+        created_attachments = db.scalars(
+            select(TaskAttachment)
+            .where(TaskAttachment.id.in_(created_ids))
+            .options(joinedload(TaskAttachment.uploader))
+            .order_by(TaskAttachment.created_at.desc(), TaskAttachment.id.desc())
+        ).all()
+
+    return TaskFullEditOut(
+        task=TaskOut.model_validate(full_task),
+        attachments_added=[_attachment_out(attachment) for attachment in created_attachments],
+    )
 
 
 @app.patch('/tasks/{task_id}/status', response_model=TaskOut)
@@ -1236,19 +1353,13 @@ def create_task_attachment_link(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
     _ensure_task_access(task, actor)
 
-    name = (payload.name or '').strip() or _default_link_attachment_name(str(payload.url))
-
-    attachment = TaskAttachment(
+    attachment = _create_link_attachment_record(
+        db,
         task_id=task_id,
-        uploaded_by=actor.id,
-        name=name,
-        mime_type='text/uri-list',
-        size_bytes=0,
-        data_url=str(payload.url),
-        storage_path=None,
-        is_image=False,
+        actor_id=actor.id,
+        url=str(payload.url),
+        name=payload.name,
     )
-    db.add(attachment)
     db.commit()
 
     stmt = select(TaskAttachment).where(TaskAttachment.id == attachment.id).options(joinedload(TaskAttachment.uploader))

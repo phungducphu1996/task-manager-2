@@ -382,6 +382,69 @@ def test_zalo_tool_agent_can_update_task_status(client, db_session, monkeypatch)
     assert 'sang doing' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_can_edit_deadline_and_assignee(
+    client,
+    db_session,
+    monkeypatch,
+) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, quang = _users(client)
+    task = Task(
+        title='Bluey Collection',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.todo,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response('', [('call-1', 'find_tasks', {'query': 'bluey', 'limit': 5})]),
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-2',
+                        'update_task_fields',
+                        {
+                            'task_id': task.id,
+                            'assignee_token': quang['username'],
+                            'due_token': 'tomorrow',
+                            'description': 'Mockup mới',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Đã đổi deadline và assign task Bluey cho Quang rồi anh nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'set deadline task bluey ngày mai và assign cho Quang nha',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-edit-deadline-assignee',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'edit'
+    db_session.refresh(task)
+    assert task.assigned_to == quang['id']
+    assert task.due_date == local_today() + timedelta(days=1)
+    assert task.description == 'Mockup mới'
+    assert 'đổi deadline' in replies[-1]['message']
+
+
 def test_zalo_find_tasks_matches_assignee_token(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, quang = _users(client)
@@ -477,6 +540,112 @@ def test_zalo_tool_agent_can_relay_message_to_user(client, monkeypatch) -> None:
     assert 'nhắn Quang rồi' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_forces_send_message_tool_for_relay_claim(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, quang = _users(client)
+    calls: list[dict] = []
+
+    def _fake_complete_bot_conversation(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return _tool_response('Em sẽ nhắn Quang giúp anh nha.')
+        if len(calls) == 2:
+            assert kwargs.get('tool_choice') == {'type': 'function', 'function': {'name': 'send_message'}}
+            return _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'send_message',
+                        {
+                            'channel': 'user',
+                            'target_token': quang['username'],
+                            'message': 'Quang ơi cập nhật task due date giúp anh Phú nha.',
+                        },
+                    )
+                ],
+            )
+        return _tool_response('Em nhắn Quang thật rồi anh Phú nha.')
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', _fake_complete_bot_conversation)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'nhắn Quang cập nhật task due date đi nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-force-tool',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert len(calls) == 3
+    assert replies[0]['target_id'] == quang['zalo_user_id']
+    assert 'thật rồi' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_does_not_claim_sent_when_send_message_tool_fails(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, quang = _users(client)
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'send_message',
+                        {
+                            'channel': 'user',
+                            'target_token': quang['username'],
+                            'message': 'Quang ơi cập nhật task due date giúp anh Phú nha.',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Em đã nhắn Quang rồi anh nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    send_calls = {'count': 0}
+
+    def _send_zalo_text(**kwargs):
+        send_calls['count'] += 1
+        if send_calls['count'] == 1:
+            return False, 500, '{"ok":false}', 'worker down'
+        replies.append(kwargs)
+        return True, 200, '{"ok":true}', None
+
+    monkeypatch.setattr('app.zalo_commands.send_zalo_text', _send_zalo_text)
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'hãy nhắn cho Quang cập nhật task due date đi nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-tool-fails',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert len(replies) == 1
+    assert replies[-1]['target_id'] == admin['zalo_user_id']
+    assert 'chưa gửi được' in replies[-1]['message']
+    assert 'worker down' in replies[-1]['message']
+
+
 def test_zalo_tool_agent_does_not_relay_to_wrong_user_when_recipient_is_missing(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, _ = _users(client)
@@ -519,7 +688,8 @@ def test_zalo_tool_agent_does_not_relay_to_wrong_user_when_recipient_is_missing(
     assert response.json()['action'] == 'send_message'
     assert len(replies) == 1
     assert replies[-1]['target_id'] == admin['zalo_user_id']
-    assert 'chưa thấy chị Ngọc' in replies[-1]['message']
+    assert 'chưa gửi được' in replies[-1]['message']
+    assert 'tránh nhắn nhầm' in replies[-1]['message']
 
 
 def test_zalo_tool_agent_can_relay_message_using_personal_md_alias(client, monkeypatch) -> None:
@@ -531,9 +701,11 @@ def test_zalo_tool_agent_can_relay_message_using_personal_md_alias(client, monke
     alias_path.write_text(
         (
             '# Custom Prompt: Quang\n\n'
-            '## Aliases\n'
+            '## Allias\n'
             '- chị Ngọc\n'
             '- mama tổng quản\n\n'
+            '## Notes\n'
+            '- Alias: Ngọc tổng quản\n\n'
             '## How to Talk to This Person\n'
             '- Nói gọn, rõ việc.\n'
         ),
@@ -696,7 +868,7 @@ def test_zalo_tool_agent_uses_shared_persona_profile_and_thread_history(client, 
 
     captured: dict[str, list[dict]] = {}
 
-    def _fake_complete_bot_conversation(*, messages, tools, temperature):
+    def _fake_complete_bot_conversation(*, messages, tools, temperature, tool_choice=None):
         captured['messages'] = messages
         return _tool_response('Chào bạn, mình đã hiểu yêu cầu rồi.')
 

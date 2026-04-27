@@ -179,14 +179,31 @@ def user_contact_aliases(user: User) -> list[str]:
     content = path.read_text(encoding='utf-8')
     aliases: list[str] = []
     in_aliases = False
+    alias_headings = {
+        'aliases',
+        'alias',
+        'allias',
+        'alliases',
+        'biệt danh',
+        'biet danh',
+        'nicknames',
+        'nickname',
+    }
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if line.startswith('## '):
-            in_aliases = line.casefold() in {'## aliases', '## biệt danh', '## biet danh'}
+            heading = line.removeprefix('##').strip().casefold()
+            in_aliases = heading in alias_headings
             continue
-        if not in_aliases or not line.startswith('- '):
+        if not line.startswith('- '):
             continue
         value = line[2:].strip()
+        if not in_aliases:
+            lower_value = value.casefold()
+            if lower_value.startswith(('alias:', 'aliases:', 'allias:', 'alliases:', 'biệt danh:', 'biet danh:')):
+                value = value.split(':', 1)[1].strip()
+            else:
+                continue
         if not value or value.casefold().startswith('chưa có') or value.casefold().startswith('chua co'):
             continue
         aliases.append(value)

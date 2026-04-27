@@ -9,6 +9,7 @@ import re
 import shlex
 import unicodedata
 from typing import Any, Callable, Literal, TypeVar
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
@@ -33,21 +34,25 @@ from .models import (
     NotificationChannel,
     Shop,
     Task,
+    TaskAttachment,
     TaskPriority,
     TaskStatus,
     TaskType,
     User,
     ZaloIncomingCommand,
 )
-from .notifications import enqueue_task_created_notifications, enqueue_task_status_transition_notifications, send_zalo_text
+from .notifications import (
+    enqueue_task_created_notifications,
+    enqueue_task_status_transition_notifications,
+    enqueue_task_updated_notifications,
+    send_zalo_text,
+)
 from .schemas import ZaloIncomingRequest
 from .services import get_task_or_404, list_tasks, local_today, next_list_order
 
 settings = get_settings()
 T = TypeVar('T')
 MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
-
-
 @dataclass(slots=True)
 class ParsedZaloCommand:
     action: Literal['add', 'list', 'chat']
@@ -140,6 +145,23 @@ def _strip_bot_alias(text: str, *, allow_plain_text: bool) -> str | None:
     return None
 
 
+def _looks_like_relay_request(text: str | None) -> bool:
+    folded = (text or '').casefold().replace('đ', 'd')
+    ascii_text = unicodedata.normalize('NFKD', folded).encode('ascii', 'ignore').decode('ascii')
+    normalized_text = re.sub(r'[\W_]+', ' ', ascii_text, flags=re.UNICODE).strip()
+    if not normalized_text:
+        return False
+    compact_text = normalized_text.replace(' ', '')
+
+    if re.search(r'\b(gui|bao)\b', normalized_text):
+        return True
+    if 'chuyen loi' in normalized_text or 'chuyenloi' in compact_text:
+        return True
+    if re.search(r'\bnhan\b', normalized_text) and not re.search(r'\bxac\s+nhan\b', normalized_text):
+        return True
+    return bool(re.search(r'\bhoi\s+(anh|chi|em|hazel|quynh|shin|ngoc|my)\b', normalized_text))
+
+
 def _mention_values(mention: dict) -> list[str]:
     values: list[str] = []
     for key in ('uid', 'id', 'user_id', 'userId', 'zalo_user_id', 'zaloUserId', 'label', 'name', 'displayName'):
@@ -202,6 +224,8 @@ def _parse_date_token(token: str | None) -> date | None:
         return today
     if raw in {'tomorrow', 'mai', 'ngaymai', 'ngàymai'}:
         return today + timedelta(days=1)
+    if raw in {'dayaftertomorrow', 'mot', 'mốt', 'ngaymot', 'ngàymốt', 'ngaymốt'}:
+        return today + timedelta(days=2)
 
     for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
         try:
@@ -236,6 +260,7 @@ def _extract_natural_due_token(text: str) -> tuple[str | None, str]:
     patterns = [
         (r'\b(hôm nay|hom nay)\b', 'today'),
         (r'\b(ngày mai|ngay mai|mai)\b', 'tomorrow'),
+        (r'\b(ngày mốt|ngay mot|mốt|mot)\b', 'dayaftertomorrow'),
         (r'\b(\d{4}-\d{2}-\d{2})\b', None),
         (r'\b(\d{1,2}/\d{1,2}(?:/\d{4})?)\b', None),
         (r'\b(\d{1,2}-\d{1,2}(?:-\d{4})?)\b', None),
@@ -668,6 +693,43 @@ def _tool_specs() -> list[dict[str, Any]]:
         {
             'type': 'function',
             'function': {
+                'name': 'update_task_fields',
+                'description': (
+                    'Edit existing task fields after finding the correct task. Supports title, description, assignee, '
+                    'shop, type, due date/deadline, priority, notes, status, and adding one link attachment. Use '
+                    'find_tasks first when the task is not identified by id.'
+                ),
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'task_id': {'type': 'integer'},
+                        'title': {'type': 'string'},
+                        'description': {'type': 'string'},
+                        'assignee_token': {'type': 'string'},
+                        'clear_assignee': {'type': 'boolean'},
+                        'shop_token': {'type': 'string'},
+                        'clear_shop': {'type': 'boolean'},
+                        'type_token': {'type': 'string'},
+                        'clear_type': {'type': 'boolean'},
+                        'due_token': {
+                            'type': 'string',
+                            'description': 'today, tomorrow, dd/mm, dd/mm/yyyy, yyyy-mm-dd, or empty when unchanged.',
+                        },
+                        'clear_due_date': {'type': 'boolean'},
+                        'priority': {'type': 'string', 'enum': ['low', 'medium', 'high']},
+                        'status': {'type': 'string', 'enum': ['todo', 'doing', 'review', 'ready', 'done']},
+                        'notes': {'type': 'string'},
+                        'link_url': {'type': 'string'},
+                        'link_name': {'type': 'string'},
+                    },
+                    'required': ['task_id'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
                 'name': 'send_message',
                 'description': (
                     'Send a Zalo message to a specific user or group when the current actor asks the bot to relay a '
@@ -723,11 +785,12 @@ def _tool_system_prompt(actor: User) -> str:
     return (
         f'{persona_text()}\n\n'
         'Bạn đang ở nhánh tool-calling của trợ lý Zalo cho Task Manager. '
-        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, đổi status task, và gửi tin nhắn Zalo hộ người dùng. '
+        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, đổi status task, sửa field task, và gửi tin nhắn Zalo hộ người dùng. '
         'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
         'Luôn dùng send_message khi người dùng yêu cầu nhắn/gửi/chuyển lời cho một người hoặc group. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
         'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
+        'Nếu người dùng muốn sửa deadline/assignee/description/link/field khác của task cũ, hãy dùng find_tasks trước rồi update_task_fields. '
         'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
         'Nếu câu mơ hồ, không chắc, hoặc có nhiều task match, đừng tự quyết định; hãy hỏi lại ngắn gọn. '
         f'Người dùng hiện tại: {actor.name} ({actor.username}), role={actor.role or "unknown"}. '
@@ -928,6 +991,171 @@ def _tool_update_task_status(db: Session, *, actor: User, task_id: int, status_t
     return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
 
 
+def _is_clear_token(value: str | None) -> bool:
+    return _normalize_lookup(value or '') in {'none', 'null', 'clear', 'xoa', 'bo', 'remove', 'unassign'}
+
+
+def _validate_url(value: str) -> str:
+    clean = value.strip()
+    parsed = urlparse(clean)
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        raise ValueError('Link phải bắt đầu bằng http:// hoặc https://.')
+    return clean
+
+
+def _tool_update_task_fields(
+    db: Session,
+    *,
+    actor: User,
+    task_id: int,
+    arguments: dict[str, Any],
+    original_text: str | None,
+) -> dict[str, Any]:
+    task = get_task_or_404(db, task_id)
+    if not task:
+        return {'ok': False, 'error': 'Task not found.'}
+
+    if not _is_admin(actor) and task.assigned_to != actor.id:
+        return {'ok': False, 'error': 'Members can only edit their own tasks.'}
+
+    changed_fields: list[str] = []
+    previous_status = task.status
+
+    if 'title' in arguments:
+        title = str(arguments.get('title') or '').strip()
+        if not title:
+            return {'ok': False, 'error': 'Task title cannot be empty.'}
+        task.title = title
+        changed_fields.append('title')
+
+    if 'description' in arguments:
+        task.description = str(arguments.get('description') or '').strip() or None
+        changed_fields.append('description')
+
+    if 'notes' in arguments:
+        task.notes = str(arguments.get('notes') or '').strip() or None
+        changed_fields.append('notes')
+
+    if arguments.get('clear_assignee'):
+        if not _is_admin(actor):
+            return {'ok': False, 'error': 'Members cannot reassign tasks.'}
+        task.assigned_to = None
+        changed_fields.append('assigned_to')
+    elif 'assignee_token' in arguments and str(arguments.get('assignee_token') or '').strip():
+        if not _is_admin(actor):
+            return {'ok': False, 'error': 'Members cannot reassign tasks.'}
+        assignee = _resolve_user(db, str(arguments.get('assignee_token') or ''))
+        if not assignee:
+            return {'ok': False, 'error': f'Không tìm thấy assignee {arguments.get("assignee_token")}.'}
+        if original_text and not _user_is_mentioned_in_text(assignee, original_text):
+            return {
+                'ok': False,
+                'error': (
+                    f'Người nhận {assignee.name} không xuất hiện rõ trong yêu cầu gốc. '
+                    'Không đổi assign để tránh gán nhầm người.'
+                ),
+            }
+        task.assigned_to = assignee.id
+        changed_fields.append('assigned_to')
+
+    if arguments.get('clear_shop') or _is_clear_token(str(arguments.get('shop_token') or '')):
+        task.shop_id = None
+        changed_fields.append('shop_id')
+    elif 'shop_token' in arguments and str(arguments.get('shop_token') or '').strip():
+        shop = _resolve_shop(db, str(arguments.get('shop_token') or ''))
+        if not shop:
+            return {'ok': False, 'error': f'Không tìm thấy shop {arguments.get("shop_token")}.'}
+        task.shop_id = shop.id
+        changed_fields.append('shop_id')
+
+    if arguments.get('clear_type') or _is_clear_token(str(arguments.get('type_token') or '')):
+        task.type_id = None
+        changed_fields.append('type_id')
+    elif 'type_token' in arguments and str(arguments.get('type_token') or '').strip():
+        task_type = _resolve_task_type(db, str(arguments.get('type_token') or ''))
+        if not task_type:
+            return {'ok': False, 'error': f'Không tìm thấy task type {arguments.get("type_token")}.'}
+        task.type_id = task_type.id
+        changed_fields.append('type_id')
+
+    if arguments.get('clear_due_date') or _is_clear_token(str(arguments.get('due_token') or '')):
+        task.due_date = None
+        changed_fields.append('due_date')
+    elif 'due_token' in arguments and str(arguments.get('due_token') or '').strip():
+        due_date = _parse_date_token(str(arguments.get('due_token') or ''))
+        if not due_date:
+            return {'ok': False, 'error': f'Không hiểu due date "{arguments.get("due_token")}".'}
+        task.due_date = due_date
+        changed_fields.append('due_date')
+
+    if 'priority' in arguments and str(arguments.get('priority') or '').strip():
+        priority_token = str(arguments.get('priority') or '').strip()
+        if priority_token not in {'low', 'medium', 'high'}:
+            return {'ok': False, 'error': f'Unknown priority: {priority_token}'}
+        task.priority = TaskPriority(priority_token)
+        changed_fields.append('priority')
+
+    if 'status' in arguments and str(arguments.get('status') or '').strip():
+        status_token = str(arguments.get('status') or '').strip()
+        if status_token not in {status.value for status in TaskStatus}:
+            return {'ok': False, 'error': f'Unknown status: {status_token}'}
+        next_status = TaskStatus(status_token)
+        error = _validate_tool_status_transition(task, next_status, actor)
+        if error:
+            return {'ok': False, 'error': error}
+        task.status = next_status
+        changed_fields.append('status')
+
+    added_links: list[dict[str, Any]] = []
+    if 'link_url' in arguments and str(arguments.get('link_url') or '').strip():
+        clean_url = _validate_url(str(arguments.get('link_url') or ''))
+        parsed = urlparse(clean_url)
+        link_name = str(arguments.get('link_name') or '').strip() or parsed.netloc or 'Link'
+        attachment = TaskAttachment(
+            task_id=task.id,
+            uploaded_by=actor.id,
+            name=link_name,
+            mime_type='text/uri-list',
+            size_bytes=0,
+            data_url=clean_url,
+            storage_path=None,
+            is_image=False,
+        )
+        db.add(attachment)
+        added_links.append({'name': link_name, 'url': clean_url})
+        changed_fields.append('attachment_links')
+
+    db.add(task)
+    db.commit()
+    full_task = get_task_or_404(db, task.id) or task
+
+    if previous_status != full_task.status:
+        try:
+            enqueue_task_status_transition_notifications(
+                db,
+                task=full_task,
+                previous_status=previous_status,
+                actor=actor,
+            )
+        except Exception:
+            db.rollback()
+
+    non_status_changes = [field for field in changed_fields if field != 'status']
+    if non_status_changes:
+        try:
+            enqueue_task_updated_notifications(db, task=full_task, actor=actor, changed_fields=non_status_changes)
+        except Exception:
+            db.rollback()
+
+    return {
+        'ok': True,
+        'task': _tool_task_payload(full_task),
+        'previous_status': previous_status.value,
+        'changed_fields': sorted(set(changed_fields)),
+        'attachments_added': added_links,
+    }
+
+
 def _resolve_group_message_target(
     *,
     target_token: str | None,
@@ -1073,6 +1301,14 @@ def _execute_tool_call(
                 task_id=int(arguments.get('task_id')),
                 status_token=str(arguments.get('status') or '').strip(),
             )
+        if name == 'update_task_fields':
+            return _tool_update_task_fields(
+                db,
+                actor=actor,
+                task_id=int(arguments.get('task_id')),
+                arguments=arguments,
+                original_text=original_text,
+            )
         if name == 'send_message':
             return _tool_send_message(
                 db,
@@ -1129,16 +1365,46 @@ def _run_tool_agent(
     ]
     last_tool_result: dict[str, Any] | None = None
     last_tool_name: str | None = None
+    forced_send_message = False
+    relay_request = _looks_like_relay_request(text)
 
     for _ in range(4):
         try:
-            response = complete_bot_conversation(messages=messages, tools=_tool_specs(), temperature=0.2)
+            tool_choice = None
+            if forced_send_message and last_tool_name != 'send_message':
+                tool_choice = {'type': 'function', 'function': {'name': 'send_message'}}
+            response = complete_bot_conversation(
+                messages=messages,
+                tools=_tool_specs(),
+                temperature=0.2,
+                tool_choice=tool_choice,
+            )
         except BotLLMError:
             return None
 
         messages.append(response.assistant_message)
         if not response.tool_calls:
             final_text = response.content.strip()
+            if relay_request and last_tool_name != 'send_message':
+                if not forced_send_message:
+                    forced_send_message = True
+                    messages.append(
+                        {
+                            'role': 'user',
+                            'content': (
+                                'Tin nhắn gốc là yêu cầu nhắn/gửi/chuyển lời cho người khác. '
+                                'Bạn chưa được nói là đã gửi nếu chưa gọi tool send_message. '
+                                'Hãy gọi tool send_message ngay với đúng người nhận; nếu không xác định được người nhận, '
+                                'hãy gọi send_message với target rõ nhất để backend kiểm tra, hoặc trả lời ngắn rằng chưa gửi.'
+                            ),
+                        }
+                    )
+                    continue
+                return {
+                    'handled': True,
+                    'action': 'send_message',
+                    'message': 'Em chưa gửi tin nhắn nào vì chưa xác định được người nhận chắc chắn. Anh nói rõ tên/Zalo user giúp em nha.',
+                }
             if not final_text and last_tool_result:
                 if last_tool_result.get('ok') and 'task' in last_tool_result:
                     task = last_tool_result['task']
@@ -1155,10 +1421,15 @@ def _run_tool_agent(
                 action = 'approve'
             elif last_tool_name == 'update_task_status':
                 action = 'status'
+            elif last_tool_name == 'update_task_fields':
+                action = 'edit'
             elif last_tool_name == 'list_tasks':
                 action = 'list'
             elif last_tool_name == 'send_message':
                 action = 'send_message'
+                if last_tool_result and not last_tool_result.get('ok'):
+                    error = str(last_tool_result.get('error') or 'Không rõ lỗi gửi tin.')
+                    final_text = f'Em chưa gửi được tin nhắn nha: {error}'
             return {'handled': True, 'action': action, 'message': final_text}
 
         for tool_call in response.tool_calls:
