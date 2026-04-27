@@ -540,18 +540,12 @@ def test_zalo_tool_agent_can_relay_message_to_user(client, monkeypatch) -> None:
     assert 'nhắn Quang rồi' in replies[-1]['message']
 
 
-def test_zalo_tool_agent_forces_send_message_tool_for_relay_claim(client, monkeypatch) -> None:
+def test_zalo_tool_agent_can_relay_link_to_named_user(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
-    admin, _, quang = _users(client)
-    calls: list[dict] = []
-
-    def _fake_complete_bot_conversation(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            return _tool_response('Em sẽ nhắn Quang giúp anh nha.')
-        if len(calls) == 2:
-            assert kwargs.get('tool_choice') == {'type': 'function', 'function': {'name': 'send_message'}}
-            return _tool_response(
+    admin, linh, _ = _users(client)
+    responses = iter(
+        [
+            _tool_response(
                 '',
                 [
                     (
@@ -559,13 +553,47 @@ def test_zalo_tool_agent_forces_send_message_tool_for_relay_claim(client, monkey
                         'send_message',
                         {
                             'channel': 'user',
-                            'target_token': quang['username'],
-                            'message': 'Quang ơi cập nhật task due date giúp anh Phú nha.',
+                            'target_token': linh['username'],
+                            'message': 'Shin ơi, task #73 đây nha: https://hazeleo.com/task',
                         },
                     )
                 ],
-            )
-        return _tool_response('Em nhắn Quang thật rồi anh Phú nha.')
+            ),
+            _tool_response('Em nhắn Shin link task #73 rồi anh nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'nhắn Linh gửi link task #73 cho anh',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-relay-link-to-named-user',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'send_message'
+    assert replies[0]['target_id'] == linh['zalo_user_id']
+    assert 'task #73' in replies[0]['message']
+    assert 'link task #73 rồi' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_does_not_force_send_message_for_link_request(client, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, _ = _users(client)
+    calls: list[dict] = []
+
+    def _fake_complete_bot_conversation(**kwargs):
+        calls.append(kwargs)
+        assert 'tool_choice' not in kwargs or kwargs.get('tool_choice') is None
+        return _tool_response('Link chi tiết task đây anh: https://hazeleo.com/task')
 
     monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
     monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', _fake_complete_bot_conversation)
@@ -573,20 +601,20 @@ def test_zalo_tool_agent_forces_send_message_tool_for_relay_claim(client, monkey
     response = client.post(
         '/zalo/incoming',
         json={
-            'text': 'nhắn Quang cập nhật task due date đi nhé',
+            'text': 'gửi link chi tiết task #73',
             'from_uid': admin['zalo_user_id'],
             'conversation_id': admin['zalo_user_id'],
             'conversation_type': 'user',
-            'message_id': 'msg-relay-force-tool',
+            'message_id': 'msg-link-no-force-send',
         },
         headers=_secret_headers(),
     )
 
     assert response.status_code == 200
-    assert response.json()['action'] == 'send_message'
-    assert len(calls) == 3
-    assert replies[0]['target_id'] == quang['zalo_user_id']
-    assert 'thật rồi' in replies[-1]['message']
+    assert response.json()['action'] == 'chat'
+    assert len(calls) == 1
+    assert replies[-1]['target_id'] == admin['zalo_user_id']
+    assert 'Link chi tiết task' in replies[-1]['message']
 
 
 def test_zalo_tool_agent_does_not_claim_sent_when_send_message_tool_fails(client, monkeypatch) -> None:

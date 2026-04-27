@@ -145,23 +145,6 @@ def _strip_bot_alias(text: str, *, allow_plain_text: bool) -> str | None:
     return None
 
 
-def _looks_like_relay_request(text: str | None) -> bool:
-    folded = (text or '').casefold().replace('đ', 'd')
-    ascii_text = unicodedata.normalize('NFKD', folded).encode('ascii', 'ignore').decode('ascii')
-    normalized_text = re.sub(r'[\W_]+', ' ', ascii_text, flags=re.UNICODE).strip()
-    if not normalized_text:
-        return False
-    compact_text = normalized_text.replace(' ', '')
-
-    if re.search(r'\b(gui|bao)\b', normalized_text):
-        return True
-    if 'chuyen loi' in normalized_text or 'chuyenloi' in compact_text:
-        return True
-    if re.search(r'\bnhan\b', normalized_text) and not re.search(r'\bxac\s+nhan\b', normalized_text):
-        return True
-    return bool(re.search(r'\bhoi\s+(anh|chi|em|hazel|quynh|shin|ngoc|my)\b', normalized_text))
-
-
 def _mention_values(mention: dict) -> list[str]:
     values: list[str] = []
     for key in ('uid', 'id', 'user_id', 'userId', 'zalo_user_id', 'zaloUserId', 'label', 'name', 'displayName'):
@@ -787,7 +770,8 @@ def _tool_system_prompt(actor: User) -> str:
         'Bạn đang ở nhánh tool-calling của trợ lý Zalo cho Task Manager. '
         'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, đổi status task, sửa field task, và gửi tin nhắn Zalo hộ người dùng. '
         'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
-        'Luôn dùng send_message khi người dùng yêu cầu nhắn/gửi/chuyển lời cho một người hoặc group. '
+        'Chỉ dùng send_message khi người dùng yêu cầu nhắn/gửi/chuyển lời tới một người hoặc group khác một cách rõ ràng. '
+        'Nếu người dùng nói "gửi link", "cho anh link", "gửi chi tiết task" trong chính cuộc chat hiện tại, hãy trả lời trong chat, không dùng send_message. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
         'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
         'Nếu người dùng muốn sửa deadline/assignee/description/link/field khác của task cũ, hãy dùng find_tasks trước rồi update_task_fields. '
@@ -1365,19 +1349,13 @@ def _run_tool_agent(
     ]
     last_tool_result: dict[str, Any] | None = None
     last_tool_name: str | None = None
-    forced_send_message = False
-    relay_request = _looks_like_relay_request(text)
 
     for _ in range(4):
         try:
-            tool_choice = None
-            if forced_send_message and last_tool_name != 'send_message':
-                tool_choice = {'type': 'function', 'function': {'name': 'send_message'}}
             response = complete_bot_conversation(
                 messages=messages,
                 tools=_tool_specs(),
                 temperature=0.2,
-                tool_choice=tool_choice,
             )
         except BotLLMError:
             return None
@@ -1385,26 +1363,6 @@ def _run_tool_agent(
         messages.append(response.assistant_message)
         if not response.tool_calls:
             final_text = response.content.strip()
-            if relay_request and last_tool_name != 'send_message':
-                if not forced_send_message:
-                    forced_send_message = True
-                    messages.append(
-                        {
-                            'role': 'user',
-                            'content': (
-                                'Tin nhắn gốc là yêu cầu nhắn/gửi/chuyển lời cho người khác. '
-                                'Bạn chưa được nói là đã gửi nếu chưa gọi tool send_message. '
-                                'Hãy gọi tool send_message ngay với đúng người nhận; nếu không xác định được người nhận, '
-                                'hãy gọi send_message với target rõ nhất để backend kiểm tra, hoặc trả lời ngắn rằng chưa gửi.'
-                            ),
-                        }
-                    )
-                    continue
-                return {
-                    'handled': True,
-                    'action': 'send_message',
-                    'message': 'Em chưa gửi tin nhắn nào vì chưa xác định được người nhận chắc chắn. Anh nói rõ tên/Zalo user giúp em nha.',
-                }
             if not final_text and last_tool_result:
                 if last_tool_result.get('ok') and 'task' in last_tool_result:
                     task = last_tool_result['task']
