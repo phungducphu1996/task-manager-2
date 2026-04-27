@@ -18,6 +18,7 @@ export const useTaskStore = defineStore('tasks', () => {
   const groups = ref<{ key: string; title: string; date?: string | null; tasks: Task[] }[]>([])
 
   const view = ref<TaskView>('today')
+  const viewCounts = ref<Partial<Record<TaskView, number>>>({})
   const assigneeId = ref<string | null>(null)
   const shopFilter = ref<number | null>(null)
   const typeFilter = ref<number | null>(null)
@@ -43,6 +44,46 @@ export const useTaskStore = defineStore('tasks', () => {
   let createTaskLock = false
   let lastCreateFingerprint: string | null = null
   let lastCreateAt = 0
+  let viewCountFetchSeq = 0
+
+  function countTasksFromGroups(groupList: { tasks: Task[] }[]): number {
+    return groupList.reduce((sum, group) => sum + group.tasks.length, 0)
+  }
+
+  async function refreshViewCounts() {
+    if (!isAdmin.value && !assigneeId.value) return
+
+    const seq = ++viewCountFetchSeq
+    const views: TaskView[] = ['inbox', 'today', 'upcoming', 'anytime', 'logbook']
+    if (isAdmin.value) views.push('review')
+
+    const effectiveAssigneeId = isAdmin.value ? assigneeId.value : null
+    const responses = await Promise.allSettled(
+      views.map(async (targetView) => {
+        const data = await api.getTasks(
+          {
+            view: targetView,
+            assignee_id: effectiveAssigneeId,
+            shop_id: shopFilter.value,
+            type_id: typeFilter.value
+          },
+          null
+        )
+        return [targetView, countTasksFromGroups(data.groups)] as const
+      })
+    )
+
+    if (seq !== viewCountFetchSeq) return
+
+    const nextCounts: Partial<Record<TaskView, number>> = {}
+    responses.forEach((result) => {
+      if (result.status === 'fulfilled') {
+        const [targetView, count] = result.value
+        nextCounts[targetView] = count
+      }
+    })
+    viewCounts.value = { ...viewCounts.value, ...nextCounts }
+  }
 
   async function bootstrap(initialUserId: string | null = null, currentActorRole: User['role'] | null = null) {
     loading.value = true
@@ -87,6 +128,11 @@ export const useTaskStore = defineStore('tasks', () => {
         null
       )
       groups.value = data.groups
+      viewCounts.value = {
+        ...viewCounts.value,
+        [view.value]: countTasksFromGroups(data.groups)
+      }
+      void refreshViewCounts()
       const visibleTaskIds = new Set(flattenGroups(data.groups).map((task) => task.id))
       selectedTaskIds.value = selectedTaskIds.value.filter((taskId) => visibleTaskIds.has(taskId))
 
@@ -423,6 +469,7 @@ export const useTaskStore = defineStore('tasks', () => {
     taskTypes,
     groups,
     view,
+    viewCounts,
     assigneeId,
     shopFilter,
     typeFilter,

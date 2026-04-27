@@ -445,6 +445,139 @@ def test_zalo_tool_agent_can_edit_deadline_and_assignee(
     assert 'đổi deadline' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_can_edit_assignee_after_confirmation_context(
+    client,
+    db_session,
+    monkeypatch,
+) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, quang = _users(client)
+    task = Task(
+        title='Bluey Collection',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.ready,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.add(
+        BotConversationMessage(
+            user_id=admin['id'],
+            conversation_id=admin['zalo_user_id'],
+            message_id='previous-edit-request',
+            role='user',
+            content='task Bluey Collection chuyển qua cho Quang và deadline hôm nay nha',
+            metadata_json={'source': 'test'},
+        )
+    )
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'update_task_fields',
+                        {
+                            'task_id': task.id,
+                            'assignee_token': quang['username'],
+                            'due_token': 'today',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Đã chuyển task Bluey cho Quang và cập nhật deadline hôm nay rồi anh nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'đúng rồi',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-edit-confirmation-context',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'edit'
+    db_session.refresh(task)
+    assert task.assigned_to == quang['id']
+    assert task.due_date == local_today()
+    assert 'Quang' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_reports_partial_failure_instead_of_lying(
+    client,
+    db_session,
+    monkeypatch,
+) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, quang = _users(client)
+    task = Task(
+        title='Bluey Collection',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.ready,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-1',
+                        'update_task_fields',
+                        {
+                            'task_id': task.id,
+                            'assignee_token': quang['username'],
+                            'due_token': 'today',
+                        },
+                    ),
+                    ('call-2', 'update_task_status', {'task_id': task.id, 'status': 'todo'}),
+                ],
+            ),
+            _tool_response('Đã chuyển cho Quang, cập nhật deadline hôm nay và đưa về todo rồi anh nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'đúng rồi',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-edit-partial-failure',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'status'
+    db_session.refresh(task)
+    assert task.assigned_to == linh['id']
+    assert task.due_date is None
+    assert task.status == TaskStatus.todo
+    assert 'chưa hoàn tất' in replies[-1]['message']
+    assert 'Không đổi assign' in replies[-1]['message']
+
+
 def test_zalo_find_tasks_matches_assignee_token(client, db_session, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, quang = _users(client)

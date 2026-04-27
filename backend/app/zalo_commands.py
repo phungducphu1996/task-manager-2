@@ -776,6 +776,7 @@ def _tool_system_prompt(actor: User) -> str:
         'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
         'Nếu người dùng muốn sửa deadline/assignee/description/link/field khác của task cũ, hãy dùng find_tasks trước rồi update_task_fields. '
         'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
+        'Nếu tool trả ok=false hoặc một phần tool fail, phải nói rõ phần chưa làm được; không được nói đã cập nhật field bị fail. '
         'Nếu câu mơ hồ, không chắc, hoặc có nhiều task match, đừng tự quyết định; hãy hỏi lại ngắn gọn. '
         f'Người dùng hiện tại: {actor.name} ({actor.username}), role={actor.role or "unknown"}. '
         f'Admin={"yes" if _is_admin(actor) else "no"}.'
@@ -1253,6 +1254,7 @@ def _execute_tool_call(
     current_channel: NotificationChannel | None = None,
     current_target_id: str | None = None,
     original_text: str | None = None,
+    task_context_text: str | None = None,
 ) -> dict[str, Any]:
     try:
         if name == 'find_tasks':
@@ -1291,7 +1293,7 @@ def _execute_tool_call(
                 actor=actor,
                 task_id=int(arguments.get('task_id')),
                 arguments=arguments,
-                original_text=original_text,
+                original_text=task_context_text or original_text,
             )
         if name == 'send_message':
             return _tool_send_message(
@@ -1311,6 +1313,29 @@ def _execute_tool_call(
     except HTTPException as exc:
         return {'ok': False, 'error': str(exc.detail)}
     return {'ok': False, 'error': f'Unknown tool: {name}'}
+
+
+def _partial_tool_failure_message(tool_results: list[dict[str, Any]]) -> str | None:
+    failed_results = [item for item in tool_results if not item.get('result', {}).get('ok')]
+    if not failed_results:
+        return None
+
+    errors = [
+        str(item.get('result', {}).get('error') or f'{item.get("name", "tool")} failed')
+        for item in failed_results
+    ]
+    successful_names = [
+        str(item.get('name'))
+        for item in tool_results
+        if item.get('result', {}).get('ok') and item.get('name')
+    ]
+    unique_successes = sorted(set(successful_names))
+    if unique_successes:
+        return (
+            f'Em chưa hoàn tất hết nha: {"; ".join(errors)} '
+            f'Phần đã chạy được: {", ".join(unique_successes)}.'
+        )
+    return f'Em chưa thực hiện được nha: {"; ".join(errors)}'
 
 
 def _run_tool_agent(
@@ -1349,6 +1374,10 @@ def _run_tool_agent(
     ]
     last_tool_result: dict[str, Any] | None = None
     last_tool_name: str | None = None
+    tool_results: list[dict[str, Any]] = []
+    task_context_text = '\n'.join(
+        part for part in (recent_conversation, f'user: {text}') if part and part.strip()
+    )
 
     for _ in range(4):
         try:
@@ -1388,6 +1417,8 @@ def _run_tool_agent(
                 if last_tool_result and not last_tool_result.get('ok'):
                     error = str(last_tool_result.get('error') or 'Không rõ lỗi gửi tin.')
                     final_text = f'Em chưa gửi được tin nhắn nha: {error}'
+            if action != 'send_message' and (failure_message := _partial_tool_failure_message(tool_results)):
+                final_text = failure_message
             return {'handled': True, 'action': action, 'message': final_text}
 
         for tool_call in response.tool_calls:
@@ -1400,8 +1431,10 @@ def _run_tool_agent(
                 current_channel=current_channel,
                 current_target_id=current_target_id,
                 original_text=text,
+                task_context_text=task_context_text,
             )
             last_tool_result = result
+            tool_results.append({'name': tool_call.name, 'result': result})
             messages.append(
                 {
                     'role': 'tool',

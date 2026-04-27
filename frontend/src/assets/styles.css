@@ -807,6 +807,25 @@ textarea {
   color: var(--muted);
 }
 
+.detail-field {
+  align-content: start;
+}
+
+.detail-field-with-foot {
+  grid-template-rows: auto auto minmax(18px, auto);
+}
+
+.detail-field-foot {
+  display: block;
+  min-height: 18px;
+  margin: 0;
+}
+
+.detail-field-foot-empty {
+  opacity: 0;
+  pointer-events: none;
+}
+
 .detail-assignee-picker .assignee-trigger,
 .detail-assignee-picker .assignee-option {
   text-transform: none;
@@ -816,6 +835,7 @@ textarea {
 .detail-assignee-picker .assignee-trigger {
   font-size: 1rem;
   color: var(--text);
+  min-height: 58px;
 }
 
 .detail-status-picker {
@@ -827,13 +847,14 @@ textarea {
   position: relative;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 8px;
   border: 1px solid #e2e8f6;
   border-radius: 10px;
   background: #f9fbff;
   color: var(--text);
-  padding: 6px 10px;
+  min-height: 58px;
+  padding: 10px 14px;
   cursor: pointer;
 }
 
@@ -844,14 +865,14 @@ textarea {
 }
 
 .status-picker-chip {
-  min-width: 88px;
-  margin: 0 auto;
+  min-width: 132px;
+  margin: 0;
   text-align: center;
 }
 
 .status-trigger .assignee-caret {
-  position: absolute;
-  right: 10px;
+  margin-left: auto;
+  position: static;
 }
 
 .status-menu {
@@ -876,7 +897,7 @@ textarea {
   border-radius: 8px;
   background: transparent;
   color: inherit;
-  justify-content: center;
+  justify-content: flex-start;
   padding: 6px 8px;
   display: flex;
   align-items: center;
@@ -898,7 +919,7 @@ textarea {
 }
 
 .status-menu-chip {
-  min-width: 88px;
+  min-width: 132px;
   text-align: center;
 }
 
@@ -2087,7 +2108,51 @@ body {
 }
 
 .nav-item-content {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
+}
+
+.nav-item-main {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-count {
+  flex: 0 0 auto;
+  margin-left: 10px;
+  padding: 0;
+  border-radius: 999px;
+  color: #7f8794;
+  font-size: 1rem;
+  font-weight: 620;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.nav-item.active .nav-count {
+  color: #9aa3b3;
+}
+
+.nav-count.is-today {
+  padding: 4px 10px;
+  background: rgba(228, 70, 103, 0.28);
+  color: #ff7d9b;
+}
+
+.nav-item.active .nav-count.is-today {
+  background: rgba(239, 88, 120, 0.34);
+  color: #ff9db2;
 }
 
 .nav-icon,

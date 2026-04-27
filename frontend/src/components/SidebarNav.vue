@@ -7,6 +7,7 @@ const props = defineProps<{
   users: User[]
   shops: Shop[]
   taskTypes: TaskType[]
+  viewCounts?: Partial<Record<TaskView, number>>
   assigneeId: string | null
   activeRole: User['role'] | null
   lockAssignee: boolean
@@ -33,6 +34,10 @@ const navItems: { key: TaskView; label: string; icon: NavIcon }[] = [
   { key: 'logbook', label: 'Logbook', icon: 'logbook' },
   { key: 'review', label: 'Review Queue', icon: 'review' }
 ]
+
+function getViewCount(viewKey: TaskView): number {
+  return props.viewCounts?.[viewKey] ?? 0
+}
 
 function toNullableInt(value: string): number | null {
   if (!value) return null
@@ -134,33 +139,43 @@ onBeforeUnmount(() => {
         @click="emit('change-view', item.key)"
       >
         <span class="nav-item-content">
-          <span class="nav-icon" :class="`icon-${item.icon}`" :data-testid="`nav-icon-${item.key}`" aria-hidden="true">
-            <svg v-if="item.icon === 'inbox'" viewBox="0 0 20 20" fill="none">
-              <path d="M2.5 6.25a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2z" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M6.5 9.75h2l1.2 1.8h.6l1.2-1.8h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <svg v-else-if="item.icon === 'today'" viewBox="0 0 20 20" fill="none">
-              <path d="m10 2.2 2.18 4.42 4.88.71-3.53 3.45.83 4.87L10 13.34 5.64 15.65l.83-4.87L2.94 7.33l4.88-.71z" fill="currentColor"/>
-            </svg>
-            <svg v-else-if="item.icon === 'upcoming'" viewBox="0 0 20 20" fill="none">
-              <rect x="3" y="4" width="14" height="13" rx="2.5" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M3 7.5h14M6.2 2.8v2.8M13.8 2.8v2.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              <circle cx="7.1" cy="11.6" r="1" fill="currentColor"/>
-            </svg>
-            <svg v-else-if="item.icon === 'anytime'" viewBox="0 0 20 20" fill="none">
-              <path d="m10 3 6.4 3.2L10 9.4 3.6 6.2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
-              <path d="m3.6 9.3 6.4 3.2 6.4-3.2M3.6 12.4l6.4 3.2 6.4-3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <svg v-else-if="item.icon === 'logbook'" viewBox="0 0 20 20" fill="none">
-              <rect x="4" y="2.8" width="12" height="14.4" rx="2.2" stroke="currentColor" stroke-width="1.8"/>
-              <path d="m7.2 10.2 1.8 1.9 3.8-4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <svg v-else viewBox="0 0 20 20" fill="none">
-              <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8"/>
-              <path d="m7.2 10.2 1.8 1.9 3.8-4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
+          <span class="nav-item-main">
+            <span class="nav-icon" :class="`icon-${item.icon}`" :data-testid="`nav-icon-${item.key}`" aria-hidden="true">
+              <svg v-if="item.icon === 'inbox'" viewBox="0 0 20 20" fill="none">
+                <path d="M2.5 6.25a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2z" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M6.5 9.75h2l1.2 1.8h.6l1.2-1.8h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <svg v-else-if="item.icon === 'today'" viewBox="0 0 20 20" fill="none">
+                <path d="m10 2.2 2.18 4.42 4.88.71-3.53 3.45.83 4.87L10 13.34 5.64 15.65l.83-4.87L2.94 7.33l4.88-.71z" fill="currentColor"/>
+              </svg>
+              <svg v-else-if="item.icon === 'upcoming'" viewBox="0 0 20 20" fill="none">
+                <rect x="3" y="4" width="14" height="13" rx="2.5" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M3 7.5h14M6.2 2.8v2.8M13.8 2.8v2.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <circle cx="7.1" cy="11.6" r="1" fill="currentColor"/>
+              </svg>
+              <svg v-else-if="item.icon === 'anytime'" viewBox="0 0 20 20" fill="none">
+                <path d="m10 3 6.4 3.2L10 9.4 3.6 6.2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                <path d="m3.6 9.3 6.4 3.2 6.4-3.2M3.6 12.4l6.4 3.2 6.4-3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <svg v-else-if="item.icon === 'logbook'" viewBox="0 0 20 20" fill="none">
+                <rect x="4" y="2.8" width="12" height="14.4" rx="2.2" stroke="currentColor" stroke-width="1.8"/>
+                <path d="m7.2 10.2 1.8 1.9 3.8-4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <svg v-else viewBox="0 0 20 20" fill="none">
+                <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8"/>
+                <path d="m7.2 10.2 1.8 1.9 3.8-4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">{{ item.label }}</span>
           </span>
-          <span>{{ item.label }}</span>
+          <span
+            v-if="getViewCount(item.key) > 0"
+            class="nav-count"
+            :class="{ 'is-today': item.key === 'today' }"
+            :data-testid="`nav-count-${item.key}`"
+          >
+            {{ getViewCount(item.key) }}
+          </span>
         </span>
       </button>
     </nav>

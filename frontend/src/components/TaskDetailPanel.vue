@@ -1004,8 +1004,8 @@ onBeforeUnmount(() => {
         </label>
 
         <div class="detail-grid">
-          <label>
-            Status
+          <label class="detail-field detail-field-with-foot">
+            <span>Status</span>
             <div
               ref="statusPickerRef"
               class="status-picker detail-status-picker"
@@ -1047,13 +1047,14 @@ onBeforeUnmount(() => {
                 </li>
               </ul>
             </div>
-            <small v-if="approvalState" class="approval-hint" :class="`approval-${approvalState.tone}`">
+            <small v-if="approvalState" class="detail-field-foot approval-hint" :class="`approval-${approvalState.tone}`">
               {{ approvalState.label }}
             </small>
+            <small v-else class="detail-field-foot detail-field-foot-empty" aria-hidden="true">&nbsp;</small>
           </label>
 
-          <label>
-            Assignee
+          <label class="detail-field detail-field-with-foot">
+            <span>Assignee</span>
             <div
               ref="assigneePickerRef"
               class="assignee-picker detail-assignee-picker"
@@ -1104,6 +1105,7 @@ onBeforeUnmount(() => {
                 </li>
               </ul>
             </div>
+            <small class="detail-field-foot detail-field-foot-empty" aria-hidden="true">&nbsp;</small>
           </label>
 
           <label>

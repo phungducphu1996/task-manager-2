@@ -9,6 +9,7 @@ describe('SidebarNav', () => {
         users: [{ id: 'user-1', username: 'linh', name: 'Linh', role: 'designer' }],
         shops: [{ id: 10, name: 'AmzMage' }],
         taskTypes: [{ id: 20, name: 'Design' }],
+        viewCounts: { inbox: 13, today: 3 },
         assigneeId: 'user-1',
         activeRole: 'designer',
         lockAssignee: false,
@@ -21,6 +22,8 @@ describe('SidebarNav', () => {
     expect(getByTestId('nav-icon-today')).toBeTruthy()
     expect(getByTestId('nav-icon-inbox')).toBeTruthy()
     expect(getByTestId('nav-icon-anytime')).toBeTruthy()
+    expect(getByTestId('nav-count-inbox').textContent).toBe('13')
+    expect(getByTestId('nav-count-today').textContent).toBe('3')
 
     await fireEvent.click(getByText('Upcoming'))
     await fireEvent.update(getByLabelText('Shop'), '10')
@@ -36,6 +39,7 @@ describe('SidebarNav', () => {
         users: [{ id: 'user-1', username: 'admin', name: 'Admin', role: 'admin' }],
         shops: [],
         taskTypes: [{ id: 20, name: 'Design' }],
+        viewCounts: { review: 2 },
         assigneeId: null,
         activeRole: 'admin',
         lockAssignee: false,
@@ -59,6 +63,7 @@ describe('SidebarNav', () => {
         ],
         shops: [],
         taskTypes: [],
+        viewCounts: { inbox: 2 },
         assigneeId: 'user-1',
         activeRole: 'admin',
         lockAssignee: false,

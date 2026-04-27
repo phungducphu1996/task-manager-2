@@ -148,6 +148,7 @@ async function bulkDeleteSelected() {
       :users="store.users"
       :shops="store.shops"
       :task-types="store.taskTypes"
+      :view-counts="store.viewCounts"
       :assignee-id="store.assigneeId"
       :active-role="auth.user?.role ?? null"
       :shop-filter="store.shopFilter"

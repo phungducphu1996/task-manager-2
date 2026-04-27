@@ -4,6 +4,7 @@ __pycache__/
 backend/.venv/
 backend/.pytest_cache/
 backend/test_task_manager.db
+test_task_manager.db
 
 # Node
 frontend/node_modules/
