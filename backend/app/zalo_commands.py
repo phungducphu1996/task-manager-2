@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, object_session
 
 from .bot_files import (
     contact_prompt_text_for_group,
@@ -27,7 +27,14 @@ from .bot_files import (
     user_contact_aliases,
 )
 from .bot_llm import BotLLMError, complete_bot_conversation, is_bot_llm_configured
-from .bot_memory import recent_conversation_text, recent_memory_text, store_conversation_message
+from .bot_memory import (
+    conversation_state_text,
+    get_conversation_state,
+    recent_conversation_text,
+    recent_memory_text,
+    store_conversation_message,
+    upsert_conversation_state,
+)
 from .config import get_settings
 from .bot_copilot import handle_zalo_chat
 from .models import (
@@ -53,6 +60,9 @@ from .services import get_task_or_404, list_tasks, local_today, next_list_order
 settings = get_settings()
 T = TypeVar('T')
 MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
+GENERIC_NAME_PARTS = {'anh', 'chi', 'chị', 'em', 'ban', 'bạn', 'minh', 'mình'}
+
+
 @dataclass(slots=True)
 class ParsedZaloCommand:
     action: Literal['add', 'list', 'chat']
@@ -450,9 +460,120 @@ def _user_is_mentioned_in_text(user: User, text: str | None) -> bool:
 
     for part in re.split(r'\s+', user.name or ''):
         normalized_part = _normalize_lookup(part)
+        if normalized_part in {_normalize_lookup(item) for item in GENERIC_NAME_PARTS}:
+            continue
         if len(normalized_part) >= 3 and normalized_part in normalized_text:
             return True
     return False
+
+
+def _mentioned_users_in_text(db: Session, text: str | None) -> list[User]:
+    if not text:
+        return []
+    users = db.scalars(select(User).where(User.is_active.is_(True))).all()
+    return [user for user in users if _user_is_mentioned_in_text(user, text)]
+
+
+def _looks_like_assignee_update(text: str | None) -> bool:
+    normalized = _normalize_lookup(text or '')
+    if not normalized:
+        return False
+    return any(
+        token in normalized
+        for token in (
+            'chuyenquacho',
+            'doiqua',
+            'doisang',
+            'gancho',
+            'assigncho',
+            'giacho',
+            'chochi',
+            'choanh',
+            'choban',
+            'cho',
+        )
+    )
+
+
+def _explicit_due_token_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    due_token, _ = _extract_natural_due_token(text)
+    return due_token
+
+
+def _state_data_from_tool_results(*, existing_state: dict, tool_results: list[dict[str, Any]]) -> dict:
+    next_state = dict(existing_state or {})
+    successful: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for item in tool_results:
+        name = str(item.get('name') or 'tool')
+        result = item.get('result') or {}
+        if result.get('ok'):
+            successful.append({'name': name, 'task': result.get('task'), 'changed_fields': result.get('changed_fields')})
+            task = result.get('task')
+            if not task and name == 'find_tasks':
+                tasks = result.get('tasks') or []
+                if len(tasks) == 1:
+                    task = tasks[0]
+            if isinstance(task, dict):
+                next_state['active_task'] = task
+                fields: dict[str, Any] = {}
+                if name == 'update_task_status' and task.get('status'):
+                    fields['status'] = task.get('status')
+                for field in result.get('changed_fields') or []:
+                    if field == 'assigned_to':
+                        fields['assignee'] = task.get('assignee')
+                    elif field == 'due_date':
+                        fields['due_date'] = task.get('due_date')
+                    elif field == 'status':
+                        fields['status'] = task.get('status')
+                    else:
+                        fields[field] = True
+                if fields:
+                    next_state['pending_intent'] = {
+                        'action': 'update_task',
+                        'task_id': task.get('id'),
+                        'fields': fields,
+                        'needs_confirmation': False,
+                    }
+        else:
+            failed.append({'name': name, 'error': result.get('error') or 'Tool failed.'})
+
+    next_state['last_successful_tool_results'] = successful[-5:]
+    next_state['last_failed_tool_results'] = failed[-5:]
+    return next_state
+
+
+def _ground_update_arguments(
+    db: Session,
+    *,
+    arguments: dict[str, Any],
+    current_text: str | None,
+    state_data: dict | None,
+) -> dict[str, Any]:
+    grounded = dict(arguments)
+
+    if not str(grounded.get('assignee_token') or '').strip() and _looks_like_assignee_update(current_text):
+        mentioned_users = _mentioned_users_in_text(db, current_text)
+        if len(mentioned_users) == 1:
+            grounded['assignee_token'] = mentioned_users[0].username or mentioned_users[0].id
+
+    if not str(grounded.get('assignee_token') or '').strip():
+        pending = (state_data or {}).get('pending_intent') or {}
+        fields = pending.get('fields') or {}
+        assignee_token = fields.get('assignee_token') or fields.get('assignee')
+        if assignee_token:
+            resolved = _resolve_user(db, str(assignee_token))
+            if resolved:
+                grounded['assignee_token'] = resolved.username or resolved.id
+
+    explicit_due = _explicit_due_token_from_text(current_text)
+    if explicit_due:
+        grounded['due_token'] = explicit_due
+
+    return grounded
 
 
 def _resolve_shop(db: Session, token: str | None) -> Shop | None:
@@ -789,6 +910,7 @@ def _tool_user_prompt(
     text: str,
     user_directory_text: str,
     recent_conversation: str,
+    conversation_state: str,
     memory_text: str,
     current_channel: NotificationChannel | None = None,
     current_target_id: str | None = None,
@@ -803,6 +925,7 @@ def _tool_user_prompt(
         f'Profile markdown:\n{profile_text(actor)}\n\n'
         f'Contact custom context:\n{contact_context}\n\n'
         f'Active user directory:\n{user_directory_text}\n\n'
+        f'Conversation state:\n{conversation_state}\n\n'
         f'Known memory facts:\n{memory_text}\n\n'
         f'Recent conversation in this thread:\n{recent_conversation}\n\n'
         f'Message: {text}\n'
@@ -812,11 +935,17 @@ def _tool_user_prompt(
 
 
 def _tool_task_payload(task: Task) -> dict[str, Any]:
+    assignee_name = task.assignee.name if task.assignee else None
+    if not assignee_name and task.assigned_to:
+        session = object_session(task)
+        if session:
+            assignee = session.get(User, str(task.assigned_to))
+            assignee_name = assignee.name if assignee else None
     return {
         'id': task.id,
         'title': task.title,
         'status': task.status.value,
-        'assignee': task.assignee.name if task.assignee else None,
+        'assignee': assignee_name,
         'assigned_to': task.assigned_to,
         'due_date': task.due_date.isoformat() if task.due_date else None,
         'shop': task.shop.name if task.shop else None,
@@ -1112,6 +1241,7 @@ def _tool_update_task_fields(
 
     db.add(task)
     db.commit()
+    db.expire_all()
     full_task = get_task_or_404(db, task.id) or task
 
     if previous_status != full_task.status:
@@ -1255,6 +1385,7 @@ def _execute_tool_call(
     current_target_id: str | None = None,
     original_text: str | None = None,
     task_context_text: str | None = None,
+    state_data: dict | None = None,
 ) -> dict[str, Any]:
     try:
         if name == 'find_tasks':
@@ -1288,11 +1419,17 @@ def _execute_tool_call(
                 status_token=str(arguments.get('status') or '').strip(),
             )
         if name == 'update_task_fields':
+            grounded_arguments = _ground_update_arguments(
+                db,
+                arguments=arguments,
+                current_text=original_text,
+                state_data=state_data,
+            )
             return _tool_update_task_fields(
                 db,
                 actor=actor,
                 task_id=int(arguments.get('task_id')),
-                arguments=arguments,
+                arguments=grounded_arguments,
                 original_text=task_context_text or original_text,
             )
         if name == 'send_message':
@@ -1338,6 +1475,51 @@ def _partial_tool_failure_message(tool_results: list[dict[str, Any]]) -> str | N
     return f'Em chưa thực hiện được nha: {"; ".join(errors)}'
 
 
+def _verified_update_success_message(tool_results: list[dict[str, Any]]) -> str | None:
+    if any(not item.get('result', {}).get('ok') for item in tool_results):
+        return None
+
+    task: dict[str, Any] | None = None
+    changed_fields: set[str] = set()
+    for item in tool_results:
+        name = str(item.get('name') or '')
+        result = item.get('result') or {}
+        candidate = result.get('task')
+        if isinstance(candidate, dict) and name in {'update_task_fields', 'update_task_status', 'approve_task'}:
+            task = candidate
+        if name == 'update_task_status':
+            changed_fields.add('status')
+        for field in result.get('changed_fields') or []:
+            changed_fields.add(str(field))
+
+    if not task or not changed_fields:
+        return None
+
+    parts: list[str] = []
+    if 'status' in changed_fields and task.get('status'):
+        parts.append(f'status sang {task["status"]}')
+    if 'assigned_to' in changed_fields:
+        parts.append(f'người phụ trách sang {task.get("assignee") or "chưa gán"}')
+    if 'due_date' in changed_fields:
+        parts.append(f'deadline {task.get("due_date") or "trống"}')
+    if 'description' in changed_fields:
+        parts.append('description')
+    if 'notes' in changed_fields:
+        parts.append('notes')
+    if 'shop_id' in changed_fields:
+        parts.append(f'shop {task.get("shop") or "trống"}')
+    if 'type_id' in changed_fields:
+        parts.append(f'type {task.get("type") or "trống"}')
+    if 'priority' in changed_fields:
+        parts.append('priority')
+    if 'attachment_links' in changed_fields:
+        parts.append('link attachment')
+
+    if not parts:
+        return None
+    return f'Em đã cập nhật task #{task["id"]} "{task["title"]}": {", ".join(parts)}.'
+
+
 def _run_tool_agent(
     db: Session,
     *,
@@ -1356,6 +1538,9 @@ def _run_tool_agent(
         user_id=actor.id,
         conversation_id=conversation_id,
     )
+    state_record = get_conversation_state(db, user_id=actor.id, conversation_id=conversation_id)
+    state_data = dict(state_record.state_json or {}) if state_record else {}
+    state_text = conversation_state_text(state_record)
     memory_text = recent_memory_text(db, user_id=actor.id)
     messages: list[dict[str, Any]] = [
         {'role': 'system', 'content': _tool_system_prompt(actor)},
@@ -1366,6 +1551,7 @@ def _run_tool_agent(
                 text=text,
                 user_directory_text=user_directory_text,
                 recent_conversation=recent_conversation,
+                conversation_state=state_text,
                 memory_text=memory_text,
                 current_channel=current_channel,
                 current_target_id=current_target_id,
@@ -1419,6 +1605,16 @@ def _run_tool_agent(
                     final_text = f'Em chưa gửi được tin nhắn nha: {error}'
             if action != 'send_message' and (failure_message := _partial_tool_failure_message(tool_results)):
                 final_text = failure_message
+            elif verified_message := _verified_update_success_message(tool_results):
+                final_text = verified_message
+            if tool_results:
+                next_state = _state_data_from_tool_results(existing_state=state_data, tool_results=tool_results)
+                upsert_conversation_state(
+                    db,
+                    user_id=actor.id,
+                    conversation_id=conversation_id,
+                    state_data=next_state,
+                )
             return {'handled': True, 'action': action, 'message': final_text}
 
         for tool_call in response.tool_calls:
@@ -1432,6 +1628,7 @@ def _run_tool_agent(
                 current_target_id=current_target_id,
                 original_text=text,
                 task_context_text=task_context_text,
+                state_data=state_data,
             )
             last_tool_result = result
             tool_results.append({'name': tool_call.name, 'result': result})

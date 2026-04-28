@@ -20,6 +20,7 @@ from .config import get_settings
 from .database import Base, engine, get_db
 from .models import (
     BotConversationMessage,
+    BotConversationState,
     BotMemoryFact,
     NotificationDelivery,
     NotificationEvent,
@@ -419,6 +420,7 @@ def on_startup() -> None:
             'notification_deliveries',
             'zalo_incoming_commands',
             'bot_conversation_messages',
+            'bot_conversation_states',
             'bot_memory_facts',
         ]
         if any(not inspector.has_table(table, schema=schema_name) for table in required_tables):
@@ -437,6 +439,7 @@ def on_startup() -> None:
                     NotificationDelivery.__table__,
                     ZaloIncomingCommand.__table__,
                     BotConversationMessage.__table__,
+                    BotConversationState.__table__,
                     BotMemoryFact.__table__,
                 ],
             )

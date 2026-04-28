@@ -8,7 +8,15 @@ from sqlalchemy import func, select
 
 from app.bot_llm import BotLLMToolCall, BotLLMToolResponse
 from app.config import get_settings
-from app.models import BotConversationMessage, BotMemoryFact, Task, TaskPriority, TaskStatus, ZaloIncomingCommand
+from app.models import (
+    BotConversationMessage,
+    BotConversationState,
+    BotMemoryFact,
+    Task,
+    TaskPriority,
+    TaskStatus,
+    ZaloIncomingCommand,
+)
 from app.services import local_today
 
 
@@ -442,7 +450,8 @@ def test_zalo_tool_agent_can_edit_deadline_and_assignee(
     assert task.assigned_to == quang['id']
     assert task.due_date == local_today() + timedelta(days=1)
     assert task.description == 'Mockup mới'
-    assert 'đổi deadline' in replies[-1]['message']
+    assert 'deadline' in replies[-1]['message']
+    assert 'Quang' in replies[-1]['message']
 
 
 def test_zalo_tool_agent_can_edit_assignee_after_confirmation_context(
@@ -576,6 +585,68 @@ def test_zalo_tool_agent_reports_partial_failure_instead_of_lying(
     assert task.status == TaskStatus.todo
     assert 'chưa hoàn tất' in replies[-1]['message']
     assert 'Không đổi assign' in replies[-1]['message']
+
+
+def test_zalo_tool_agent_grounds_missing_assignee_and_due_from_current_text(
+    client,
+    db_session,
+    monkeypatch,
+) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, quang = _users(client)
+    task = Task(
+        title='Update video mockup Mario Collection Gen AI',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.ready,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    ('call-1', 'update_task_status', {'task_id': task.id, 'status': 'todo'}),
+                    ('call-2', 'update_task_fields', {'task_id': task.id, 'due_token': 'today'}),
+                ],
+            ),
+            _tool_response('Đã đổi status và deadline, nhưng chưa đổi được người phụ trách.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'em chuyển status sang todo và cập nhật deadline ngày mai cho Quang nhé',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-ground-missing-assignee-due',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'edit'
+    db_session.refresh(task)
+    assert task.status == TaskStatus.todo
+    assert task.assigned_to == quang['id']
+    assert task.due_date == local_today() + timedelta(days=1)
+    assert 'Quang' in replies[-1]['message']
+    assert (local_today() + timedelta(days=1)).isoformat() in replies[-1]['message']
+
+    state = db_session.scalar(
+        select(BotConversationState).where(BotConversationState.conversation_id == admin['zalo_user_id'])
+    )
+    assert state is not None
+    assert state.state_json['active_task']['id'] == task.id
+    assert state.state_json['active_task']['assignee'] == 'Quang'
 
 
 def test_zalo_find_tasks_matches_assignee_token(client, db_session, monkeypatch) -> None:

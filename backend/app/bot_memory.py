@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import BotConversationMessage, BotMemoryFact, User
+from .models import BotConversationMessage, BotConversationState, BotMemoryFact, User
 
 settings = get_settings()
 
@@ -119,6 +119,83 @@ def recent_conversation_text(
         return 'Chưa có lịch sử hội thoại.'
     ordered = list(reversed(rows))
     return '\n'.join(f'{row.role}: {row.content}' for row in ordered)
+
+
+def get_conversation_state(
+    db: Session,
+    *,
+    user_id: str | None,
+    conversation_id: str | None,
+) -> BotConversationState | None:
+    if not conversation_id:
+        return None
+    return db.scalar(select(BotConversationState).where(BotConversationState.conversation_id == conversation_id))
+
+
+def conversation_state_text(state: BotConversationState | None) -> str:
+    if not state or not state.state_json:
+        return 'Chưa có state đang mở.'
+
+    data = state.state_json or {}
+    lines: list[str] = []
+    active_task = data.get('active_task') or {}
+    if active_task:
+        task_id = active_task.get('id')
+        title = active_task.get('title')
+        status = active_task.get('status')
+        assignee = active_task.get('assignee')
+        due_date = active_task.get('due_date')
+        details = [f'id={task_id}', f'title={title}']
+        if status:
+            details.append(f'status={status}')
+        if assignee:
+            details.append(f'assignee={assignee}')
+        if due_date:
+            details.append(f'due={due_date}')
+        lines.append(f'Active task: {" | ".join(details)}')
+
+    pending = data.get('pending_intent') or {}
+    if pending:
+        fields = pending.get('fields') or {}
+        lines.append(
+            'Pending intent: '
+            f'action={pending.get("action")}; task_id={pending.get("task_id")}; fields={fields}; '
+            f'needs_confirmation={pending.get("needs_confirmation", False)}'
+        )
+
+    failures = data.get('last_failed_tool_results') or []
+    if failures:
+        errors = [str(item.get('error') or item) for item in failures[:3]]
+        lines.append(f'Last failed tool results: {"; ".join(errors)}')
+
+    successes = data.get('last_successful_tool_results') or []
+    if successes:
+        names = [str(item.get('name') or 'tool') for item in successes[:3]]
+        lines.append(f'Last successful tools: {", ".join(names)}')
+
+    return '\n'.join(lines) if lines else 'Chưa có state đang mở.'
+
+
+def upsert_conversation_state(
+    db: Session,
+    *,
+    user_id: str | None,
+    conversation_id: str | None,
+    state_data: dict,
+) -> BotConversationState | None:
+    if not conversation_id:
+        return None
+    state = get_conversation_state(db, user_id=user_id, conversation_id=conversation_id)
+    if state is None:
+        state = BotConversationState(user_id=user_id, conversation_id=conversation_id, state_json=state_data)
+        db.add(state)
+        db.flush()
+        return state
+    state.user_id = user_id or state.user_id
+    state.state_json = state_data
+    db.add(state)
+    db.flush()
+    return state
 
 
 def extract_memory_facts(text: str) -> list[ExtractedMemory]:

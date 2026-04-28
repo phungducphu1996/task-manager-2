@@ -303,6 +303,25 @@ class BotConversationMessage(Base):
     )
 
 
+class BotConversationState(Base):
+    __tablename__ = 'bot_conversation_states'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    state_json: Mapped[dict] = mapped_column('state', JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(BotConversationState.user_id) == User.id,
+        viewonly=True,
+    )
+
+
 class BotMemoryFact(Base):
     __tablename__ = 'bot_memory_facts'
 
