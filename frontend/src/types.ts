@@ -115,3 +115,67 @@ export interface TaskPayload {
 export interface TaskConvertPayload {
   target_type_id: number
 }
+
+export type ReminderRuleType = 'daily_group_digest' | 'daily_member_checkin' | 'task_nudge' | 'daily_strategy'
+export type ReminderScheduleType = 'daily' | 'interval'
+export type NotificationChannel = 'user' | 'group'
+
+export interface ReminderRule {
+  id: number
+  name: string
+  rule_type: ReminderRuleType
+  enabled: boolean
+  target_channel: NotificationChannel | null
+  target_id: string | null
+  user_id: string | null
+  task_id: number | null
+  schedule_type: ReminderScheduleType
+  schedule_time: string | null
+  interval_minutes: number | null
+  timezone: string
+  quiet_start: string | null
+  quiet_end: string | null
+  max_runs_per_day: number | null
+  stop_statuses: string[]
+  escalation_after_minutes: number | null
+  escalation_after_runs: number | null
+  payload: Record<string, unknown>
+  created_by: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ReminderRulePayload {
+  name: string
+  rule_type: ReminderRuleType
+  enabled?: boolean
+  target_channel?: NotificationChannel | null
+  target_id?: string | null
+  user_id?: string | null
+  task_id?: number | null
+  schedule_type?: ReminderScheduleType
+  schedule_time?: string | null
+  interval_minutes?: number | null
+  timezone?: string | null
+  quiet_start?: string | null
+  quiet_end?: string | null
+  max_runs_per_day?: number | null
+  stop_statuses?: string[]
+  escalation_after_minutes?: number | null
+  escalation_after_runs?: number | null
+  payload?: Record<string, unknown>
+}
+
+export interface ReminderTickResult {
+  now: string
+  rules_checked: number
+  runs_created: number
+  runs_deduped: number
+  escalations_created: number
+  dispatch: {
+    processed: number
+    sent: number
+    pending: number
+    failed: number
+  }
+}

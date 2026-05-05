@@ -50,6 +50,18 @@ def test_internal_reminder_tick_requires_token(client) -> None:
     assert wrong.status_code == 403
 
 
+def test_manual_reminder_tick_is_admin_only(client, monkeypatch) -> None:
+    install_worker_success_stub(monkeypatch)
+    admin, member, _ = select_users(client.get('/users').json())
+
+    forbidden = client.post('/reminders/tick', headers=actor_headers(member['id']))
+    assert forbidden.status_code == 403
+
+    allowed = client.post('/reminders/tick', headers=actor_headers(admin['id']))
+    assert allowed.status_code == 200
+    assert 'rules_checked' in allowed.json()
+
+
 def test_daily_group_digest_tick_creates_one_run_and_dedupes(client, db_session, monkeypatch) -> None:
     calls = install_worker_success_stub(monkeypatch)
     settings = get_settings()

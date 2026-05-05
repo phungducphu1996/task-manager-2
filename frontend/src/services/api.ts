@@ -1,5 +1,8 @@
 import type {
   LoginResponse,
+  ReminderRule,
+  ReminderRulePayload,
+  ReminderTickResult,
   Shop,
   TaskAttachment,
   TaskComment,
@@ -94,6 +97,16 @@ export const api = {
   updateTaskType: (id: number, payload: { name: string }) =>
     request<TaskType>(`/task-types/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteTaskType: (id: number) => request<void>(`/task-types/${id}`, { method: 'DELETE' }),
+
+  getReminders: (actorId: string | null) => request<ReminderRule[]>('/reminders', { actorId }),
+  createReminder: (payload: ReminderRulePayload, actorId: string | null) =>
+    request<ReminderRule>('/reminders', { method: 'POST', body: JSON.stringify(payload), actorId }),
+  updateReminder: (id: number, payload: Partial<ReminderRulePayload>, actorId: string | null) =>
+    request<ReminderRule>(`/reminders/${id}`, { method: 'PATCH', body: JSON.stringify(payload), actorId }),
+  deleteReminder: (id: number, actorId: string | null) =>
+    request<ReminderRule>(`/reminders/${id}`, { method: 'DELETE', actorId }),
+  runReminderTick: (actorId: string | null) =>
+    request<ReminderTickResult>('/reminders/tick', { method: 'POST', actorId }),
 
   getTasks: (query: TaskQuery, actorId: string | null) => {
     const params = new URLSearchParams({ view: query.view })

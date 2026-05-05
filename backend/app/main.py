@@ -704,6 +704,20 @@ def list_reminders(
     return db.scalars(stmt).unique().all()
 
 
+@app.post('/reminders/tick')
+def run_manual_reminders_tick(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    if not _is_admin(actor):
+        raise _forbidden('Only admins can run reminder tick manually.')
+    try:
+        return run_reminder_tick(db)
+    except Exception as exc:  # pragma: no cover - defensive guard for manual ops
+        logger.exception('Manual reminder tick failed')
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Reminder tick failed: {exc}') from exc
+
+
 @app.patch('/reminders/{reminder_id}', response_model=ReminderRuleOut)
 def update_reminder(
     reminder_id: int,
