@@ -53,6 +53,19 @@ class Settings(BaseSettings):
     reminder_default_quiet_end: str = '07:00'
     reminder_member_checkin_admin_delay_minutes: int = 60
     reminder_task_nudge_max_per_day: int = 6
+    vikunja_api_url: str | None = None
+    vikunja_api_token: str | None = None
+    vikunja_public_url: str | None = None
+    vikunja_task_url_template: str | None = None
+    vikunja_project_id: int | None = None
+    vikunja_project_title: str = 'Hazel Task Manager'
+    vikunja_webhook_secret: str | None = None
+    vikunja_bucket_inbox_id: int | None = None
+    vikunja_bucket_todo_id: int | None = None
+    vikunja_bucket_doing_id: int | None = None
+    vikunja_bucket_review_id: int | None = None
+    vikunja_bucket_ready_id: int | None = None
+    vikunja_bucket_done_id: int | None = None
     runtime_base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property
@@ -103,6 +116,23 @@ class Settings(BaseSettings):
         if self.zalo_group_id and self.zalo_group_id not in group_ids:
             group_ids = [self.zalo_group_id, *group_ids]
         return [(group_id, f'Zalo group {index + 1}') for index, group_id in enumerate(group_ids)]
+
+    @property
+    def vikunja_enabled(self) -> bool:
+        return bool((self.vikunja_api_url or '').strip() and (self.vikunja_api_token or '').strip())
+
+    @property
+    def vikunja_status_bucket_map(self) -> dict[str, int]:
+        pairs = {
+            'todo': self.vikunja_bucket_todo_id,
+            'doing': self.vikunja_bucket_doing_id,
+            'review': self.vikunja_bucket_review_id,
+            'ready': self.vikunja_bucket_ready_id,
+            'done': self.vikunja_bucket_done_id,
+        }
+        if self.vikunja_bucket_inbox_id:
+            pairs['inbox'] = self.vikunja_bucket_inbox_id
+        return {status: bucket_id for status, bucket_id in pairs.items() if bucket_id is not None}
 
     def resolve_runtime_path(self, raw_path: str) -> Path:
         path = Path(raw_path)

@@ -432,6 +432,63 @@ class ZaloIncomingCommand(Base):
     task: Mapped[Task | None] = relationship('Task')
 
 
+class VikunjaUserMapping(Base):
+    __tablename__ = 'vikunja_user_mappings'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    social_user_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    vikunja_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    username: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    zalo_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    role: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending', index=True)
+    sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict] = mapped_column('metadata', JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(VikunjaUserMapping.social_user_id) == User.id,
+        viewonly=True,
+    )
+
+
+class VikunjaTaskMapping(Base):
+    __tablename__ = 'vikunja_task_mappings'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    local_task_id: Mapped[int] = mapped_column(ForeignKey('tasks.id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
+    vikunja_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    vikunja_project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    vikunja_bucket_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    source_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    sync_status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending', index=True)
+    sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict] = mapped_column('metadata', JSON, nullable=False, default=dict)
+    migrated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    task: Mapped[Task] = relationship('Task')
+
+
+class VikunjaBridgeState(Base):
+    __tablename__ = 'vikunja_bridge_state'
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class BotConversationMessage(Base):
     __tablename__ = 'bot_conversation_messages'
 

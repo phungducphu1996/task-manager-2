@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 from logging import getLogger
 from os.path import basename
 from re import sub
@@ -27,6 +28,9 @@ from .models import (
     ReminderInteraction,
     ReminderRule,
     ReminderRun,
+    VikunjaBridgeState,
+    VikunjaTaskMapping,
+    VikunjaUserMapping,
     Shop,
     Subtask,
     Task,
@@ -96,6 +100,15 @@ from .services import (
 from .storage import StorageError, delete_object, is_storage_enabled, sign_object_url, upload_bytes
 from .storage import ensure_bucket_exists
 from .zalo_commands import handle_zalo_incoming
+from .vikunja import (
+    get_vikunja_client,
+    handle_vikunja_webhook,
+    migrate_tasks_to_vikunja,
+    reconcile_vikunja_bridge,
+    require_vikunja_or_503,
+    sync_vikunja_users,
+    vikunja_bridge_summary,
+)
 
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
@@ -453,6 +466,9 @@ def on_startup() -> None:
             'reminder_rules',
             'reminder_runs',
             'reminder_interactions',
+            'vikunja_user_mappings',
+            'vikunja_task_mappings',
+            'vikunja_bridge_state',
         ]
         if any(not inspector.has_table(table, schema=schema_name) for table in required_tables):
             # Safety fallback for local/dev environments where migrations are not yet aligned.
@@ -475,6 +491,9 @@ def on_startup() -> None:
                     ReminderRule.__table__,
                     ReminderRun.__table__,
                     ReminderInteraction.__table__,
+                    VikunjaUserMapping.__table__,
+                    VikunjaTaskMapping.__table__,
+                    VikunjaBridgeState.__table__,
                 ],
             )
 
@@ -591,6 +610,58 @@ def receive_zalo_incoming(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     return handle_zalo_incoming(db=db, payload=payload, x_internal_secret=x_internal_secret)
+
+
+@app.get('/internal/vikunja/status')
+def get_internal_vikunja_status(
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return vikunja_bridge_summary(db)
+
+
+@app.post('/internal/vikunja/sync-users')
+def sync_internal_vikunja_users(
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_vikunja_or_503()
+    return sync_vikunja_users(db, get_vikunja_client())
+
+
+@app.post('/internal/vikunja/migrate-tasks')
+def migrate_internal_vikunja_tasks(
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+    force: bool = Query(default=False),
+    dry_run: bool = Query(default=False),
+    limit: int | None = Query(default=None, ge=1, le=10000),
+) -> dict[str, Any]:
+    require_vikunja_or_503()
+    return migrate_tasks_to_vikunja(db, client=get_vikunja_client(), force=force, dry_run=dry_run, limit=limit)
+
+
+@app.post('/internal/vikunja/reconcile')
+def reconcile_internal_vikunja(
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return reconcile_vikunja_bridge(db)
+
+
+@app.post('/vikunja/webhook')
+def receive_vikunja_webhook(
+    payload: dict[str, Any],
+    x_vikunja_secret: str | None = Header(default=None, alias='X-Vikunja-Secret'),
+    x_webhook_secret: str | None = Header(default=None, alias='X-Webhook-Secret'),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    expected = settings.vikunja_webhook_secret
+    if expected:
+        received = x_vikunja_secret or x_webhook_secret
+        if not received or not hmac.compare_digest(received, expected):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid Vikunja webhook secret.')
+    return handle_vikunja_webhook(db, payload)
 
 
 @app.post('/auth/login', response_model=LoginResponse)

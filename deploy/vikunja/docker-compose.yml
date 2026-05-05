@@ -1,0 +1,11 @@
+services:
+  vikunja:
+    image: vikunja/vikunja:latest
+    container_name: hazel-vikunja
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:3456:3456"
+    volumes:
+      - /opt/vikunja/files:/app/vikunja/files

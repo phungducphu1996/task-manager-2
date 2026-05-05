@@ -1,0 +1,20 @@
+# Add these to /opt/task-manager/backend/.env after Vikunja admin/project/buckets exist.
+
+VIKUNJA_API_URL=https://hazeleo.com/vikunja
+VIKUNJA_API_TOKEN=replace-with-vikunja-admin-api-token
+VIKUNJA_PUBLIC_URL=https://hazeleo.com/vikunja
+VIKUNJA_TASK_URL_TEMPLATE=https://hazeleo.com/vikunja/projects/{project_id}/tasks/{task_id}
+VIKUNJA_PROJECT_TITLE=Hazel Task Manager
+# Set this after creating/finding the Vikunja project:
+VIKUNJA_PROJECT_ID=
+
+# Set these after creating Kanban buckets in the Hazel Task Manager project.
+VIKUNJA_BUCKET_INBOX_ID=
+VIKUNJA_BUCKET_TODO_ID=
+VIKUNJA_BUCKET_DOING_ID=
+VIKUNJA_BUCKET_REVIEW_ID=
+VIKUNJA_BUCKET_READY_ID=
+VIKUNJA_BUCKET_DONE_ID=
+
+# Optional webhook guard.
+VIKUNJA_WEBHOOK_SECRET=replace-with-long-random-secret
