@@ -1052,7 +1052,9 @@ def _task_url(task_id: int) -> str | None:
 
 
 def _format_task_detail(task: dict[str, Any], *, compact: bool = False) -> str:
-    lines = [f'Tên task: {task.get("title") or f"Task #{task.get('id')}"}']
+    task_id = task.get('id')
+    title = task.get('title') or f'Task #{task_id}'
+    lines = [f'Tên task: {title}']
     if not compact:
         assignee = task.get('assignee') or 'Unassigned'
         status_value = task.get('status') or 'unknown'
