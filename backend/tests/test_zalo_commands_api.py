@@ -12,6 +12,8 @@ from app.models import (
     BotConversationMessage,
     BotConversationState,
     BotMemoryFact,
+    ReminderRule,
+    ReminderRuleType,
     Task,
     TaskPriority,
     TaskStatus,
@@ -821,6 +823,100 @@ def test_zalo_tool_agent_does_not_force_send_message_for_link_request(client, mo
     assert 'Link chi tiết task' in replies[-1]['message']
 
 
+def test_zalo_tool_agent_formats_task_link_without_markdown(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, linh, _ = _users(client)
+    task = Task(
+        title='[Design] [AmzMage] Bluey Collection',
+        assigned_to=linh['id'],
+        created_by=admin['id'],
+        status=TaskStatus.ready,
+        list_order=1,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    responses = iter(
+        [
+            _tool_response('', [('call-1', 'find_tasks', {'query': str(task.id), 'limit': 5})]),
+            _tool_response(
+                f'Anh admin, đây là [Link task #{task.id}](https://taskmanager.example.com/tasks/{task.id}).'
+            ),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': f'gửi link chi tiết task #{task.id}',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-link-formatted-task',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    message = replies[-1]['message']
+    assert f'Tên task: {task.title}' in message
+    assert f'Link task: https://hazeleo.com/task/today?task={task.id}' in message
+    assert '[' not in message.replace(task.title, '')
+    assert 'taskmanager.example.com' not in message
+
+
+def test_zalo_tool_agent_can_create_group_digest_reminder(client, db_session, monkeypatch) -> None:
+    replies = _install_zalo_reply_stub(monkeypatch)
+    admin, _, _ = _users(client)
+    responses = iter(
+        [
+            _tool_response(
+                '',
+                [
+                    (
+                        'call-reminder',
+                        'create_reminder_rule',
+                        {
+                            'name': 'Nhắc group 8h',
+                            'rule_type': 'daily_group_digest',
+                            'target_channel': 'group',
+                            'target_token': 'default_group',
+                            'schedule_time': '08:00',
+                        },
+                    )
+                ],
+            ),
+            _tool_response('Em đã tạo reminder nhắc group 8h mỗi ngày rồi nha.'),
+        ]
+    )
+
+    monkeypatch.setattr('app.zalo_commands.is_bot_llm_configured', lambda: True)
+    monkeypatch.setattr('app.zalo_commands.complete_bot_conversation', lambda **kwargs: next(responses))
+
+    response = client.post(
+        '/zalo/incoming',
+        json={
+            'text': 'em tạo reminder mỗi ngày 8h nhắn group tổng quan task hôm nay nha',
+            'from_uid': admin['zalo_user_id'],
+            'conversation_id': admin['zalo_user_id'],
+            'conversation_type': 'user',
+            'message_id': 'msg-create-reminder',
+        },
+        headers=_secret_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['action'] == 'reminder'
+    rule = db_session.scalar(select(ReminderRule).where(ReminderRule.name == 'Nhắc group 8h'))
+    assert rule is not None
+    assert rule.rule_type == ReminderRuleType.daily_group_digest
+    assert rule.schedule_time.hour == 8
+    assert replies[-1]['message'] == 'Em đã tạo reminder nhắc group 8h mỗi ngày rồi nha.'
+
+
 def test_zalo_tool_agent_does_not_claim_sent_when_send_message_tool_fails(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, quang = _users(client)
@@ -1246,7 +1342,7 @@ def test_zalo_add_creates_task_and_dedupes_message_id(client, db_session, monkey
     assert task.priority == TaskPriority.high
     assert replies[-1]['channel'].value == 'group'
     assert replies[-1]['target_id'] == 'test-zalo-group'
-    assert f'#{task.id}' in replies[-1]['message']
+    assert f'Link task: https://hazeleo.com/task/today?task={task.id}' in replies[-1]['message']
 
     duplicate = client.post(
         '/zalo/incoming',

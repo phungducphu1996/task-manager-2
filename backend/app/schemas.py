@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from datetime import date as dt_date, datetime
+from datetime import date as dt_date, datetime, time
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
-from .models import TaskPriority, TaskStatus
+from .models import (
+    NotificationChannel,
+    ReminderInteractionType,
+    ReminderRuleType,
+    ReminderRunStatus,
+    ReminderScheduleType,
+    TaskPriority,
+    TaskStatus,
+)
 
 
 class UserOut(BaseModel):
@@ -215,6 +223,109 @@ class TaskGroup(BaseModel):
 class TaskListResponse(BaseModel):
     view: str
     groups: list[TaskGroup]
+
+
+class ReminderRuleBase(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    rule_type: ReminderRuleType
+    enabled: bool = True
+    target_channel: NotificationChannel | None = None
+    target_id: str | None = Field(default=None, max_length=128)
+    user_id: str | None = Field(default=None, max_length=64)
+    task_id: int | None = None
+    schedule_type: ReminderScheduleType = ReminderScheduleType.daily
+    schedule_time: time | None = None
+    interval_minutes: int | None = Field(default=None, ge=1)
+    timezone: str | None = Field(default=None, max_length=64)
+    quiet_start: time | None = None
+    quiet_end: time | None = None
+    max_runs_per_day: int | None = Field(default=None, ge=1)
+    stop_statuses: list[TaskStatus] = Field(default_factory=list)
+    escalation_after_minutes: int | None = Field(default=None, ge=1)
+    escalation_after_runs: int | None = Field(default=None, ge=1)
+    payload: dict = Field(default_factory=dict)
+
+
+class ReminderRuleCreate(ReminderRuleBase):
+    pass
+
+
+class ReminderRuleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    enabled: bool | None = None
+    target_channel: NotificationChannel | None = None
+    target_id: str | None = Field(default=None, max_length=128)
+    user_id: str | None = Field(default=None, max_length=64)
+    task_id: int | None = None
+    schedule_type: ReminderScheduleType | None = None
+    schedule_time: time | None = None
+    interval_minutes: int | None = Field(default=None, ge=1)
+    timezone: str | None = Field(default=None, max_length=64)
+    quiet_start: time | None = None
+    quiet_end: time | None = None
+    max_runs_per_day: int | None = Field(default=None, ge=1)
+    stop_statuses: list[TaskStatus] | None = None
+    escalation_after_minutes: int | None = Field(default=None, ge=1)
+    escalation_after_runs: int | None = Field(default=None, ge=1)
+    payload: dict | None = None
+
+
+class ReminderRuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    rule_type: ReminderRuleType
+    enabled: bool
+    target_channel: NotificationChannel | None
+    target_id: str | None
+    user_id: str | None
+    task_id: int | None
+    schedule_type: ReminderScheduleType
+    schedule_time: time | None
+    interval_minutes: int | None
+    timezone: str
+    quiet_start: time | None
+    quiet_end: time | None
+    max_runs_per_day: int | None
+    stop_statuses: list[str]
+    escalation_after_minutes: int | None
+    escalation_after_runs: int | None
+    payload: dict
+    created_by: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReminderRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    rule_id: int
+    scheduled_for: datetime
+    status: ReminderRunStatus
+    notification_event_id: int | None
+    run_key: str
+    acknowledged_at: datetime | None
+    snoozed_until: datetime | None
+    escalated_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReminderInteractionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    run_id: int | None
+    rule_id: int | None
+    user_id: str | None
+    conversation_id: str | None
+    message_id: str | None
+    interaction_type: ReminderInteractionType
+    text: str | None
+    payload: dict
+    created_at: datetime
 
 
 class ZaloIncomingRequest(BaseModel):

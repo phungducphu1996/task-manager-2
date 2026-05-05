@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, inspect, select, text
+from sqlalchemy import func, inspect, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
@@ -24,6 +24,9 @@ from .models import (
     BotMemoryFact,
     NotificationDelivery,
     NotificationEvent,
+    ReminderInteraction,
+    ReminderRule,
+    ReminderRun,
     Shop,
     Subtask,
     Task,
@@ -67,8 +70,19 @@ from .schemas import (
     TaskTypeOut,
     TaskTypeUpdate,
     TaskUpdate,
+    ReminderRuleCreate,
+    ReminderRuleOut,
+    ReminderRuleUpdate,
     UserOut,
     ZaloIncomingRequest,
+)
+from .reminders import (
+    create_reminder_rule,
+    create_task_nudge_rule,
+    is_reminder_internal_token_valid,
+    reminder_internal_token_configured,
+    run_reminder_tick,
+    update_reminder_rule,
 )
 from .services import (
     get_subtask_or_404,
@@ -254,6 +268,20 @@ def require_internal_token(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Invalid internal token.')
 
 
+def require_reminder_internal_token(
+    x_internal_token: str | None = Header(default=None, alias='X-Internal-Token'),
+) -> None:
+    if not reminder_internal_token_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Internal reminder token is not configured.',
+        )
+    if not x_internal_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Missing X-Internal-Token.')
+    if not is_reminder_internal_token_valid(x_internal_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Invalid internal token.')
+
+
 def get_actor(
     db: Session = Depends(get_db),
     actor_id: str | None = Header(default=None, alias='X-Actor-Id'),
@@ -422,6 +450,9 @@ def on_startup() -> None:
             'bot_conversation_messages',
             'bot_conversation_states',
             'bot_memory_facts',
+            'reminder_rules',
+            'reminder_runs',
+            'reminder_interactions',
         ]
         if any(not inspector.has_table(table, schema=schema_name) for table in required_tables):
             # Safety fallback for local/dev environments where migrations are not yet aligned.
@@ -441,6 +472,9 @@ def on_startup() -> None:
                     BotConversationMessage.__table__,
                     BotConversationState.__table__,
                     BotMemoryFact.__table__,
+                    ReminderRule.__table__,
+                    ReminderRun.__table__,
+                    ReminderInteraction.__table__,
                 ],
             )
 
@@ -535,6 +569,21 @@ def run_internal_notifications_job(
         ) from exc
 
 
+@app.post('/internal/reminders/tick')
+def run_internal_reminders_tick(
+    _: None = Depends(require_reminder_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return run_reminder_tick(db)
+    except Exception as exc:
+        logger.exception('Internal reminder tick failed')
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Reminder tick failed: {exc}',
+        ) from exc
+
+
 @app.post('/zalo/incoming')
 def receive_zalo_incoming(
     payload: ZaloIncomingRequest,
@@ -602,6 +651,90 @@ def get_users(db: Session = Depends(get_db)) -> list[User]:
         .order_by(func.lower(func.coalesce(User.full_name, User.username)).asc(), func.lower(User.username).asc())
     )
     return db.scalars(stmt).all()
+
+
+def _ensure_reminder_manage_access(rule: ReminderRule, actor: User) -> None:
+    if _is_admin(actor):
+        return
+    if rule.user_id == actor.id:
+        return
+    if rule.task:
+        _ensure_task_access(rule.task, actor)
+        return
+    raise _forbidden('Members can only manage their own reminders.')
+
+
+def _validate_reminder_payload(payload_values: dict[str, Any], actor: User, db: Session) -> None:
+    target_channel = payload_values.get('target_channel')
+    user_id = payload_values.get('user_id')
+    task_id = payload_values.get('task_id')
+    if target_channel and str(target_channel.value if hasattr(target_channel, 'value') else target_channel) == 'group' and not _is_admin(actor):
+        raise _forbidden('Only admins can create group reminders.')
+    if user_id and user_id != actor.id and not _is_admin(actor):
+        raise _forbidden('Members can only create reminders for themselves.')
+    if user_id and not db.get(User, user_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Reminder user not found.')
+    if task_id:
+        task = db.get(Task, task_id)
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Reminder task not found.')
+        _ensure_task_access(task, actor)
+
+
+@app.post('/reminders', response_model=ReminderRuleOut, status_code=status.HTTP_201_CREATED)
+def create_reminder(
+    payload: ReminderRuleCreate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> ReminderRule:
+    values = payload.model_dump()
+    _validate_reminder_payload(values, actor, db)
+    return create_reminder_rule(db, actor=actor, values=values)
+
+
+@app.get('/reminders', response_model=list[ReminderRuleOut])
+def list_reminders(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> list[ReminderRule]:
+    stmt = select(ReminderRule).options(joinedload(ReminderRule.task)).order_by(ReminderRule.created_at.desc(), ReminderRule.id.desc())
+    if not _is_admin(actor):
+        accessible_task_ids = select(Task.id).where(Task.assigned_to == actor.id)
+        stmt = stmt.where(or_(ReminderRule.user_id == actor.id, ReminderRule.task_id.in_(accessible_task_ids)))
+    return db.scalars(stmt).unique().all()
+
+
+@app.patch('/reminders/{reminder_id}', response_model=ReminderRuleOut)
+def update_reminder(
+    reminder_id: int,
+    payload: ReminderRuleUpdate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> ReminderRule:
+    rule = db.get(ReminderRule, reminder_id)
+    if not rule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Reminder not found.')
+    _ensure_reminder_manage_access(rule, actor)
+    values = payload.model_dump(exclude_unset=True)
+    _validate_reminder_payload(values, actor, db)
+    return update_reminder_rule(db, rule=rule, values=values)
+
+
+@app.delete('/reminders/{reminder_id}', response_model=ReminderRuleOut)
+def disable_reminder(
+    reminder_id: int,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> ReminderRule:
+    rule = db.get(ReminderRule, reminder_id)
+    if not rule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Reminder not found.')
+    _ensure_reminder_manage_access(rule, actor)
+    rule.enabled = False
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
 
 
 @app.get('/shops', response_model=list[ShopOut])
@@ -846,6 +979,20 @@ def get_task(task_id: int, db: Session = Depends(get_db), actor: User = Depends(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
     _ensure_task_access(task, actor)
     return task
+
+
+@app.post('/tasks/{task_id}/reminders', response_model=ReminderRuleOut, status_code=status.HTTP_201_CREATED)
+def create_task_reminder(
+    task_id: int,
+    interval_minutes: int = Query(default=60, ge=1),
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> ReminderRule:
+    task = get_task_or_404(db, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Task not found.')
+    _ensure_task_access(task, actor)
+    return create_task_nudge_rule(db, actor=actor, task=task, interval_minutes=interval_minutes)
 
 
 @app.patch('/tasks/{task_id}', response_model=TaskOut)

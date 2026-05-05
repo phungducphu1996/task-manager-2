@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     notification_delivery_batch_limit: int = 100
     notification_http_timeout_seconds: float = 10.0
     notification_max_retries: int = 3
+    reminder_tick_internal_token: str | None = None
+    reminder_timezone: str = 'Asia/Ho_Chi_Minh'
+    reminder_default_quiet_start: str = '22:00'
+    reminder_default_quiet_end: str = '07:00'
+    reminder_member_checkin_admin_delay_minutes: int = 60
+    reminder_task_nudge_max_per_day: int = 6
     runtime_base_dir: Path = Path(__file__).resolve().parents[1]
 
     @property

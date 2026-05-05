@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import hashlib
 import hmac
 import json
@@ -39,6 +39,9 @@ from .config import get_settings
 from .bot_copilot import handle_zalo_chat
 from .models import (
     NotificationChannel,
+    ReminderRule,
+    ReminderRuleType,
+    ReminderScheduleType,
     Shop,
     Task,
     TaskAttachment,
@@ -53,6 +56,12 @@ from .notifications import (
     enqueue_task_status_transition_notifications,
     enqueue_task_updated_notifications,
     send_zalo_text,
+)
+from .reminders import (
+    create_reminder_rule,
+    create_task_nudge_rule,
+    handle_reminder_interaction,
+    update_reminder_rule,
 )
 from .schemas import ZaloIncomingRequest
 from .services import get_task_or_404, list_tasks, local_today, next_list_order
@@ -856,6 +865,84 @@ def _tool_specs() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'create_reminder_rule',
+                'description': (
+                    'Create a reminder rule. Use this when the actor asks to remind, nudge, check in, send daily '
+                    'digests, or run daily strategy suggestions. Use find_tasks first for task_nudge if task is not '
+                    'identified by id.'
+                ),
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'name': {'type': 'string'},
+                        'rule_type': {
+                            'type': 'string',
+                            'enum': ['daily_group_digest', 'daily_member_checkin', 'task_nudge', 'daily_strategy'],
+                        },
+                        'target_channel': {'type': 'string', 'enum': ['user', 'group']},
+                        'target_token': {'type': 'string'},
+                        'task_id': {'type': 'integer'},
+                        'schedule_time': {'type': 'string', 'description': 'HH:MM for daily reminders.'},
+                        'interval_minutes': {'type': 'integer'},
+                        'max_runs_per_day': {'type': 'integer'},
+                    },
+                    'required': ['name', 'rule_type'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'list_reminder_rules',
+                'description': 'List active reminder rules visible to the actor.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'include_disabled': {'type': 'boolean'},
+                    },
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'disable_reminder_rule',
+                'description': 'Disable an existing reminder rule by id.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'rule_id': {'type': 'integer'},
+                    },
+                    'required': ['rule_id'],
+                    'additionalProperties': False,
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'update_reminder_rule',
+                'description': 'Update an existing reminder rule by id.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'rule_id': {'type': 'integer'},
+                        'name': {'type': 'string'},
+                        'enabled': {'type': 'boolean'},
+                        'schedule_time': {'type': 'string'},
+                        'interval_minutes': {'type': 'integer'},
+                        'max_runs_per_day': {'type': 'integer'},
+                    },
+                    'required': ['rule_id'],
+                    'additionalProperties': False,
+                },
+            },
+        },
     ]
 
 
@@ -889,13 +976,15 @@ def _tool_system_prompt(actor: User) -> str:
     return (
         f'{persona_text()}\n\n'
         'Bạn đang ở nhánh tool-calling của trợ lý Zalo cho Task Manager. '
-        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, đổi status task, sửa field task, và gửi tin nhắn Zalo hộ người dùng. '
+        'Bạn có quyền dùng tools để tìm task, list task, tạo task, approve task, đổi status task, sửa field task, tạo/quản lý reminder, và gửi tin nhắn Zalo hộ người dùng. '
         'Luôn dùng tool khi người dùng muốn thao tác với task hoặc hỏi danh sách task. '
         'Chỉ dùng send_message khi người dùng yêu cầu nhắn/gửi/chuyển lời tới một người hoặc group khác một cách rõ ràng. '
         'Nếu người dùng nói "gửi link", "cho anh link", "gửi chi tiết task" trong chính cuộc chat hiện tại, hãy trả lời trong chat, không dùng send_message. '
+        'Khi trả lời link hoặc chi tiết task, dùng format plain text từ tool result, không dùng markdown link và không tự bịa domain. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
         'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
         'Nếu người dùng muốn sửa deadline/assignee/description/link/field khác của task cũ, hãy dùng find_tasks trước rồi update_task_fields. '
+        'Nếu người dùng muốn nhắc việc, check-in hằng ngày, nudge task lặp lại, hoặc tắt/sửa reminder, hãy dùng reminder tools. '
         'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
         'Nếu tool trả ok=false hoặc một phần tool fail, phải nói rõ phần chưa làm được; không được nói đã cập nhật field bị fail. '
         'Nếu câu mơ hồ, không chắc, hoặc có nhiều task match, đừng tự quyết định; hãy hỏi lại ngắn gọn. '
@@ -953,6 +1042,42 @@ def _tool_task_payload(task: Task) -> dict[str, Any]:
     }
 
 
+def _task_url(task_id: int) -> str | None:
+    base = (settings.task_public_base_url or '').strip().rstrip('/')
+    if not base:
+        return None
+    if '{task_id}' in base:
+        return base.replace('{task_id}', str(task_id))
+    return f'{base}/today?task={task_id}'
+
+
+def _format_task_detail(task: dict[str, Any], *, compact: bool = False) -> str:
+    lines = [f'Tên task: {task.get("title") or f"Task #{task.get('id')}"}']
+    if not compact:
+        assignee = task.get('assignee') or 'Unassigned'
+        status_value = task.get('status') or 'unknown'
+        due_date = task.get('due_date') or 'Chưa có'
+        lines.extend(
+            [
+                f'Phụ trách: {assignee}',
+                f'Trạng thái: {status_value}',
+                f'Deadline: {due_date}',
+            ]
+        )
+    url = _task_url(int(task['id'])) if task.get('id') is not None else None
+    if url:
+        lines.append(f'Link task: {url}')
+    return '\n'.join(lines)
+
+
+def _attach_task_format(result: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+    task = result.get('task')
+    if isinstance(task, dict) and task.get('id') is not None:
+        result['task_url'] = _task_url(int(task['id']))
+        result['formatted_task'] = _format_task_detail(task, compact=compact)
+    return result
+
+
 def _tool_find_tasks(db: Session, *, actor: User, query: str, status_token: str | None, limit: int) -> dict[str, Any]:
     stmt = (
         select(Task)
@@ -979,11 +1104,17 @@ def _tool_find_tasks(db: Session, *, actor: User, query: str, status_token: str 
         stmt = stmt.where(Task.status == TaskStatus(status_token))
 
     tasks = db.scalars(stmt.limit(max(1, min(limit, 10)))).unique().all()
-    return {
+    response = {
         'ok': True,
         'count': len(tasks),
         'tasks': [_tool_task_payload(task) for task in tasks],
     }
+    if len(response['tasks']) == 1:
+        task_payload = response['tasks'][0]
+        response['task'] = task_payload
+        response['task_url'] = _task_url(int(task_payload['id']))
+        response['formatted_task'] = _format_task_detail(task_payload, compact=True)
+    return response
 
 
 def _tool_list_tasks(db: Session, *, actor: User, view: str) -> dict[str, Any]:
@@ -1029,7 +1160,7 @@ def _tool_create_task(
         enqueue_task_created_notifications(db, full_task)
     except Exception:
         db.rollback()
-    return {'ok': True, 'task': _tool_task_payload(full_task)}
+    return _attach_task_format({'ok': True, 'task': _tool_task_payload(full_task)})
 
 
 def _tool_approve_task(db: Session, *, actor: User, task_id: int) -> dict[str, Any]:
@@ -1054,7 +1185,7 @@ def _tool_approve_task(db: Session, *, actor: User, task_id: int) -> dict[str, A
         )
     except Exception:
         db.rollback()
-    return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
+    return _attach_task_format({'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value})
 
 
 def _validate_tool_status_transition(task: Task, next_status: TaskStatus, actor: User) -> str | None:
@@ -1102,7 +1233,7 @@ def _tool_update_task_status(db: Session, *, actor: User, task_id: int, status_t
             )
         except Exception:
             db.rollback()
-    return {'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value}
+    return _attach_task_format({'ok': True, 'task': _tool_task_payload(task), 'previous_status': previous_status.value})
 
 
 def _is_clear_token(value: str | None) -> bool:
@@ -1262,13 +1393,13 @@ def _tool_update_task_fields(
         except Exception:
             db.rollback()
 
-    return {
+    return _attach_task_format({
         'ok': True,
         'task': _tool_task_payload(full_task),
         'previous_status': previous_status.value,
         'changed_fields': sorted(set(changed_fields)),
         'attachments_added': added_links,
-    }
+    })
 
 
 def _resolve_group_message_target(
@@ -1375,6 +1506,155 @@ def _tool_send_message(
     return {'ok': False, 'error': f'Unknown send_message channel: {channel_token}'}
 
 
+def _parse_schedule_time_token(value: str | None) -> time | None:
+    if not value:
+        return None
+    clean = value.strip()
+    match = re.fullmatch(r'(\d{1,2})(?::|h)?(\d{2})?', clean)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return time(hour=hour, minute=minute)
+
+
+def _format_reminder_rule(rule: ReminderRule) -> str:
+    if rule.schedule_type == ReminderScheduleType.interval:
+        schedule = f'mỗi {rule.interval_minutes or 60} phút'
+    else:
+        schedule = f'hằng ngày {rule.schedule_time.strftime("%H:%M") if rule.schedule_time else "09:00"}'
+    status_text = 'bật' if rule.enabled else 'tắt'
+    return f'#{rule.id} {rule.name} — {rule.rule_type.value} — {schedule} — {status_text}'
+
+
+def _ensure_reminder_tool_access(rule: ReminderRule, actor: User) -> str | None:
+    if _is_admin(actor):
+        return None
+    if rule.user_id == actor.id:
+        return None
+    if rule.task and rule.task.assigned_to == actor.id:
+        return None
+    return 'Members chỉ được quản lý reminder của chính mình.'
+
+
+def _tool_create_reminder_rule(
+    db: Session,
+    *,
+    actor: User,
+    arguments: dict[str, Any],
+    current_channel: NotificationChannel | None,
+    current_target_id: str | None,
+) -> dict[str, Any]:
+    rule_type_token = str(arguments.get('rule_type') or '').strip()
+    if rule_type_token not in {item.value for item in ReminderRuleType}:
+        return {'ok': False, 'error': f'Unknown reminder type: {rule_type_token}'}
+
+    rule_type = ReminderRuleType(rule_type_token)
+    task_id = arguments.get('task_id')
+    interval_minutes = int(arguments.get('interval_minutes') or 60)
+    if rule_type == ReminderRuleType.task_nudge:
+        if not task_id:
+            return {'ok': False, 'error': 'task_nudge cần task_id. Hãy tìm task trước.'}
+        task = get_task_or_404(db, int(task_id))
+        if not task:
+            return {'ok': False, 'error': 'Task not found.'}
+        if not _is_admin(actor) and task.assigned_to != actor.id:
+            return {'ok': False, 'error': 'Members chỉ nhắc task của chính mình.'}
+        rule = create_task_nudge_rule(
+            db,
+            actor=actor,
+            task=task,
+            interval_minutes=interval_minutes,
+            name=str(arguments.get('name') or '').strip() or None,
+        )
+        return {'ok': True, 'rule': {'id': rule.id, 'summary': _format_reminder_rule(rule)}}
+
+    target_channel: NotificationChannel | None = None
+    target_id: str | None = None
+    user_id: str | None = None
+    target_token = str(arguments.get('target_token') or '').strip() or None
+    target_channel_token = str(arguments.get('target_channel') or '').strip()
+
+    if rule_type == ReminderRuleType.daily_group_digest or target_channel_token == NotificationChannel.group.value:
+        if not _is_admin(actor):
+            return {'ok': False, 'error': 'Only admins can create group reminders.'}
+        target_channel = NotificationChannel.group
+        target_id = _resolve_group_message_target(
+            target_token=target_token,
+            current_channel=current_channel,
+            current_target_id=current_target_id,
+        )
+    elif target_channel_token == NotificationChannel.user.value and target_token:
+        target_user = _resolve_user(db, target_token)
+        if not target_user:
+            return {'ok': False, 'error': f'Không tìm thấy user {target_token}.'}
+        if not _is_admin(actor) and target_user.id != actor.id:
+            return {'ok': False, 'error': 'Members chỉ tạo reminder cho chính mình.'}
+        target_channel = NotificationChannel.user
+        target_id = target_user.zalo_user_id
+        user_id = target_user.id
+
+    schedule_time = _parse_schedule_time_token(str(arguments.get('schedule_time') or '').strip() or None)
+    values = {
+        'name': str(arguments.get('name') or rule_type.value).strip(),
+        'rule_type': rule_type.value,
+        'target_channel': target_channel,
+        'target_id': target_id,
+        'user_id': user_id,
+        'schedule_type': ReminderScheduleType.daily.value,
+        'schedule_time': schedule_time,
+        'max_runs_per_day': arguments.get('max_runs_per_day'),
+    }
+    rule = create_reminder_rule(db, actor=actor, values=values)
+    return {'ok': True, 'rule': {'id': rule.id, 'summary': _format_reminder_rule(rule)}}
+
+
+def _tool_list_reminder_rules(db: Session, *, actor: User, include_disabled: bool = False) -> dict[str, Any]:
+    stmt = select(ReminderRule).options(joinedload(ReminderRule.task)).order_by(ReminderRule.created_at.desc(), ReminderRule.id.desc())
+    if not include_disabled:
+        stmt = stmt.where(ReminderRule.enabled.is_(True))
+    if not _is_admin(actor):
+        task_ids = select(Task.id).where(Task.assigned_to == actor.id)
+        stmt = stmt.where(or_(ReminderRule.user_id == actor.id, ReminderRule.task_id.in_(task_ids)))
+    rules = db.scalars(stmt.limit(20)).unique().all()
+    return {'ok': True, 'count': len(rules), 'rules': [{'id': rule.id, 'summary': _format_reminder_rule(rule)} for rule in rules]}
+
+
+def _tool_disable_reminder_rule(db: Session, *, actor: User, rule_id: int) -> dict[str, Any]:
+    rule = db.get(ReminderRule, rule_id)
+    if not rule:
+        return {'ok': False, 'error': 'Reminder not found.'}
+    if error := _ensure_reminder_tool_access(rule, actor):
+        return {'ok': False, 'error': error}
+    rule.enabled = False
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return {'ok': True, 'rule': {'id': rule.id, 'summary': _format_reminder_rule(rule)}}
+
+
+def _tool_update_reminder_rule(db: Session, *, actor: User, arguments: dict[str, Any]) -> dict[str, Any]:
+    rule = db.get(ReminderRule, int(arguments.get('rule_id')))
+    if not rule:
+        return {'ok': False, 'error': 'Reminder not found.'}
+    if error := _ensure_reminder_tool_access(rule, actor):
+        return {'ok': False, 'error': error}
+
+    values: dict[str, Any] = {}
+    for key in ('name', 'enabled', 'interval_minutes', 'max_runs_per_day'):
+        if key in arguments:
+            values[key] = arguments[key]
+    if 'schedule_time' in arguments:
+        parsed_time = _parse_schedule_time_token(str(arguments.get('schedule_time') or ''))
+        if not parsed_time:
+            return {'ok': False, 'error': f'Không hiểu giờ nhắc {arguments.get("schedule_time")}.'}
+        values['schedule_time'] = parsed_time
+    rule = update_reminder_rule(db, rule=rule, values=values)
+    return {'ok': True, 'rule': {'id': rule.id, 'summary': _format_reminder_rule(rule)}}
+
+
 def _execute_tool_call(
     db: Session,
     *,
@@ -1443,6 +1723,24 @@ def _execute_tool_call(
                 current_target_id=current_target_id,
                 original_text=original_text,
             )
+        if name == 'create_reminder_rule':
+            return _tool_create_reminder_rule(
+                db,
+                actor=actor,
+                arguments=arguments,
+                current_channel=current_channel,
+                current_target_id=current_target_id,
+            )
+        if name == 'list_reminder_rules':
+            return _tool_list_reminder_rules(
+                db,
+                actor=actor,
+                include_disabled=bool(arguments.get('include_disabled')),
+            )
+        if name == 'disable_reminder_rule':
+            return _tool_disable_reminder_rule(db, actor=actor, rule_id=int(arguments.get('rule_id')))
+        if name == 'update_reminder_rule':
+            return _tool_update_reminder_rule(db, actor=actor, arguments=arguments)
     except (ValueError, TypeError) as exc:
         return {'ok': False, 'error': str(exc)}
     except PermissionError as exc:
@@ -1517,7 +1815,30 @@ def _verified_update_success_message(tool_results: list[dict[str, Any]]) -> str 
 
     if not parts:
         return None
-    return f'Em đã cập nhật task #{task["id"]} "{task["title"]}": {", ".join(parts)}.'
+    detail = _format_task_detail(task)
+    return f'Em đã cập nhật: {", ".join(parts)}.\n{detail}'
+
+
+def _task_link_message_from_results(tool_results: list[dict[str, Any]], final_text: str) -> str | None:
+    normalized = _normalize_lookup(final_text)
+    wants_task_link = any(token in normalized for token in ('linktask', 'linkchitiettask', 'linkchitiet'))
+    has_markdown_link = bool(re.search(r'\[[^\]]+\]\(https?://[^)]+\)', final_text))
+    has_url = bool(re.search(r'https?://\S+', final_text))
+    if not wants_task_link and not has_markdown_link and not has_url:
+        return None
+
+    for item in reversed(tool_results):
+        result = item.get('result') or {}
+        formatted = result.get('formatted_task')
+        if formatted:
+            return str(formatted)
+        task = result.get('task')
+        if isinstance(task, dict) and task.get('id') is not None:
+            return _format_task_detail(task, compact=True)
+        tasks = result.get('tasks') or []
+        if len(tasks) == 1:
+            return _format_task_detail(tasks[0], compact=True)
+    return None
 
 
 def _run_tool_agent(
@@ -1603,10 +1924,14 @@ def _run_tool_agent(
                 if last_tool_result and not last_tool_result.get('ok'):
                     error = str(last_tool_result.get('error') or 'Không rõ lỗi gửi tin.')
                     final_text = f'Em chưa gửi được tin nhắn nha: {error}'
+            elif last_tool_name in {'create_reminder_rule', 'list_reminder_rules', 'disable_reminder_rule', 'update_reminder_rule'}:
+                action = 'reminder'
             if action != 'send_message' and (failure_message := _partial_tool_failure_message(tool_results)):
                 final_text = failure_message
             elif verified_message := _verified_update_success_message(tool_results):
                 final_text = verified_message
+            elif task_link_message := _task_link_message_from_results(tool_results, final_text):
+                final_text = task_link_message
             if tool_results:
                 next_state = _state_data_from_tool_results(existing_state=state_data, tool_results=tool_results)
                 upsert_conversation_state(
@@ -1718,26 +2043,8 @@ def _create_zalo_task(db: Session, parsed: ParsedZaloCommand, actor: User) -> Ta
     return task
 
 
-def _task_url(task_id: int) -> str | None:
-    base = (settings.task_public_base_url or '').strip().rstrip('/')
-    if not base:
-        return None
-    if '{task_id}' in base:
-        return base.replace('{task_id}', str(task_id))
-    if base.endswith('/task') or '/task/' in base:
-        return base
-    return f'{base}/task'
-
-
 def _format_task_created(task: Task) -> str:
-    assignee = task.assignee.name if task.assignee else task.assigned_to or 'Unassigned'
-    parts = [f'Đã tạo task #{task.id}: {task.title}', f'Assignee: {assignee}']
-    if task.due_date:
-        parts.append(f'Due: {task.due_date.strftime("%d/%m/%Y")}')
-    url = _task_url(task.id)
-    if url:
-        parts.append(url)
-    return '\n'.join(parts)
+    return f'Đã tạo task:\n{_format_task_detail(_tool_task_payload(task))}'
 
 
 def _format_task_line(task: Any) -> str:
@@ -1916,8 +2223,34 @@ def handle_zalo_incoming(
         return {'ok': False, 'error': 'unmapped_sender', 'reply': reply}
 
     try:
-        tool_text = body
         conversation_id = payload.conversation_id or payload.from_uid
+        reminder_interaction = handle_reminder_interaction(
+            db,
+            actor=actor,
+            text=body,
+            conversation_id=conversation_id,
+            message_id=payload.message_id,
+            target_id=target_id,
+        )
+        if reminder_interaction and reminder_interaction.handled:
+            message = reminder_interaction.message
+            reply = _reply_to_conversation(
+                channel=channel,
+                target_id=target_id,
+                message=message,
+                context={
+                    'source': 'reminder_interaction',
+                    'interaction_type': reminder_interaction.interaction_type.value,
+                    'run_id': reminder_interaction.run_id,
+                    'message_id': payload.message_id,
+                },
+            )
+            record.command = f'reminder_{reminder_interaction.interaction_type.value}'
+            record.response_payload = {'message': message, 'reply': reply}
+            db.commit()
+            return {'ok': True, 'action': record.command, 'reply': reply}
+
+        tool_text = body
         tool_outcome = _run_tool_agent(
             db,
             actor=actor,

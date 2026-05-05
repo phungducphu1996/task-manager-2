@@ -24,6 +24,11 @@ const rawRouteView = computed(() => String(route.params.view ?? 'today').toLower
 const routeView = computed<TaskView>(() =>
   supportedViews.includes(rawRouteView.value as TaskView) ? (rawRouteView.value as TaskView) : 'today'
 )
+const routeTaskId = computed(() => {
+  const rawTaskId = Array.isArray(route.query.task) ? route.query.task[0] : route.query.task
+  const parsed = Number(rawTaskId)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+})
 
 const headingMap: Record<TaskView, string> = {
   today: 'Today',
@@ -49,6 +54,9 @@ async function syncRouteToStore() {
   if (store.view !== routeView.value) {
     await store.setView(routeView.value)
   }
+  if (routeTaskId.value && String(store.selectedTaskId) !== String(routeTaskId.value)) {
+    await store.openTask(routeTaskId.value)
+  }
 }
 
 onMounted(async () => {
@@ -59,6 +67,12 @@ onMounted(async () => {
 
 watch(routeView, async () => {
   await syncRouteToStore()
+})
+
+watch(routeTaskId, async (taskId) => {
+  if (!taskId) return
+  if (String(store.selectedTaskId) === String(taskId)) return
+  await store.openTask(taskId)
 })
 
 watch(

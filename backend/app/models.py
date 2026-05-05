@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import enum
-from datetime import date, datetime
+from datetime import date, datetime, time
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, Uuid, cast, func
+from sqlalchemy import JSON, Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, Time, Uuid, cast, func
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from .database import Base
@@ -38,6 +38,35 @@ class NotificationStatus(str, enum.Enum):
     sent = 'sent'
     failed = 'failed'
     skipped = 'skipped'
+
+
+class ReminderRuleType(str, enum.Enum):
+    daily_group_digest = 'daily_group_digest'
+    daily_member_checkin = 'daily_member_checkin'
+    task_nudge = 'task_nudge'
+    daily_strategy = 'daily_strategy'
+
+
+class ReminderScheduleType(str, enum.Enum):
+    daily = 'daily'
+    interval = 'interval'
+
+
+class ReminderRunStatus(str, enum.Enum):
+    pending = 'pending'
+    sent = 'sent'
+    acknowledged = 'acknowledged'
+    snoozed = 'snoozed'
+    blocked = 'blocked'
+    escalated = 'escalated'
+    skipped = 'skipped'
+
+
+class ReminderInteractionType(str, enum.Enum):
+    ack = 'ack'
+    snooze = 'snooze'
+    blocker = 'blocker'
+    reply = 'reply'
 
 
 class User(Base):
@@ -264,6 +293,125 @@ class NotificationDelivery(Base):
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     event: Mapped[NotificationEvent] = relationship('NotificationEvent', back_populates='deliveries')
+
+
+class ReminderRule(Base):
+    __tablename__ = 'reminder_rules'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    rule_type: Mapped[ReminderRuleType] = mapped_column(
+        Enum(ReminderRuleType, name='reminder_rule_type', native_enum=False, validate_strings=True),
+        nullable=False,
+        index=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    target_channel: Mapped[NotificationChannel | None] = mapped_column(
+        Enum(NotificationChannel, name='reminder_target_channel', native_enum=False, validate_strings=True),
+        nullable=True,
+    )
+    target_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey('tasks.id', ondelete='CASCADE'), nullable=True, index=True)
+    schedule_type: Mapped[ReminderScheduleType] = mapped_column(
+        Enum(ReminderScheduleType, name='reminder_schedule_type', native_enum=False, validate_strings=True),
+        nullable=False,
+        default=ReminderScheduleType.daily,
+    )
+    schedule_time: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    interval_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default='Asia/Ho_Chi_Minh')
+    quiet_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    quiet_end: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    max_runs_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stop_statuses: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    escalation_after_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    escalation_after_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    task: Mapped[Task | None] = relationship('Task')
+    creator: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(ReminderRule.created_by) == User.id,
+        viewonly=True,
+    )
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(ReminderRule.user_id) == User.id,
+        viewonly=True,
+    )
+    runs: Mapped[list[ReminderRun]] = relationship(
+        'ReminderRun',
+        back_populates='rule',
+        cascade='all, delete-orphan',
+        order_by='ReminderRun.scheduled_for.desc(), ReminderRun.id.desc()',
+    )
+
+
+class ReminderRun(Base):
+    __tablename__ = 'reminder_runs'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey('reminder_rules.id', ondelete='CASCADE'), nullable=False, index=True)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    status: Mapped[ReminderRunStatus] = mapped_column(
+        Enum(ReminderRunStatus, name='reminder_run_status', native_enum=False, validate_strings=True),
+        nullable=False,
+        default=ReminderRunStatus.pending,
+        index=True,
+    )
+    notification_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey('notification_events.id', ondelete='SET NULL'), nullable=True, index=True
+    )
+    run_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    rule: Mapped[ReminderRule] = relationship('ReminderRule', back_populates='runs')
+    notification_event: Mapped[NotificationEvent | None] = relationship('NotificationEvent')
+    interactions: Mapped[list[ReminderInteraction]] = relationship(
+        'ReminderInteraction',
+        back_populates='run',
+        cascade='all, delete-orphan',
+        order_by='ReminderInteraction.created_at.desc(), ReminderInteraction.id.desc()',
+    )
+
+
+class ReminderInteraction(Base):
+    __tablename__ = 'reminder_interactions'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey('reminder_runs.id', ondelete='SET NULL'), nullable=True, index=True)
+    rule_id: Mapped[int | None] = mapped_column(ForeignKey('reminder_rules.id', ondelete='SET NULL'), nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    interaction_type: Mapped[ReminderInteractionType] = mapped_column(
+        Enum(ReminderInteractionType, name='reminder_interaction_type', native_enum=False, validate_strings=True),
+        nullable=False,
+        index=True,
+    )
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    run: Mapped[ReminderRun | None] = relationship('ReminderRun', back_populates='interactions')
+    rule: Mapped[ReminderRule | None] = relationship('ReminderRule')
+    user: Mapped[User | None] = relationship(
+        'User',
+        primaryjoin=lambda: foreign(ReminderInteraction.user_id) == User.id,
+        viewonly=True,
+    )
 
 
 class ZaloIncomingCommand(Base):
