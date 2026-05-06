@@ -27,7 +27,9 @@ from .models import (
     Task,
     TaskStatus,
     User,
+    VikunjaUserMapping,
 )
+from .vikunja import get_vikunja_client
 
 logger = getLogger(__name__)
 settings = get_settings()
@@ -61,6 +63,20 @@ class NotificationSpec:
     payload: dict[str, Any]
     task_id: int | None = None
     user_id: str | None = None
+
+
+@dataclass(slots=True)
+class DailyTaskSnapshot:
+    id: int
+    title: str
+    status: str
+    done: bool
+    due_date: date | None
+    updated_at: datetime | None
+    assignee_user_ids: list[str]
+    assignee_names: list[str]
+    url: str | None
+    description: str | None = None
 
 
 def now_local() -> datetime:
@@ -369,6 +385,110 @@ def _task_url(task_id: int | None) -> str | None:
     if not base_url:
         return None
     return f'{base_url}/tasks/{task_id}'
+
+
+def _vikunja_task_url(task_id: int | None) -> str | None:
+    if task_id is None:
+        return None
+    template = (settings.vikunja_task_url_template or '').strip()
+    project_id = settings.vikunja_project_id
+    if template:
+        return template.format(project_id=project_id or '', task_id=task_id)
+    base_url = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
+    if not base_url:
+        return None
+    return f'{base_url}/tasks/{task_id}'
+
+
+def _parse_vikunja_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    normalized = value.replace('Z', '+00:00')
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _parse_vikunja_date(value: Any) -> date | None:
+    parsed = _parse_vikunja_datetime(value)
+    return parsed.date() if parsed else None
+
+
+def _vikunja_status_from_task(task: dict[str, Any]) -> str:
+    if bool(task.get('done')):
+        return TaskStatus.done.value
+    bucket_id = task.get('bucket_id')
+    reverse_bucket_map = {bucket_id: status for status, bucket_id in settings.vikunja_status_bucket_map.items()}
+    if bucket_id in reverse_bucket_map:
+        return reverse_bucket_map[bucket_id]
+    return TaskStatus.todo.value
+
+
+def _vikunja_assignees(db: Session, task: dict[str, Any]) -> tuple[list[str], list[str]]:
+    assignees = task.get('assignees')
+    if not isinstance(assignees, list):
+        return [], []
+
+    user_ids: list[str] = []
+    names: list[str] = []
+    for assignee in assignees:
+        if not isinstance(assignee, dict):
+            continue
+        vikunja_user_id = assignee.get('id')
+        mapping = None
+        try:
+            mapping = db.scalar(
+                select(VikunjaUserMapping).where(VikunjaUserMapping.vikunja_user_id == int(vikunja_user_id))
+            )
+        except (TypeError, ValueError):
+            mapping = None
+        if mapping and mapping.social_user_id:
+            user_ids.append(mapping.social_user_id)
+        display = assignee.get('name') or assignee.get('username') or assignee.get('email')
+        if display:
+            names.append(str(display))
+    return user_ids, names
+
+
+def _fetch_vikunja_daily_snapshots(db: Session) -> list[DailyTaskSnapshot] | None:
+    if not settings.vikunja_enabled or not settings.vikunja_project_id:
+        return None
+
+    try:
+        tasks = get_vikunja_client().list_all_project_tasks(settings.vikunja_project_id)
+    except Exception as exc:
+        logger.warning('Falling back to legacy daily notifications because Vikunja task fetch failed: %s', exc)
+        return None
+
+    snapshots: list[DailyTaskSnapshot] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        try:
+            task_id = int(task.get('id'))
+        except (TypeError, ValueError):
+            continue
+        assignee_ids, assignee_names = _vikunja_assignees(db, task)
+        snapshots.append(
+            DailyTaskSnapshot(
+                id=task_id,
+                title=str(task.get('title') or f'Task #{task_id}'),
+                status=_vikunja_status_from_task(task),
+                done=bool(task.get('done')),
+                due_date=_parse_vikunja_date(task.get('due_date')),
+                updated_at=_parse_vikunja_datetime(task.get('updated')),
+                assignee_user_ids=assignee_ids,
+                assignee_names=assignee_names,
+                url=_vikunja_task_url(task_id),
+                description=str(task.get('description') or '').strip() or None,
+            )
+        )
+    return snapshots
 
 
 def _task_notification_payload(
@@ -811,8 +931,151 @@ def _render_evening_group_message(total_done: int, total_pending: int) -> str:
     return render_template(template, {'total_done': total_done, 'total_pending': total_pending})
 
 
+def _snapshot_is_due_today_or_overdue(task: DailyTaskSnapshot, today: date) -> bool:
+    if task.done:
+        return False
+    return task.due_date is None or task.due_date <= today
+
+
+def _snapshot_is_approved(task: DailyTaskSnapshot) -> bool:
+    return task.status == TaskStatus.ready.value and not task.done
+
+
+def _snapshot_task_description(task: DailyTaskSnapshot) -> str:
+    due = task.due_date.strftime('%d/%m') if task.due_date else 'Anytime'
+    parts = [f'Status: {task.status}', f'Due: {due}']
+    if task.url:
+        parts.append(task.url)
+    return ' · '.join(parts)
+
+
+def _build_vikunja_daily_specs(
+    db: Session,
+    *,
+    job: Literal['morning', 'evening'],
+    today: date,
+    snapshots: list[DailyTaskSnapshot],
+) -> list[NotificationSpec]:
+    day_key = today.isoformat()
+
+    if job == 'morning':
+        users = _all_active_users(db)
+        user_summaries: list[dict[str, Any]] = []
+        per_user_specs: list[NotificationSpec] = []
+
+        for user in users:
+            today_tasks = [
+                task for task in snapshots if user.id in task.assignee_user_ids and _snapshot_is_due_today_or_overdue(task, today)
+            ]
+            approved_tasks = [task for task in snapshots if user.id in task.assignee_user_ids and _snapshot_is_approved(task)]
+            if today_tasks:
+                user_summaries.append({'name': user.name, 'task_count': len(today_tasks)})
+            if not today_tasks and not approved_tasks:
+                continue
+
+            message = _render_morning_user_message(
+                user.name,
+                [
+                    {
+                        'task_title': task.title,
+                        'task_description': _snapshot_task_description(task),
+                    }
+                    for task in today_tasks
+                ],
+                [{'task_title': task.title} for task in approved_tasks],
+            )
+            per_user_specs.append(
+                NotificationSpec(
+                    event_key=f'vikunja:daily:morning:user:{user.id}:{day_key}',
+                    event_type='daily_morning_user',
+                    channel=NotificationChannel.user,
+                    target_id=user.zalo_user_id,
+                    user_id=user.id,
+                    payload={
+                        'message': message,
+                        'context': {
+                            'source': 'daily_job',
+                            'task_source': 'vikunja',
+                            'job': 'morning',
+                            'scope': 'user',
+                            'date': day_key,
+                        },
+                    },
+                )
+            )
+
+        specs: list[NotificationSpec] = [
+            NotificationSpec(
+                event_key=f'vikunja:daily:morning:group:{day_key}',
+                event_type='daily_morning_group',
+                channel=NotificationChannel.group,
+                target_id=settings.zalo_group_id,
+                payload={
+                    'message': _render_morning_group_message(user_summaries),
+                    'context': {'source': 'daily_job', 'task_source': 'vikunja', 'job': 'morning', 'scope': 'group', 'date': day_key},
+                },
+            )
+        ]
+
+        review_tasks = [task for task in snapshots if task.status == TaskStatus.review.value and not task.done]
+        pending_payload = [
+            {
+                'task_title': task.title,
+                'assignee': ', '.join(task.assignee_names) or 'Unassigned',
+            }
+            for task in review_tasks
+        ]
+        for admin in _active_admins(db):
+            specs.append(
+                NotificationSpec(
+                    event_key=f'vikunja:daily:morning:admin:{admin.id}:{day_key}',
+                    event_type='daily_morning_admin',
+                    channel=NotificationChannel.user,
+                    target_id=admin.zalo_user_id,
+                    user_id=admin.id,
+                    payload={
+                        'message': _render_morning_admin_message(pending_payload),
+                        'context': {
+                            'source': 'daily_job',
+                            'task_source': 'vikunja',
+                            'job': 'morning',
+                            'scope': 'admin',
+                            'date': day_key,
+                        },
+                    },
+                )
+            )
+
+        specs.extend(per_user_specs)
+        return specs
+
+    total_done = len(
+        [
+            task
+            for task in snapshots
+            if task.done and task.updated_at and task.updated_at.astimezone(ZoneInfo(settings.notify_timezone)).date() == today
+        ]
+    )
+    total_pending = len([task for task in snapshots if not task.done])
+    return [
+        NotificationSpec(
+            event_key=f'vikunja:daily:evening:group:{day_key}',
+            event_type='daily_evening_group',
+            channel=NotificationChannel.group,
+            target_id=settings.zalo_group_id,
+            payload={
+                'message': _render_evening_group_message(total_done=total_done, total_pending=total_pending),
+                'context': {'source': 'daily_job', 'task_source': 'vikunja', 'job': 'evening', 'scope': 'group', 'date': day_key},
+            },
+        )
+    ]
+
+
 def _build_daily_specs(db: Session, *, job: Literal['morning', 'evening'], today: date) -> list[NotificationSpec]:
     day_key = today.isoformat()
+    vikunja_snapshots = _fetch_vikunja_daily_snapshots(db)
+    if vikunja_snapshots is not None:
+        return _build_vikunja_daily_specs(db, job=job, today=today, snapshots=vikunja_snapshots)
 
     if job == 'morning':
         users = _all_active_users(db)

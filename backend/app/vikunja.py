@@ -52,6 +52,32 @@ class VikunjaRequestResult:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class VikunjaTaskSnapshot:
+    id: int
+    title: str
+    status: str
+    done: bool
+    due_date: str | None
+    updated: str | None
+    assignee_social_ids: list[str]
+    assignee_names: list[str]
+    url: str | None
+
+    def as_state(self) -> dict[str, Any]:
+        return {
+            'id': self.id,
+            'title': self.title,
+            'status': self.status,
+            'done': self.done,
+            'due_date': self.due_date,
+            'updated': self.updated,
+            'assignee_social_ids': self.assignee_social_ids,
+            'assignee_names': self.assignee_names,
+            'url': self.url,
+        }
+
+
 class VikunjaConfigError(RuntimeError):
     pass
 
@@ -90,6 +116,26 @@ class VikunjaClient:
 
     def create_project(self, title: str) -> dict[str, Any]:
         return self.request('PUT', '/projects', json={'title': title})
+
+    def list_project_tasks(self, project_id: int, *, page: int = 1, per_page: int = 100) -> list[dict[str, Any]]:
+        data = self.request('GET', f'/projects/{project_id}/tasks', params={'page': page, 'per_page': per_page})
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get('data'), list):
+            return data['data']
+        return []
+
+    def list_all_project_tasks(self, project_id: int, *, per_page: int = 100, max_pages: int = 50) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            batch = self.list_project_tasks(project_id, page=page, per_page=per_page)
+            tasks.extend(batch)
+            if len(batch) < per_page:
+                break
+        return tasks
+
+    def get_task(self, task_id: int) -> dict[str, Any]:
+        return self.request('GET', f'/tasks/{task_id}')
 
     def create_task(self, project_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request('PUT', f'/projects/{project_id}/tasks', json=payload)
@@ -302,6 +348,312 @@ def _extract_task_id(response: dict[str, Any]) -> int:
     return int(task_id)
 
 
+def _vikunja_task_url(task_id: int | None) -> str | None:
+    if task_id is None:
+        return None
+    template = (settings.vikunja_task_url_template or '').strip()
+    if template:
+        return template.format(project_id=settings.vikunja_project_id or '', task_id=task_id)
+    base_url = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
+    if not base_url:
+        return None
+    return f'{base_url}/tasks/{task_id}'
+
+
+def _status_from_vikunja_task(task: dict[str, Any]) -> str:
+    if bool(task.get('done')):
+        return TaskStatus.done.value
+    bucket_id = task.get('bucket_id')
+    reverse = {bucket_id: status for status, bucket_id in settings.vikunja_status_bucket_map.items()}
+    if bucket_id in reverse:
+        return reverse[bucket_id]
+    return TaskStatus.todo.value
+
+
+def _snapshot_assignees(db: Session, task: dict[str, Any]) -> tuple[list[str], list[str]]:
+    assignees = task.get('assignees')
+    if not isinstance(assignees, list):
+        return [], []
+
+    social_ids: list[str] = []
+    names: list[str] = []
+    for assignee in assignees:
+        if not isinstance(assignee, dict):
+            continue
+        try:
+            vikunja_user_id = int(assignee.get('id'))
+        except (TypeError, ValueError):
+            vikunja_user_id = None
+        if vikunja_user_id is not None:
+            mapping = db.scalar(select(VikunjaUserMapping).where(VikunjaUserMapping.vikunja_user_id == vikunja_user_id))
+            if mapping and mapping.social_user_id:
+                social_ids.append(mapping.social_user_id)
+                names.append(mapping.display_name or mapping.username)
+                continue
+        display = assignee.get('name') or assignee.get('username') or assignee.get('email')
+        if display:
+            names.append(str(display))
+    return social_ids, names
+
+
+def _snapshot_from_task(db: Session, task: dict[str, Any]) -> VikunjaTaskSnapshot | None:
+    try:
+        task_id = int(task.get('id'))
+    except (TypeError, ValueError):
+        return None
+    assignee_ids, assignee_names = _snapshot_assignees(db, task)
+    due_date = task.get('due_date')
+    if isinstance(due_date, str) and 'T' in due_date:
+        due_date = due_date.split('T', 1)[0]
+    updated = task.get('updated') or task.get('updated_at')
+    return VikunjaTaskSnapshot(
+        id=task_id,
+        title=str(task.get('title') or f'Task #{task_id}'),
+        status=_status_from_vikunja_task(task),
+        done=bool(task.get('done')),
+        due_date=str(due_date) if due_date else None,
+        updated=str(updated) if updated else None,
+        assignee_social_ids=assignee_ids,
+        assignee_names=assignee_names,
+        url=_vikunja_task_url(task_id),
+    )
+
+
+def _local_task_id_for_vikunja(db: Session, vikunja_task_id: int) -> int | None:
+    mapping = db.scalar(select(VikunjaTaskMapping).where(VikunjaTaskMapping.vikunja_task_id == vikunja_task_id))
+    return mapping.local_task_id if mapping else None
+
+
+def _snapshot_state_key(vikunja_task_id: int) -> str:
+    return f'vikunja_task:{vikunja_task_id}'
+
+
+def _changed_fields(previous: dict[str, Any], current: VikunjaTaskSnapshot) -> list[str]:
+    now_state = current.as_state()
+    keys = ['title', 'status', 'done', 'due_date', 'assignee_social_ids']
+    return [key for key in keys if previous.get(key) != now_state.get(key)]
+
+
+def _active_admins(db: Session) -> list[User]:
+    return db.scalars(
+        select(User)
+        .where(User.is_active.is_(True), func.lower(func.coalesce(User.role, '')) == 'admin')
+        .order_by(func.lower(func.coalesce(User.full_name, User.username)).asc())
+    ).all()
+
+
+def _user_for_social_id(db: Session, social_user_id: str | None) -> User | None:
+    if not social_user_id:
+        return None
+    return db.get(User, social_user_id)
+
+
+def _notify_vikunja_task_changes(
+    db: Session,
+    *,
+    previous: dict[str, Any] | None,
+    current: VikunjaTaskSnapshot,
+    reason: str,
+) -> dict[str, int]:
+    from .models import NotificationChannel
+    from .notifications import NotificationSpec, dispatch_due_notification_events, enqueue_notification_event
+
+    if previous is None:
+        return {'created': 0, 'deduped': 0}
+
+    changed = _changed_fields(previous, current)
+    if not changed:
+        return {'created': 0, 'deduped': 0}
+
+    previous_status = str(previous.get('status') or '')
+    local_task_id = _local_task_id_for_vikunja(db, current.id)
+    event_suffix = current.updated or _now().isoformat()
+    specs: list[NotificationSpec] = []
+
+    def task_line() -> str:
+        assignee = ', '.join(current.assignee_names) or 'Unassigned'
+        due = current.due_date or 'no due'
+        link = f'\n{current.url}' if current.url else ''
+        return f'{current.title}\nAssignee: {assignee}\nStatus: {current.status}\nDue: {due}{link}'
+
+    def render_message(*, event_type: str, recipient: User | None, fallback: str, context: dict[str, Any]) -> str:
+        from .bot_files import contact_prompt_text_for_user, notification_prompt_text
+        from .bot_llm import BotLLMError, generate_bot_reply, is_bot_llm_configured
+
+        if not is_bot_llm_configured():
+            return fallback
+        payload = {
+            'event_type': event_type,
+            'recipient': {
+                'id': recipient.id,
+                'name': recipient.name,
+                'username': recipient.username,
+                'role': recipient.role,
+            }
+            if recipient
+            else None,
+            'task': {
+                'id': current.id,
+                'title': current.title,
+                'status': current.status,
+                'previous_status': previous.get('status'),
+                'assignee': ', '.join(current.assignee_names) or None,
+                'due_date': current.due_date,
+                'url': current.url,
+            },
+            'changed_fields': changed,
+            'context': context,
+            'recipient_custom_prompt': contact_prompt_text_for_user(recipient) if recipient else '',
+        }
+        prompt = (
+            'Viết một thông báo Zalo tự nhiên cho task event dưới đây.\n'
+            'Không dùng chữ "Vikunja". Gọi là task hoặc Task Manager.\n'
+            'Trả về duy nhất nội dung tin nhắn, không markdown fence, không JSON.\n\n'
+            f'{payload}'
+        )
+        try:
+            message = generate_bot_reply(system_prompt=notification_prompt_text(), user_prompt=prompt).strip()
+        except BotLLMError:
+            return fallback
+        return message[:1200] if message else fallback
+
+    new_assignees = set(current.assignee_social_ids) - set(previous.get('assignee_social_ids') or [])
+    if previous.get('id') and new_assignees:
+        for social_user_id in new_assignees:
+            user = _user_for_social_id(db, social_user_id)
+            fallback = f'{user.name if user else "Bạn"} ơi, bạn vừa được assign task mới:\n{task_line()}'
+            message = render_message(
+                event_type='task_assigned',
+                recipient=user,
+                fallback=fallback,
+                context={'reason': 'assigned', 'task_id': current.id},
+            )
+            specs.append(
+                NotificationSpec(
+                    event_key=f'vikunja:task:{current.id}:assigned:{social_user_id}:{event_suffix}',
+                    event_type='vikunja_task_assigned',
+                    channel=NotificationChannel.user,
+                    target_id=user.zalo_user_id if user else None,
+                    task_id=local_task_id,
+                    user_id=social_user_id,
+                    payload={'message': message, 'context': {'source': 'vikunja_realtime', 'reason': 'assigned', 'vikunja_task_id': current.id}},
+                )
+            )
+
+    if 'status' in changed or 'done' in changed:
+        if previous_status == TaskStatus.review.value and current.status == TaskStatus.ready.value:
+            for social_user_id in current.assignee_social_ids:
+                user = _user_for_social_id(db, social_user_id)
+                fallback = f'{user.name if user else "Bạn"} ơi, task đã được duyệt ready rồi nha:\n{task_line()}'
+                message = render_message(
+                    event_type='task_approved_ready',
+                    recipient=user,
+                    fallback=fallback,
+                    context={'reason': 'review_to_ready', 'task_id': current.id},
+                )
+                specs.append(
+                    NotificationSpec(
+                        event_key=f'vikunja:task:{current.id}:review-ready:{social_user_id}:{event_suffix}',
+                        event_type='vikunja_task_approved_ready',
+                        channel=NotificationChannel.user,
+                        target_id=user.zalo_user_id if user else None,
+                        task_id=local_task_id,
+                        user_id=social_user_id,
+                        payload={
+                            'message': message,
+                            'context': {'source': 'vikunja_realtime', 'reason': 'review_to_ready', 'vikunja_task_id': current.id},
+                        },
+                    )
+                )
+
+        if current.status == TaskStatus.review.value and previous_status != TaskStatus.review.value:
+            for admin in _active_admins(db):
+                fallback = f'Admin ơi, task vừa vào review:\n{task_line()}'
+                message = render_message(
+                    event_type='task_submitted_for_review',
+                    recipient=admin,
+                    fallback=fallback,
+                    context={'reason': 'moved_to_review', 'task_id': current.id},
+                )
+                specs.append(
+                    NotificationSpec(
+                        event_key=f'vikunja:task:{current.id}:to-review:admin:{admin.id}:{event_suffix}',
+                        event_type='vikunja_task_submitted_for_review',
+                        channel=NotificationChannel.user,
+                        target_id=admin.zalo_user_id,
+                        task_id=local_task_id,
+                        user_id=admin.id,
+                        payload={
+                            'message': message,
+                            'context': {'source': 'vikunja_realtime', 'reason': 'moved_to_review', 'vikunja_task_id': current.id},
+                        },
+                    )
+                )
+
+        if current.status == TaskStatus.done.value and previous_status != TaskStatus.done.value:
+            for admin in _active_admins(db):
+                fallback = f'Admin update: task vừa được chuyển done:\n{task_line()}'
+                message = render_message(
+                    event_type='task_done',
+                    recipient=admin,
+                    fallback=fallback,
+                    context={'reason': 'done', 'task_id': current.id},
+                )
+                specs.append(
+                    NotificationSpec(
+                        event_key=f'vikunja:task:{current.id}:done:admin:{admin.id}:{event_suffix}',
+                        event_type='vikunja_task_done',
+                        channel=NotificationChannel.user,
+                        target_id=admin.zalo_user_id,
+                        task_id=local_task_id,
+                        user_id=admin.id,
+                        payload={'message': message, 'context': {'source': 'vikunja_realtime', 'reason': 'done', 'vikunja_task_id': current.id}},
+                    )
+                )
+
+    passive_fields = [field for field in changed if field in {'title', 'due_date'}]
+    if passive_fields and not ({'status', 'done', 'assignee_social_ids'} & set(changed)):
+        for social_user_id in current.assignee_social_ids:
+            user = _user_for_social_id(db, social_user_id)
+            fallback = f'{user.name if user else "Bạn"} ơi, task vừa được cập nhật ({", ".join(passive_fields)}):\n{task_line()}'
+            message = render_message(
+                event_type='task_updated',
+                recipient=user,
+                fallback=fallback,
+                context={'reason': reason, 'changed_fields': passive_fields, 'task_id': current.id},
+            )
+            specs.append(
+                NotificationSpec(
+                    event_key=f'vikunja:task:{current.id}:updated:{social_user_id}:{event_suffix}',
+                    event_type='vikunja_task_updated',
+                    channel=NotificationChannel.user,
+                    target_id=user.zalo_user_id if user else None,
+                    task_id=local_task_id,
+                    user_id=social_user_id,
+                    payload={
+                        'message': message,
+                        'context': {
+                            'source': 'vikunja_realtime',
+                            'reason': reason,
+                            'changed_fields': passive_fields,
+                            'vikunja_task_id': current.id,
+                        },
+                    },
+                )
+            )
+
+    created = 0
+    deduped = 0
+    for spec in specs:
+        _, inserted = enqueue_notification_event(db, spec)
+        created += int(inserted)
+        deduped += int(not inserted)
+    if specs:
+        db.commit()
+        dispatch_due_notification_events(db, limit=min(20, settings.notification_delivery_batch_limit))
+    return {'created': created, 'deduped': deduped}
+
+
 def _migrated_comment(comment: TaskComment) -> str:
     author = comment.author.name if comment.author else 'Unknown'
     return f'[Legacy comment from {author} at {comment.created_at.isoformat()}]\n{comment.content}'
@@ -414,15 +766,86 @@ def vikunja_bridge_summary(db: Session) -> dict[str, Any]:
     }
 
 
+def _reconcile_snapshots(
+    db: Session,
+    *,
+    snapshots: list[VikunjaTaskSnapshot],
+    reason: str,
+) -> dict[str, Any]:
+    seeded = 0
+    changed = 0
+    unchanged = 0
+    events_created = 0
+    events_deduped = 0
+
+    for snapshot in snapshots:
+        state_key = _snapshot_state_key(snapshot.id)
+        existing = _state(db, state_key)
+        previous = existing.value if existing and isinstance(existing.value, dict) else None
+        if previous is None:
+            seeded += 1
+        else:
+            change_names = _changed_fields(previous, snapshot)
+            if change_names:
+                changed += 1
+                stats = _notify_vikunja_task_changes(db, previous=previous, current=snapshot, reason=reason)
+                events_created += int(stats.get('created') or 0)
+                events_deduped += int(stats.get('deduped') or 0)
+            else:
+                unchanged += 1
+        _set_state(db, state_key, snapshot.as_state())
+
+    _set_state(
+        db,
+        'vikunja_reconcile',
+        {
+            'last_run_at': _now().isoformat(),
+            'task_count': len(snapshots),
+            'reason': reason,
+        },
+    )
+    db.commit()
+    return {
+        'checked': len(snapshots),
+        'seeded': seeded,
+        'changed': changed,
+        'unchanged': unchanged,
+        'events_created': events_created,
+        'events_deduped': events_deduped,
+    }
+
+
 def reconcile_vikunja_bridge(db: Session) -> dict[str, Any]:
-    # V1 reconcile is intentionally conservative: it reports bridge state without mutating Vikunja.
-    return vikunja_bridge_summary(db)
+    require_vikunja_or_503()
+    if not settings.vikunja_project_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='VIKUNJA_PROJECT_ID must be configured before reconciling Vikunja tasks.',
+        )
+    client = get_vikunja_client()
+    raw_tasks = client.list_all_project_tasks(settings.vikunja_project_id)
+    snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task))]
+    stats = _reconcile_snapshots(db, snapshots=snapshots, reason='poll_reconcile')
+    return {**vikunja_bridge_summary(db), 'reconcile': stats}
 
 
 def handle_vikunja_webhook(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     _set_state(db, 'last_webhook', {'received_at': _now().isoformat(), 'payload': payload})
-    db.commit()
-    return {'ok': True, 'action': 'recorded'}
+    if not settings.vikunja_enabled or not settings.vikunja_project_id:
+        db.commit()
+        return {'ok': True, 'action': 'recorded', 'reconcile': None}
+
+    try:
+        client = get_vikunja_client()
+        raw_tasks = client.list_all_project_tasks(settings.vikunja_project_id)
+        snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task))]
+        stats = _reconcile_snapshots(db, snapshots=snapshots, reason='webhook')
+    except Exception as exc:
+        _set_state(db, 'last_webhook_error', {'received_at': _now().isoformat(), 'error': str(exc), 'payload': payload})
+        db.commit()
+        return {'ok': False, 'action': 'recorded', 'error': str(exc)}
+
+    return {'ok': True, 'action': 'recorded_and_reconciled', 'reconcile': stats}
 
 
 def require_vikunja_or_503() -> None:

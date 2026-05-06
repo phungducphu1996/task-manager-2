@@ -49,6 +49,8 @@ from .models import (
     TaskStatus,
     TaskType,
     User,
+    VikunjaTaskMapping,
+    VikunjaUserMapping,
     ZaloIncomingCommand,
 )
 from .notifications import (
@@ -65,11 +67,24 @@ from .reminders import (
 )
 from .schemas import ZaloIncomingRequest
 from .services import get_task_or_404, list_tasks, local_today, next_list_order
+from .vikunja import VikunjaConfigError, ensure_vikunja_project, get_vikunja_client
 
 settings = get_settings()
 T = TypeVar('T')
 MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
 GENERIC_NAME_PARTS = {'anh', 'chi', 'chị', 'em', 'ban', 'bạn', 'minh', 'mình'}
+VIKUNJA_PRIORITY_TO_TASK_PRIORITY = {
+    1: TaskPriority.low.value,
+    2: TaskPriority.low.value,
+    3: TaskPriority.medium.value,
+    4: TaskPriority.high.value,
+    5: TaskPriority.high.value,
+}
+TASK_PRIORITY_TO_VIKUNJA_PRIORITY = {
+    TaskPriority.low.value: 2,
+    TaskPriority.medium.value: 3,
+    TaskPriority.high.value: 4,
+}
 
 
 @dataclass(slots=True)
@@ -609,6 +624,16 @@ def _auto_prefix_title_for_type(title: str, task_type: TaskType | None) -> str:
     return f'{prefix} {title}'
 
 
+def _replace_type_prefix_for_title(db: Session, title: str, task_type: TaskType | None) -> str:
+    clean_title = title.strip()
+    for existing_type in db.scalars(select(TaskType)).all():
+        prefix = f'[{existing_type.name.strip()}]'
+        if clean_title.casefold().startswith(prefix.casefold()):
+            clean_title = clean_title[len(prefix):].strip()
+            break
+    return _auto_prefix_title_for_type(clean_title, task_type)
+
+
 def _message_key(payload: ZaloIncomingRequest) -> str:
     if payload.message_id:
         return f'{payload.conversation_id or ""}:{payload.message_id}'
@@ -1043,12 +1068,178 @@ def _tool_task_payload(task: Task) -> dict[str, Any]:
 
 
 def _task_url(task_id: int) -> str | None:
+    if settings.vikunja_enabled:
+        template = (settings.vikunja_task_url_template or '').strip()
+        if template:
+            return template.format(project_id=settings.vikunja_project_id or '', task_id=task_id)
+        base = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
+        if base:
+            return f'{base}/tasks/{task_id}'
+
     base = (settings.task_public_base_url or '').strip().rstrip('/')
     if not base:
         return None
     if '{task_id}' in base:
         return base.replace('{task_id}', str(task_id))
     return f'{base}/today?task={task_id}'
+
+
+def _use_vikunja_tasks() -> bool:
+    return settings.vikunja_enabled
+
+
+def _task_due_datetime_value(due_date: date | None) -> str | None:
+    if not due_date:
+        return None
+    return datetime.combine(due_date, time(hour=23, minute=59), tzinfo=ZoneInfo(settings.app_timezone)).isoformat()
+
+
+def _date_from_vikunja(value: Any) -> date | None:
+    if not value:
+        return None
+    raw = str(value)
+    try:
+        if 'T' in raw:
+            return datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(ZoneInfo(settings.app_timezone)).date()
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _status_from_vikunja_payload(task: dict[str, Any]) -> str:
+    if bool(task.get('done')):
+        return TaskStatus.done.value
+    bucket_id = task.get('bucket_id')
+    reverse = {bucket_id: status for status, bucket_id in settings.vikunja_status_bucket_map.items()}
+    if bucket_id in reverse:
+        return reverse[bucket_id]
+    return TaskStatus.todo.value
+
+
+def _vikunja_assignee_social_ids(db: Session, task: dict[str, Any]) -> list[str]:
+    assignees = task.get('assignees')
+    if not isinstance(assignees, list):
+        return []
+
+    social_ids: list[str] = []
+    for assignee in assignees:
+        if not isinstance(assignee, dict):
+            continue
+        try:
+            vikunja_user_id = int(assignee.get('id'))
+        except (TypeError, ValueError):
+            continue
+        mapping = db.scalar(select(VikunjaUserMapping).where(VikunjaUserMapping.vikunja_user_id == vikunja_user_id))
+        if mapping and mapping.social_user_id:
+            social_ids.append(mapping.social_user_id)
+    return social_ids
+
+
+def _vikunja_assignee_names(db: Session, task: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    assignees = task.get('assignees')
+    if not isinstance(assignees, list):
+        return names
+
+    for assignee in assignees:
+        if not isinstance(assignee, dict):
+            continue
+        try:
+            vikunja_user_id = int(assignee.get('id'))
+        except (TypeError, ValueError):
+            vikunja_user_id = None
+        if vikunja_user_id is not None:
+            mapping = db.scalar(select(VikunjaUserMapping).where(VikunjaUserMapping.vikunja_user_id == vikunja_user_id))
+            if mapping:
+                names.append(mapping.display_name or mapping.username)
+                continue
+        display = assignee.get('name') or assignee.get('username') or assignee.get('email')
+        if display:
+            names.append(str(display))
+    return names
+
+
+def _tool_vikunja_task_payload(db: Session, task: dict[str, Any]) -> dict[str, Any]:
+    task_id = int(task.get('id'))
+    due_date = _date_from_vikunja(task.get('due_date'))
+    assignee_names = _vikunja_assignee_names(db, task)
+    assignee_social_ids = _vikunja_assignee_social_ids(db, task)
+    try:
+        priority_number = int(task.get('priority') or 0)
+    except (TypeError, ValueError):
+        priority_number = 0
+    return {
+        'id': task_id,
+        'title': str(task.get('title') or f'Task #{task_id}'),
+        'status': _status_from_vikunja_payload(task),
+        'assignee': ', '.join(assignee_names) if assignee_names else None,
+        'assigned_to': assignee_social_ids[0] if assignee_social_ids else None,
+        'due_date': due_date.isoformat() if due_date else None,
+        'shop': None,
+        'type': None,
+        'priority': VIKUNJA_PRIORITY_TO_TASK_PRIORITY.get(priority_number, TaskPriority.medium.value),
+    }
+
+
+def _vikunja_project_id(db: Session) -> int:
+    client = get_vikunja_client()
+    return ensure_vikunja_project(db, client)
+
+
+def _resolve_vikunja_task_id(db: Session, task_id: int) -> int:
+    mapping = db.scalar(select(VikunjaTaskMapping).where(VikunjaTaskMapping.local_task_id == task_id))
+    if mapping and mapping.vikunja_task_id:
+        return int(mapping.vikunja_task_id)
+    return task_id
+
+
+def _resolve_vikunja_assignee(db: Session, token: str | None) -> tuple[User | None, int | None, str | None]:
+    user = _resolve_user(db, token)
+    if not user:
+        return None, None, f'Không tìm thấy assignee {token}.'
+    mapping = db.scalar(select(VikunjaUserMapping).where(VikunjaUserMapping.social_user_id == user.id))
+    if not mapping or not mapping.vikunja_user_id:
+        return user, None, f'{user.name} chưa được sync user sang Task Manager mới.'
+    return user, int(mapping.vikunja_user_id), None
+
+
+def _actor_can_access_vikunja_task(db: Session, *, actor: User, task: dict[str, Any]) -> bool:
+    if _is_admin(actor):
+        return True
+    return actor.id in _vikunja_assignee_social_ids(db, task)
+
+
+def _actor_can_edit_vikunja_task(db: Session, *, actor: User, task: dict[str, Any]) -> bool:
+    return _actor_can_access_vikunja_task(db, actor=actor, task=task)
+
+
+def _vikunja_status_payload(status_token: str) -> tuple[dict[str, Any] | None, str | None]:
+    if status_token not in {status.value for status in TaskStatus}:
+        return None, f'Unknown status: {status_token}'
+
+    updates: dict[str, Any] = {'done': status_token == TaskStatus.done.value}
+    bucket_id = settings.vikunja_status_bucket_map.get(status_token)
+    if bucket_id:
+        updates['bucket_id'] = bucket_id
+    elif status_token != TaskStatus.done.value:
+        return None, f'Chưa cấu hình bucket cho status "{status_token}" trong Task Manager mới.'
+    return updates, None
+
+
+def _format_vikunja_changed_fields(changes: dict[str, Any]) -> list[str]:
+    translated: list[str] = []
+    for key in changes:
+        if key == 'assignees':
+            translated.append('assigned_to')
+        elif key == 'bucket_id':
+            translated.append('status')
+        else:
+            translated.append(key)
+    return sorted(set(translated))
+
+
+def _task_manager_error(exc: Exception) -> str:
+    return str(exc).replace('Vikunja ', 'Task Manager ')
 
 
 def _format_task_detail(task: dict[str, Any], *, compact: bool = False) -> str:
@@ -1080,7 +1271,329 @@ def _attach_task_format(result: dict[str, Any], *, compact: bool = False) -> dic
     return result
 
 
+def _tool_find_vikunja_tasks(db: Session, *, actor: User, query: str, status_token: str | None, limit: int) -> dict[str, Any]:
+    client = get_vikunja_client()
+    project_id = _vikunja_project_id(db)
+    normalized_query = (query or '').strip()
+    max_items = max(1, min(limit, 10))
+
+    if normalized_query.startswith('#') and normalized_query[1:].isdigit():
+        candidates = [client.get_task(int(normalized_query[1:]))]
+    elif normalized_query.isdigit():
+        candidates = [client.get_task(int(normalized_query))]
+    else:
+        candidates = client.list_all_project_tasks(project_id)
+
+    normalized = _normalize_lookup(normalized_query)
+    matched_user_ids = {user.id for user in _matching_users_for_token(db, normalized_query)}
+    tasks: list[dict[str, Any]] = []
+
+    for task in candidates:
+        if not isinstance(task, dict) or task.get('id') is None:
+            continue
+        if int(task.get('project_id') or project_id) != project_id:
+            continue
+        if not _actor_can_access_vikunja_task(db, actor=actor, task=task):
+            continue
+
+        payload = _tool_vikunja_task_payload(db, task)
+        if status_token and payload['status'] != status_token:
+            continue
+
+        if normalized_query and not (normalized_query.startswith('#') and normalized_query[1:].isdigit()) and not normalized_query.isdigit():
+            haystacks = [
+                str(payload.get('title') or ''),
+                str(task.get('description') or ''),
+                str(payload.get('assignee') or ''),
+                str(payload.get('assigned_to') or ''),
+            ]
+            assignee_ids = set(_vikunja_assignee_social_ids(db, task))
+            if normalized and not any(normalized in _normalize_lookup(value) for value in haystacks) and not (matched_user_ids & assignee_ids):
+                continue
+
+        tasks.append(payload)
+        if len(tasks) >= max_items:
+            break
+
+    response = {'ok': True, 'count': len(tasks), 'tasks': tasks}
+    if len(tasks) == 1:
+        task_payload = tasks[0]
+        response['task'] = task_payload
+        response['task_url'] = _task_url(int(task_payload['id']))
+        response['formatted_task'] = _format_task_detail(task_payload, compact=True)
+    return response
+
+
+def _tool_list_vikunja_tasks(db: Session, *, actor: User, view: str) -> dict[str, Any]:
+    client = get_vikunja_client()
+    project_id = _vikunja_project_id(db)
+    normalized_view = view if view in {'today', 'inbox', 'review', 'logbook'} else 'today'
+    today = _today()
+    tasks: list[dict[str, Any]] = []
+
+    for task in client.list_all_project_tasks(project_id):
+        if not isinstance(task, dict) or task.get('id') is None:
+            continue
+        if not _actor_can_access_vikunja_task(db, actor=actor, task=task):
+            continue
+        payload = _tool_vikunja_task_payload(db, task)
+        due_date = date.fromisoformat(payload['due_date']) if payload.get('due_date') else None
+        is_done = payload['status'] == TaskStatus.done.value
+
+        include = False
+        if normalized_view == 'today':
+            include = not is_done and due_date is not None and due_date <= today
+        elif normalized_view == 'inbox':
+            include = not is_done
+        elif normalized_view == 'review':
+            include = payload['status'] == TaskStatus.review.value
+        elif normalized_view == 'logbook':
+            include = is_done
+
+        if include:
+            tasks.append(payload)
+
+    tasks.sort(key=lambda item: (item.get('due_date') or '9999-12-31', item.get('id') or 0))
+    group_title = {
+        'today': 'Today + overdue',
+        'inbox': 'Open tasks',
+        'review': 'Review',
+        'logbook': 'Logbook',
+    }[normalized_view]
+    return {'ok': True, 'view': normalized_view, 'groups': [{'key': normalized_view, 'title': group_title, 'tasks': tasks[:30]}]}
+
+
+def _tool_create_vikunja_task(
+    db: Session,
+    *,
+    actor: User,
+    title: str,
+    assignee_token: str | None,
+    shop_token: str | None = None,
+    type_token: str | None = None,
+    due_token: str | None = None,
+    priority_token: str | None = None,
+) -> dict[str, Any]:
+    clean_title = title.strip()
+    if not clean_title:
+        return {'ok': False, 'error': 'Task title cannot be empty.'}
+
+    shop = _resolve_shop(db, shop_token) if shop_token else None
+    task_type = _resolve_task_type(db, type_token) if type_token else None
+    if shop_token and not shop:
+        return {'ok': False, 'error': f'Không tìm thấy shop {shop_token}.'}
+    if type_token and not task_type:
+        return {'ok': False, 'error': f'Không tìm thấy task type {type_token}.'}
+    clean_title = _auto_prefix_title_for_type(clean_title, task_type)
+
+    assignee_user: User | None = None
+    assignee_id: int | None = None
+    if assignee_token:
+        if not _is_admin(actor):
+            return {'ok': False, 'error': 'Members cannot assign tasks to other users.'}
+        assignee_user, assignee_id, error = _resolve_vikunja_assignee(db, assignee_token)
+        if error:
+            return {'ok': False, 'error': error}
+    elif not _is_admin(actor):
+        assignee_user, assignee_id, error = _resolve_vikunja_assignee(db, actor.username)
+        if error:
+            return {'ok': False, 'error': error}
+
+    due_date = _parse_date_token(due_token)
+    priority_token = priority_token if priority_token in TASK_PRIORITY_TO_VIKUNJA_PRIORITY else TaskPriority.medium.value
+    project_id = _vikunja_project_id(db)
+    payload: dict[str, Any] = {
+        'title': clean_title,
+        'project_id': project_id,
+        'done': False,
+        'priority': TASK_PRIORITY_TO_VIKUNJA_PRIORITY[priority_token],
+    }
+    bucket_id = settings.vikunja_status_bucket_map.get(TaskStatus.todo.value) or settings.vikunja_bucket_inbox_id
+    if bucket_id:
+        payload['bucket_id'] = bucket_id
+    if due_date:
+        payload['due_date'] = _task_due_datetime_value(due_date)
+    if assignee_id:
+        payload['assignees'] = [{'id': assignee_id}]
+    metadata = [item for item in (f'Shop: {shop.name}' if shop else None, f'Type: {task_type.name}' if task_type else None) if item]
+    if metadata:
+        payload['description'] = 'Task metadata:\n' + '\n'.join(f'- {item}' for item in metadata)
+
+    task = get_vikunja_client().create_task(project_id, payload)
+    task_payload = _tool_vikunja_task_payload(db, task)
+    if assignee_user and not task_payload.get('assignee'):
+        task_payload['assignee'] = assignee_user.name
+        task_payload['assigned_to'] = assignee_user.id
+    return _attach_task_format({'ok': True, 'task': task_payload})
+
+
+def _tool_update_vikunja_task_status(db: Session, *, actor: User, task_id: int, status_token: str) -> dict[str, Any]:
+    client = get_vikunja_client()
+    resolved_task_id = _resolve_vikunja_task_id(db, task_id)
+    task = client.get_task(resolved_task_id)
+    if not _actor_can_edit_vikunja_task(db, actor=actor, task=task):
+        return {'ok': False, 'error': 'Members can only update their own tasks.'}
+
+    previous_status = _status_from_vikunja_payload(task)
+    if not _is_admin(actor):
+        next_status = TaskStatus(status_token) if status_token in {status.value for status in TaskStatus} else None
+        if next_status is None:
+            return {'ok': False, 'error': f'Unknown status: {status_token}'}
+        fake_previous_status = TaskStatus(previous_status) if previous_status in {status.value for status in TaskStatus} else TaskStatus.todo
+        fake_task = Task(title=str(task.get('title') or 'Task'), status=fake_previous_status, assigned_to=actor.id)
+        error = _validate_tool_status_transition(fake_task, next_status, actor)
+        if error:
+            return {'ok': False, 'error': error}
+
+    updates, error = _vikunja_status_payload(status_token)
+    if error:
+        return {'ok': False, 'error': error}
+    updated = client.update_task(resolved_task_id, updates or {})
+    return _attach_task_format(
+        {
+            'ok': True,
+            'task': _tool_vikunja_task_payload(db, updated),
+            'previous_status': previous_status,
+            'changed_fields': ['status'],
+        }
+    )
+
+
+def _tool_approve_vikunja_task(db: Session, *, actor: User, task_id: int) -> dict[str, Any]:
+    if not _is_admin(actor):
+        return {'ok': False, 'error': 'Only admins can approve review tasks.'}
+    client = get_vikunja_client()
+    resolved_task_id = _resolve_vikunja_task_id(db, task_id)
+    task = client.get_task(resolved_task_id)
+    previous_status = _status_from_vikunja_payload(task)
+    if previous_status != TaskStatus.review.value:
+        return {'ok': False, 'error': 'Only tasks in review can be approved to ready.'}
+    updates, error = _vikunja_status_payload(TaskStatus.ready.value)
+    if error:
+        return {'ok': False, 'error': error}
+    updated = client.update_task(resolved_task_id, updates or {})
+    return _attach_task_format({'ok': True, 'task': _tool_vikunja_task_payload(db, updated), 'previous_status': previous_status})
+
+
+def _tool_update_vikunja_task_fields(
+    db: Session,
+    *,
+    actor: User,
+    task_id: int,
+    arguments: dict[str, Any],
+    original_text: str | None,
+) -> dict[str, Any]:
+    client = get_vikunja_client()
+    resolved_task_id = _resolve_vikunja_task_id(db, task_id)
+    task = client.get_task(resolved_task_id)
+    if not _actor_can_edit_vikunja_task(db, actor=actor, task=task):
+        return {'ok': False, 'error': 'Members can only edit their own tasks.'}
+
+    updates: dict[str, Any] = {}
+    previous_status = _status_from_vikunja_payload(task)
+
+    if 'title' in arguments:
+        title = str(arguments.get('title') or '').strip()
+        if not title:
+            return {'ok': False, 'error': 'Task title cannot be empty.'}
+        updates['title'] = title
+
+    if 'description' in arguments:
+        updates['description'] = str(arguments.get('description') or '').strip()
+
+    metadata_updates: list[str] = []
+    if arguments.get('clear_shop') or _is_clear_token(str(arguments.get('shop_token') or '')):
+        metadata_updates.append('Shop: None')
+    elif 'shop_token' in arguments and str(arguments.get('shop_token') or '').strip():
+        shop = _resolve_shop(db, str(arguments.get('shop_token') or ''))
+        if not shop:
+            return {'ok': False, 'error': f'Không tìm thấy shop {arguments.get("shop_token")}.'}
+        metadata_updates.append(f'Shop: {shop.name}')
+
+    if arguments.get('clear_type') or _is_clear_token(str(arguments.get('type_token') or '')):
+        updates['title'] = _replace_type_prefix_for_title(db, str(updates.get('title') or task.get('title') or ''), None)
+        metadata_updates.append('Type: None')
+    elif 'type_token' in arguments and str(arguments.get('type_token') or '').strip():
+        task_type = _resolve_task_type(db, str(arguments.get('type_token') or ''))
+        if not task_type:
+            return {'ok': False, 'error': f'Không tìm thấy task type {arguments.get("type_token")}.'}
+        updates['title'] = _replace_type_prefix_for_title(db, str(updates.get('title') or task.get('title') or ''), task_type)
+        metadata_updates.append(f'Type: {task_type.name}')
+
+    if arguments.get('clear_assignee'):
+        if not _is_admin(actor):
+            return {'ok': False, 'error': 'Members cannot reassign tasks.'}
+        updates['assignees'] = []
+    elif 'assignee_token' in arguments and str(arguments.get('assignee_token') or '').strip():
+        if not _is_admin(actor):
+            return {'ok': False, 'error': 'Members cannot reassign tasks.'}
+        assignee, vikunja_user_id, error = _resolve_vikunja_assignee(db, str(arguments.get('assignee_token') or ''))
+        if error:
+            return {'ok': False, 'error': error}
+        if assignee and original_text and not _user_is_mentioned_in_text(assignee, original_text):
+            return {
+                'ok': False,
+                'error': (
+                    f'Người nhận {assignee.name} không xuất hiện rõ trong yêu cầu gốc. '
+                    'Không đổi assign để tránh gán nhầm người.'
+                ),
+            }
+        updates['assignees'] = [{'id': vikunja_user_id}]
+
+    if arguments.get('clear_due_date') or _is_clear_token(str(arguments.get('due_token') or '')):
+        updates['due_date'] = None
+    elif 'due_token' in arguments and str(arguments.get('due_token') or '').strip():
+        due_date = _parse_date_token(str(arguments.get('due_token') or ''))
+        if not due_date:
+            return {'ok': False, 'error': f'Không hiểu due date "{arguments.get("due_token")}".'}
+        updates['due_date'] = _task_due_datetime_value(due_date)
+
+    if 'priority' in arguments and str(arguments.get('priority') or '').strip():
+        priority_token = str(arguments.get('priority') or '').strip()
+        if priority_token not in TASK_PRIORITY_TO_VIKUNJA_PRIORITY:
+            return {'ok': False, 'error': f'Unknown priority: {priority_token}'}
+        updates['priority'] = TASK_PRIORITY_TO_VIKUNJA_PRIORITY[priority_token]
+
+    if 'status' in arguments and str(arguments.get('status') or '').strip():
+        status_updates, error = _vikunja_status_payload(str(arguments.get('status') or '').strip())
+        if error:
+            return {'ok': False, 'error': error}
+        updates.update(status_updates or {})
+
+    if 'link_url' in arguments and str(arguments.get('link_url') or '').strip():
+        clean_url = _validate_url(str(arguments.get('link_url') or ''))
+        current_description = str(task.get('description') or '').strip()
+        link_name = str(arguments.get('link_name') or '').strip() or urlparse(clean_url).netloc or 'Link'
+        link_line = f'{link_name}: {clean_url}'
+        updates['description'] = f'{current_description}\n\nLinks:\n- {link_line}'.strip()
+
+    if metadata_updates:
+        current_description = str(updates.get('description') if 'description' in updates else task.get('description') or '').strip()
+        updates['description'] = f'{current_description}\n\nTask metadata update:\n' + '\n'.join(f'- {item}' for item in metadata_updates)
+        updates['description'] = updates['description'].strip()
+
+    if not updates:
+        return {'ok': False, 'error': 'Không có field nào để cập nhật.'}
+
+    updated = client.update_task(resolved_task_id, updates)
+    return _attach_task_format(
+        {
+            'ok': True,
+            'task': _tool_vikunja_task_payload(db, updated),
+            'previous_status': previous_status,
+            'changed_fields': _format_vikunja_changed_fields(updates),
+            'attachments_added': [],
+        }
+    )
+
+
 def _tool_find_tasks(db: Session, *, actor: User, query: str, status_token: str | None, limit: int) -> dict[str, Any]:
+    if _use_vikunja_tasks():
+        try:
+            return _tool_find_vikunja_tasks(db, actor=actor, query=query, status_token=status_token, limit=limit)
+        except (VikunjaConfigError, RuntimeError, ValueError) as exc:
+            return {'ok': False, 'error': _task_manager_error(exc)}
+
     stmt = (
         select(Task)
         .options(joinedload(Task.assignee), joinedload(Task.shop), joinedload(Task.task_type))
@@ -1120,6 +1633,12 @@ def _tool_find_tasks(db: Session, *, actor: User, query: str, status_token: str 
 
 
 def _tool_list_tasks(db: Session, *, actor: User, view: str) -> dict[str, Any]:
+    if _use_vikunja_tasks():
+        try:
+            return _tool_list_vikunja_tasks(db, actor=actor, view=view)
+        except (VikunjaConfigError, RuntimeError, ValueError) as exc:
+            return {'ok': False, 'error': _task_manager_error(exc)}
+
     normalized_view = view if view in {'today', 'inbox', 'review', 'logbook'} else 'today'
     result = list_tasks(
         db,
@@ -1145,6 +1664,21 @@ def _tool_create_task(
     due_token: str | None,
     priority_token: str | None,
 ) -> dict[str, Any]:
+    if _use_vikunja_tasks():
+        try:
+            return _tool_create_vikunja_task(
+                db,
+                actor=actor,
+                title=title,
+                assignee_token=assignee_token,
+                shop_token=shop_token,
+                type_token=type_token,
+                due_token=due_token,
+                priority_token=priority_token,
+            )
+        except (VikunjaConfigError, RuntimeError, ValueError) as exc:
+            return {'ok': False, 'error': _task_manager_error(exc)}
+
     priority_value = priority_token if priority_token in {'low', 'medium', 'high'} else 'medium'
     parsed = ParsedZaloCommand(
         action='add',
@@ -1166,6 +1700,12 @@ def _tool_create_task(
 
 
 def _tool_approve_task(db: Session, *, actor: User, task_id: int) -> dict[str, Any]:
+    if _use_vikunja_tasks():
+        try:
+            return _tool_approve_vikunja_task(db, actor=actor, task_id=task_id)
+        except (VikunjaConfigError, RuntimeError, ValueError) as exc:
+            return {'ok': False, 'error': _task_manager_error(exc)}
+
     task = get_task_or_404(db, task_id)
     if not task:
         return {'ok': False, 'error': 'Task not found.'}
@@ -1209,6 +1749,12 @@ def _validate_tool_status_transition(task: Task, next_status: TaskStatus, actor:
 
 
 def _tool_update_task_status(db: Session, *, actor: User, task_id: int, status_token: str) -> dict[str, Any]:
+    if _use_vikunja_tasks():
+        try:
+            return _tool_update_vikunja_task_status(db, actor=actor, task_id=task_id, status_token=status_token)
+        except (VikunjaConfigError, RuntimeError, ValueError) as exc:
+            return {'ok': False, 'error': _task_manager_error(exc)}
+
     task = get_task_or_404(db, task_id)
     if not task:
         return {'ok': False, 'error': 'Task not found.'}
@@ -1258,6 +1804,18 @@ def _tool_update_task_fields(
     arguments: dict[str, Any],
     original_text: str | None,
 ) -> dict[str, Any]:
+    if _use_vikunja_tasks():
+        try:
+            return _tool_update_vikunja_task_fields(
+                db,
+                actor=actor,
+                task_id=task_id,
+                arguments=arguments,
+                original_text=original_text,
+            )
+        except (VikunjaConfigError, RuntimeError, ValueError) as exc:
+            return {'ok': False, 'error': _task_manager_error(exc)}
+
     task = get_task_or_404(db, task_id)
     if not task:
         return {'ok': False, 'error': 'Task not found.'}
@@ -1744,9 +2302,9 @@ def _execute_tool_call(
         if name == 'update_reminder_rule':
             return _tool_update_reminder_rule(db, actor=actor, arguments=arguments)
     except (ValueError, TypeError) as exc:
-        return {'ok': False, 'error': str(exc)}
+        return {'ok': False, 'error': _task_manager_error(exc)}
     except PermissionError as exc:
-        return {'ok': False, 'error': str(exc)}
+        return {'ok': False, 'error': _task_manager_error(exc)}
     except HTTPException as exc:
         return {'ok': False, 'error': str(exc.detail)}
     return {'ok': False, 'error': f'Unknown tool: {name}'}
@@ -2339,10 +2897,10 @@ def handle_zalo_incoming(
         )
     except PermissionError as exc:
         db.rollback()
-        message = str(exc)
+        message = _task_manager_error(exc)
     except ValueError as exc:
         db.rollback()
-        message = str(exc)
+        message = _task_manager_error(exc)
 
     reply = _reply_to_conversation(
         channel=channel,

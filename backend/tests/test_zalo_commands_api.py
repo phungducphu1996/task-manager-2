@@ -6,6 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import func, select
 
+from app import zalo_commands
 from app.bot_llm import BotLLMToolCall, BotLLMToolResponse
 from app.config import get_settings
 from app.models import (
@@ -17,6 +18,8 @@ from app.models import (
     Task,
     TaskPriority,
     TaskStatus,
+    User,
+    VikunjaUserMapping,
     ZaloIncomingCommand,
 )
 from app.services import local_today
@@ -697,6 +700,118 @@ def test_zalo_find_tasks_matches_assignee_token(client, db_session, monkeypatch)
     assert response.status_code == 200
     assert response.json()['action'] == 'chat'
     assert 'Unrelated title' in replies[-1]['message']
+
+
+def test_zalo_find_tasks_uses_task_manager_bridge(client, db_session, monkeypatch) -> None:
+    admin, _, quang = _users(client)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_api_url', 'https://tasks.local')
+    monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    monkeypatch.setattr(settings, 'vikunja_task_url_template', 'https://hazeleo.com/tasks/{task_id}')
+    db_session.add(
+        VikunjaUserMapping(
+            social_user_id=quang['id'],
+            vikunja_user_id=42,
+            username=quang['username'],
+            display_name=quang['name'],
+            zalo_user_id=quang['zalo_user_id'],
+            role=quang['role'],
+            sync_status='matched',
+            metadata_json={},
+        )
+    )
+    db_session.commit()
+
+    class FakeClient:
+        def list_all_project_tasks(self, project_id: int):
+            assert project_id == 9
+            return [
+                {
+                    'id': 73,
+                    'project_id': 9,
+                    'title': 'Update video mockup Mario Collection Gen AI',
+                    'done': False,
+                    'bucket_id': None,
+                    'priority': 4,
+                    'due_date': '2026-05-06T23:59:00+07:00',
+                    'assignees': [{'id': 42, 'username': quang['username']}],
+                }
+            ]
+
+    monkeypatch.setattr(zalo_commands, 'get_vikunja_client', lambda: FakeClient())
+
+    actor = db_session.get(User, admin['id'])
+    result = zalo_commands._tool_find_tasks(db_session, actor=actor, query=quang['username'], status_token=None, limit=10)
+
+    assert result['ok'] is True
+    assert result['count'] == 1
+    assert result['task']['id'] == 73
+    assert result['task']['assigned_to'] == quang['id']
+    assert result['task_url'] == 'https://hazeleo.com/tasks/73'
+
+
+def test_zalo_update_task_fields_uses_task_manager_bridge(client, db_session, monkeypatch) -> None:
+    admin, _, quang = _users(client)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_api_url', 'https://tasks.local')
+    monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    db_session.add(
+        VikunjaUserMapping(
+            social_user_id=quang['id'],
+            vikunja_user_id=42,
+            username=quang['username'],
+            display_name=quang['name'],
+            zalo_user_id=quang['zalo_user_id'],
+            role=quang['role'],
+            sync_status='matched',
+            metadata_json={},
+        )
+    )
+    db_session.commit()
+
+    updates_seen: dict = {}
+
+    class FakeClient:
+        def get_task(self, task_id: int):
+            assert task_id == 73
+            return {
+                'id': 73,
+                'project_id': 9,
+                'title': 'Update video mockup Mario Collection Gen AI',
+                'done': False,
+                'priority': 3,
+                'assignees': [],
+            }
+
+        def update_task(self, task_id: int, payload: dict):
+            updates_seen.update(payload)
+            return {
+                'id': task_id,
+                'project_id': 9,
+                'title': 'Update video mockup Mario Collection Gen AI',
+                'done': False,
+                'priority': 3,
+                'due_date': payload.get('due_date'),
+                'assignees': payload.get('assignees', []),
+            }
+
+    monkeypatch.setattr(zalo_commands, 'get_vikunja_client', lambda: FakeClient())
+
+    actor = db_session.get(User, admin['id'])
+    result = zalo_commands._tool_update_task_fields(
+        db_session,
+        actor=actor,
+        task_id=73,
+        arguments={'assignee_token': quang['username'], 'due_token': 'today'},
+        original_text=f'đổi qua cho {quang["name"]} hôm nay nha',
+    )
+
+    assert result['ok'] is True
+    assert updates_seen['assignees'] == [{'id': 42}]
+    assert updates_seen['due_date'].startswith(str(local_today()))
+    assert result['task']['assigned_to'] == quang['id']
 
 
 def test_zalo_tool_agent_can_relay_message_to_user(client, monkeypatch) -> None:

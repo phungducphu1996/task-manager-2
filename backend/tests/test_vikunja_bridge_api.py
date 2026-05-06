@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from app.config import get_settings
-from app.models import Task, TaskStatus, VikunjaTaskMapping, VikunjaUserMapping
+from app.models import NotificationEvent, Task, TaskStatus, VikunjaTaskMapping, VikunjaUserMapping
 import app.main as main_module
+import app.vikunja as vikunja_module
 
 
 def internal_headers() -> dict[str, str]:
@@ -14,6 +15,7 @@ class DummyVikunjaClient:
         self.created_projects: list[dict] = []
         self.created_tasks: list[dict] = []
         self.comments: list[tuple[int, str]] = []
+        self.project_tasks: list[dict] = []
 
     def find_users(self, search: str) -> list[dict]:
         return [{'id': abs(hash(search)) % 10000 + 1, 'username': search}]
@@ -31,6 +33,9 @@ class DummyVikunjaClient:
         self.comments.append((task_id, comment))
         return {'id': len(self.comments), 'comment': comment}
 
+    def list_all_project_tasks(self, project_id: int) -> list[dict]:
+        return self.project_tasks
+
 
 def configure_vikunja(monkeypatch, client: DummyVikunjaClient):
     settings = get_settings()
@@ -38,6 +43,7 @@ def configure_vikunja(monkeypatch, client: DummyVikunjaClient):
     monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
     monkeypatch.setattr(settings, 'vikunja_project_id', None)
     monkeypatch.setattr(main_module, 'get_vikunja_client', lambda: client)
+    monkeypatch.setattr(vikunja_module, 'get_vikunja_client', lambda: client)
 
 
 def test_vikunja_status_requires_internal_token(client) -> None:
@@ -98,3 +104,37 @@ def test_vikunja_webhook_records_payload(client, db_session, monkeypatch) -> Non
     accepted = client.post('/vikunja/webhook', json={'event': 'task.updated'}, headers={'X-Vikunja-Secret': 'secret'})
     assert accepted.status_code == 200
     assert accepted.json()['ok'] is True
+
+
+def test_vikunja_reconcile_seeds_then_notifies_changes(client, db_session, monkeypatch) -> None:
+    dummy = DummyVikunjaClient()
+    configure_vikunja(monkeypatch, dummy)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+
+    sync = client.post('/internal/vikunja/sync-users', headers=internal_headers())
+    assert sync.status_code == 200
+    admin_mapping = db_session.query(VikunjaUserMapping).first()
+    assert admin_mapping is not None
+    dummy.project_tasks = [
+        {
+            'id': 501,
+            'title': 'Initial Vikunja task',
+            'done': False,
+            'due_date': None,
+            'updated': '2026-05-06T09:00:00+07:00',
+            'assignees': [{'id': admin_mapping.vikunja_user_id, 'username': 'admin'}],
+        }
+    ]
+
+    first = client.post('/internal/vikunja/reconcile', headers=internal_headers())
+    assert first.status_code == 200
+    assert first.json()['reconcile']['seeded'] == 1
+    assert db_session.query(NotificationEvent).count() == 0
+
+    dummy.project_tasks[0] = {**dummy.project_tasks[0], 'title': 'Updated Vikunja task', 'updated': '2026-05-06T09:05:00+07:00'}
+    second = client.post('/internal/vikunja/reconcile', headers=internal_headers())
+    assert second.status_code == 200
+    assert second.json()['reconcile']['changed'] == 1
+    event = db_session.query(NotificationEvent).filter(NotificationEvent.event_type == 'vikunja_task_updated').one()
+    assert event.payload['context']['vikunja_task_id'] == 501

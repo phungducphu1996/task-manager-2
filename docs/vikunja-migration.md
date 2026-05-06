@@ -222,6 +222,57 @@ X-Vikunja-Secret: $VIKUNJA_WEBHOOK_SECRET
 
 V1 records webhook payloads. Enforcement/reconciliation can be expanded after real Vikunja event payloads are observed.
 
+## 8.1. Realtime Notification Reconcile
+
+After tasks are migrated and `VIKUNJA_PROJECT_ID` is configured, seed the first Vikunja snapshot before enabling cron/webhooks. The first reconcile only stores baseline state and does not notify everyone.
+
+```bash
+TOKEN="$NOTIFY_INTERNAL_TOKEN"
+
+curl -s -X POST https://hazeleo.com/task-api/internal/vikunja/reconcile \
+  -H "X-Internal-Token: $TOKEN" | jq
+```
+
+Then add a VPS cron as a safety net. This catches task changes even if a Vikunja webhook is missed:
+
+```bash
+* * * * * curl -s -X POST https://hazeleo.com/task-api/internal/vikunja/reconcile -H "X-Internal-Token: $NOTIFY_INTERNAL_TOKEN" >/dev/null 2>&1
+```
+
+## 8.2. Zalo Bot Task Source
+
+When `VIKUNJA_API_URL`, `VIKUNJA_API_TOKEN`, and `VIKUNJA_PROJECT_ID` are configured, the Zalo bot task tools use the new Task Manager source for:
+
+- `find_tasks`
+- `list_tasks`
+- `create_task`
+- `approve_task`
+- `update_task_status`
+- `update_task_fields`
+
+Legacy task tables remain as fallback only when the new Task Manager env is not configured.
+
+Status changes need bucket IDs in `/opt/task-manager/backend/.env`; otherwise the bot will refuse the status update instead of claiming success:
+
+```bash
+VIKUNJA_BUCKET_INBOX_ID=
+VIKUNJA_BUCKET_TODO_ID=
+VIKUNJA_BUCKET_DOING_ID=
+VIKUNJA_BUCKET_REVIEW_ID=
+VIKUNJA_BUCKET_READY_ID=
+VIKUNJA_BUCKET_DONE_ID=
+```
+
+Realtime notification rules currently handled by reconcile/webhook:
+
+- new assignee on an existing Vikunja task -> notify the new assignee
+- status changes to `review` -> notify admins
+- `review -> ready` -> notify assignees
+- status changes to `done` -> notify admins
+- title/due date changes -> notify assignees
+
+Daily morning/evening notification jobs and Reminder Engine daily summaries read from Vikunja when `VIKUNJA_API_URL`, `VIKUNJA_API_TOKEN`, and `VIKUNJA_PROJECT_ID` are configured. If Vikunja API fails, they fall back to legacy task tables.
+
 ## 9. Cutover Later
 
 After staging smoke test and migration verification:

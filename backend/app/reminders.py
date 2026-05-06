@@ -29,7 +29,14 @@ from .models import (
     TaskStatus,
     User,
 )
-from .notifications import NotificationSpec, dispatch_due_notification_events, enqueue_notification_event
+from .notifications import (
+    DailyTaskSnapshot,
+    NotificationSpec,
+    _fetch_vikunja_daily_snapshots,
+    _snapshot_is_due_today_or_overdue,
+    dispatch_due_notification_events,
+    enqueue_notification_event,
+)
 
 settings = get_settings()
 
@@ -232,18 +239,36 @@ def _task_line(task: Task) -> str:
     return f'• #{task.id} {task.title} — {assignee} — {task.status.value} — {due}'
 
 
+def _snapshot_line(task: DailyTaskSnapshot) -> str:
+    assignee = ', '.join(task.assignee_names) or 'Unassigned'
+    due = task.due_date.strftime('%d/%m') if task.due_date else 'no due'
+    return f'• #{task.id} {task.title} — {assignee} — {task.status} — {due}'
+
+
 def _render_group_digest(db: Session, *, now: datetime, rule: ReminderRule) -> str:
     today = now.date()
-    today_tasks = _tasks_today(db, today=today)
-    overdue_tasks = _tasks_overdue(db, today=today)
-    review_tasks = _pending_review_tasks(db)
     users = _active_users(db)
+    snapshots = _fetch_vikunja_daily_snapshots(db)
 
     workload: list[str] = []
-    for user in users:
-        count = len(_tasks_for_user_today(db, user=user, today=today))
-        if count:
-            workload.append(f'• {user.name}: {count} task')
+    if snapshots is not None:
+        today_tasks = [task for task in snapshots if not task.done and task.due_date == today]
+        overdue_tasks = [task for task in snapshots if not task.done and task.due_date is not None and task.due_date < today]
+        review_tasks = [task for task in snapshots if not task.done and task.status == TaskStatus.review.value]
+        for user in users:
+            count = len([task for task in snapshots if user.id in task.assignee_user_ids and _snapshot_is_due_today_or_overdue(task, today)])
+            if count:
+                workload.append(f'• {user.name}: {count} task')
+        overdue_lines = [_snapshot_line(task) for task in overdue_tasks[:5]]
+    else:
+        today_tasks = _tasks_today(db, today=today)
+        overdue_tasks = _tasks_overdue(db, today=today)
+        review_tasks = _pending_review_tasks(db)
+        for user in users:
+            count = len(_tasks_for_user_today(db, user=user, today=today))
+            if count:
+                workload.append(f'• {user.name}: {count} task')
+        overdue_lines = [_task_line(task) for task in overdue_tasks[:5]]
 
     group_prompt = ''
     if rule.target_channel == NotificationChannel.group and rule.target_id:
@@ -260,19 +285,27 @@ def _render_group_digest(db: Session, *, now: datetime, rule: ReminderRule) -> s
         lines.extend(workload[:8])
     if overdue_tasks:
         lines.append('\nQuá hạn cần để ý:')
-        lines.extend(_task_line(task) for task in overdue_tasks[:5])
+        lines.extend(overdue_lines)
     if group_prompt:
         lines.append('\nTone note: đã dùng style group.')
     return '\n'.join(lines)
 
 
 def _render_member_checkin(db: Session, *, user: User, now: datetime) -> str:
-    tasks = _tasks_for_user_today(db, user=user, today=now.date())
+    today = now.date()
+    snapshots = _fetch_vikunja_daily_snapshots(db)
+    if snapshots is not None:
+        tasks = [task for task in snapshots if user.id in task.assignee_user_ids and _snapshot_is_due_today_or_overdue(task, today)]
+        task_lines = [_snapshot_line(task) for task in tasks[:10]]
+    else:
+        legacy_tasks = _tasks_for_user_today(db, user=user, today=today)
+        task_lines = [_task_line(task) for task in legacy_tasks[:10]]
+        tasks = legacy_tasks
     custom = contact_prompt_text_for_user(user)
     lines = [f'Chào {user.name} 👋', 'Hôm nay mình check-in nhẹ nha.']
     if tasks:
         lines.append('\nTask của bạn:')
-        lines.extend(_task_line(task) for task in tasks[:10])
+        lines.extend(task_lines)
     else:
         lines.append('\nHiện chưa thấy task due hôm nay/quá hạn của bạn.')
     lines.append('\nReply "ok", "đang làm", hoặc nếu bị kẹt thì nói em biết để báo admin nha.')
@@ -296,9 +329,17 @@ def _render_task_nudge(rule: ReminderRule) -> str:
 
 def _strategy_fallback(db: Session, *, now: datetime) -> str:
     today = now.date()
-    today_tasks = _tasks_today(db, today=today)
-    overdue_tasks = _tasks_overdue(db, today=today)
-    review_tasks = _pending_review_tasks(db)
+    snapshots = _fetch_vikunja_daily_snapshots(db)
+    if snapshots is not None:
+        today_tasks = [task for task in snapshots if not task.done and task.due_date == today]
+        overdue_tasks = [task for task in snapshots if not task.done and task.due_date is not None and task.due_date < today]
+        review_tasks = [task for task in snapshots if not task.done and task.status == TaskStatus.review.value]
+        overdue_lines = [_snapshot_line(task) for task in overdue_tasks[:5]]
+    else:
+        today_tasks = _tasks_today(db, today=today)
+        overdue_tasks = _tasks_overdue(db, today=today)
+        review_tasks = _pending_review_tasks(db)
+        overdue_lines = [_task_line(task) for task in overdue_tasks[:5]]
     lines = [
         'Gợi ý hướng làm hôm nay:',
         f'• Ưu tiên xử lý {len(overdue_tasks)} task quá hạn trước.',
@@ -307,7 +348,7 @@ def _strategy_fallback(db: Session, *, now: datetime) -> str:
     ]
     if overdue_tasks:
         lines.append('\nTop overdue:')
-        lines.extend(_task_line(task) for task in overdue_tasks[:5])
+        lines.extend(overdue_lines)
     return '\n'.join(lines)
 
 
@@ -317,11 +358,23 @@ def _render_daily_strategy(db: Session, *, now: datetime) -> str:
         return fallback
 
     today = now.date()
+    snapshots = _fetch_vikunja_daily_snapshots(db)
+    if snapshots is not None:
+        today_tasks = [_snapshot_line(task) for task in snapshots if not task.done and task.due_date == today]
+        overdue_tasks = [
+            _snapshot_line(task) for task in snapshots if not task.done and task.due_date is not None and task.due_date < today
+        ]
+        review_tasks = [_snapshot_line(task) for task in snapshots if not task.done and task.status == TaskStatus.review.value]
+    else:
+        today_tasks = [_task_line(task) for task in _tasks_today(db, today=today)]
+        overdue_tasks = [_task_line(task) for task in _tasks_overdue(db, today=today)]
+        review_tasks = [_task_line(task) for task in _pending_review_tasks(db)]
     context = {
         'today': today.isoformat(),
-        'today_tasks': [_task_line(task) for task in _tasks_today(db, today=today)[:12]],
-        'overdue_tasks': [_task_line(task) for task in _tasks_overdue(db, today=today)[:12]],
-        'review_tasks': [_task_line(task) for task in _pending_review_tasks(db)[:12]],
+        'task_source': 'vikunja' if snapshots is not None else 'legacy',
+        'today_tasks': today_tasks[:12],
+        'overdue_tasks': overdue_tasks[:12],
+        'review_tasks': review_tasks[:12],
     }
     prompt = (
         'Bạn là Hazel Office Bot. Dựa vào context task thật, gợi ý chiến lược làm việc hôm nay. '
