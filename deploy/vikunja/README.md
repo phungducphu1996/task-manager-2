@@ -60,7 +60,17 @@ Paste `deploy/vikunja/nginx-location.conf` into the existing `server { ... }` bl
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 curl -I https://hazeleo.com/hazeleo-assets/hazeleo-logo.png
+curl -I https://hazeleo.com/favicon.ico
 curl -I https://hazeleo.com/vikunja/
+```
+
+If Hazeleo is proxied at the root domain with `location /`, add the same `/hazeleo-assets/` and `/favicon.ico` locations above `location /`. To hide remaining UI copy such as `Powered by Vikunja` without a custom frontend build, add these lines inside the root proxy location:
+
+```nginx
+proxy_set_header Accept-Encoding "";
+sub_filter_once off;
+sub_filter_types text/html text/css application/javascript application/json;
+sub_filter 'Vikunja' 'Hazeleo';
 ```
 
 ## 4. Initial Hazeleo Setup

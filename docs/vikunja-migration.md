@@ -84,6 +84,7 @@ Then reload nginx:
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 curl -I https://hazeleo.com/hazeleo-assets/hazeleo-logo.png
+curl -I https://hazeleo.com/favicon.ico
 curl -I https://hazeleo.com/vikunja/
 ```
 
