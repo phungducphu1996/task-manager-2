@@ -708,6 +708,7 @@ def test_zalo_find_tasks_uses_task_manager_bridge(client, db_session, monkeypatc
     monkeypatch.setattr(settings, 'vikunja_api_url', 'https://tasks.local')
     monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
     monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    monkeypatch.setattr(settings, 'vikunja_bucket_doing_id', 26)
     monkeypatch.setattr(settings, 'vikunja_task_url_template', 'https://hazeleo.com/tasks/{task_id}')
     db_session.add(
         VikunjaUserMapping(
@@ -732,12 +733,19 @@ def test_zalo_find_tasks_uses_task_manager_bridge(client, db_session, monkeypatc
                     'project_id': 9,
                     'title': 'Update video mockup Mario Collection Gen AI',
                     'done': False,
-                    'bucket_id': None,
                     'priority': 4,
                     'due_date': '2026-05-06T23:59:00+07:00',
                     'assignees': [{'id': 42, 'username': quang['username']}],
                 }
             ]
+
+        def list_project_views(self, project_id: int):
+            return [{'id': 36, 'view_kind': 'kanban'}]
+
+        def list_all_view_tasks(self, project_id: int, view_id: int, *, filter_query: str | None = None, **kwargs):
+            if filter_query == 'bucket_id = 26':
+                return [{'id': 73, 'bucket_id': 26, 'done': False}]
+            return []
 
     monkeypatch.setattr(zalo_commands, 'get_vikunja_client', lambda: FakeClient())
 
@@ -747,6 +755,7 @@ def test_zalo_find_tasks_uses_task_manager_bridge(client, db_session, monkeypatc
     assert result['ok'] is True
     assert result['count'] == 1
     assert result['task']['id'] == 73
+    assert result['task']['status'] == 'doing'
     assert result['task']['assigned_to'] == quang['id']
     assert result['task_url'] == 'https://hazeleo.com/tasks/73'
 
@@ -774,6 +783,12 @@ def test_zalo_update_task_fields_uses_task_manager_bridge(client, db_session, mo
     updates_seen: dict = {}
 
     class FakeClient:
+        def list_project_views(self, project_id: int):
+            return []
+
+        def list_all_view_tasks(self, project_id: int, view_id: int, *, filter_query: str | None = None, **kwargs):
+            return []
+
         def get_task(self, task_id: int):
             assert task_id == 73
             return {

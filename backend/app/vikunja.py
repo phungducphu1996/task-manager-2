@@ -134,6 +134,50 @@ class VikunjaClient:
                 break
         return tasks
 
+    def list_project_views(self, project_id: int) -> list[dict[str, Any]]:
+        data = self.request('GET', f'/projects/{project_id}/views')
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get('data'), list):
+            return data['data']
+        return []
+
+    def list_view_tasks(
+        self,
+        project_id: int,
+        view_id: int,
+        *,
+        page: int = 1,
+        per_page: int = 100,
+        filter_query: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {'page': page, 'per_page': per_page}
+        if filter_query:
+            params['filter'] = filter_query
+        data = self.request('GET', f'/projects/{project_id}/views/{view_id}/tasks', params=params)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get('data'), list):
+            return data['data']
+        return []
+
+    def list_all_view_tasks(
+        self,
+        project_id: int,
+        view_id: int,
+        *,
+        filter_query: str | None = None,
+        per_page: int = 100,
+        max_pages: int = 50,
+    ) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            batch = self.list_view_tasks(project_id, view_id, page=page, per_page=per_page, filter_query=filter_query)
+            tasks.extend(batch)
+            if len(batch) < per_page:
+                break
+        return tasks
+
     def get_task(self, task_id: int) -> dict[str, Any]:
         return self.request('GET', f'/tasks/{task_id}')
 
@@ -360,14 +404,86 @@ def _vikunja_task_url(task_id: int | None) -> str | None:
     return f'{base_url}/tasks/{task_id}'
 
 
-def _status_from_vikunja_task(task: dict[str, Any]) -> str:
+def _task_id_from_payload(task: dict[str, Any]) -> int | None:
+    try:
+        return int(task.get('id'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _status_for_bucket_id(bucket_id: Any) -> str | None:
+    try:
+        normalized_bucket_id = int(bucket_id)
+    except (TypeError, ValueError):
+        return None
+
+    # Prefer workflow states over the inbox alias when multiple statuses share one bucket.
+    for status_value in ('review', 'ready', 'doing', 'done', 'todo', 'inbox'):
+        if settings.vikunja_status_bucket_map.get(status_value) == normalized_bucket_id:
+            return status_value
+    return None
+
+
+def vikunja_task_status_from_payload(task: dict[str, Any], task_status_map: dict[int, str] | None = None) -> str:
     if bool(task.get('done')):
         return TaskStatus.done.value
+    task_id = _task_id_from_payload(task)
+    if task_id is not None and task_status_map and task_status_map.get(task_id):
+        return task_status_map[task_id]
     bucket_id = task.get('bucket_id')
-    reverse = {bucket_id: status for status, bucket_id in settings.vikunja_status_bucket_map.items()}
-    if bucket_id in reverse:
-        return reverse[bucket_id]
+    bucket_status = _status_for_bucket_id(bucket_id)
+    if bucket_status:
+        return bucket_status
     return TaskStatus.todo.value
+
+
+def _kanban_view_id(client: VikunjaClient, project_id: int) -> int | None:
+    for view in client.list_project_views(project_id):
+        if str(view.get('view_kind') or '').casefold() == 'kanban':
+            try:
+                return int(view.get('id'))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def build_vikunja_task_status_map(client: VikunjaClient, project_id: int) -> dict[int, str]:
+    """Map task ids to Kanban bucket statuses.
+
+    The project task endpoint can omit bucket_id, which makes open tasks look like
+    todo. Reading tasks through the Kanban view gives us the current bucket.
+    """
+    try:
+        view_id = _kanban_view_id(client, project_id)
+    except Exception:
+        return {}
+    if not view_id:
+        return {}
+
+    status_by_task_id: dict[int, str] = {}
+
+    try:
+        for task in client.list_all_view_tasks(project_id, view_id):
+            task_id = _task_id_from_payload(task)
+            status_value = _status_for_bucket_id(task.get('bucket_id'))
+            if task_id is not None and status_value:
+                status_by_task_id[task_id] = status_value
+    except Exception:
+        pass
+
+    for status_value, bucket_id in settings.vikunja_status_bucket_map.items():
+        if status_value == 'inbox':
+            continue
+        try:
+            bucket_tasks = client.list_all_view_tasks(project_id, view_id, filter_query=f'bucket_id = {int(bucket_id)}')
+        except Exception:
+            continue
+        for task in bucket_tasks:
+            task_id = _task_id_from_payload(task)
+            if task_id is not None:
+                status_by_task_id[task_id] = status_value
+
+    return status_by_task_id
 
 
 def _snapshot_assignees(db: Session, task: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -396,7 +512,12 @@ def _snapshot_assignees(db: Session, task: dict[str, Any]) -> tuple[list[str], l
     return social_ids, names
 
 
-def _snapshot_from_task(db: Session, task: dict[str, Any]) -> VikunjaTaskSnapshot | None:
+def _snapshot_from_task(
+    db: Session,
+    task: dict[str, Any],
+    *,
+    task_status_map: dict[int, str] | None = None,
+) -> VikunjaTaskSnapshot | None:
     try:
         task_id = int(task.get('id'))
     except (TypeError, ValueError):
@@ -409,7 +530,7 @@ def _snapshot_from_task(db: Session, task: dict[str, Any]) -> VikunjaTaskSnapsho
     return VikunjaTaskSnapshot(
         id=task_id,
         title=str(task.get('title') or f'Task #{task_id}'),
-        status=_status_from_vikunja_task(task),
+        status=vikunja_task_status_from_payload(task, task_status_map),
         done=bool(task.get('done')),
         due_date=str(due_date) if due_date else None,
         updated=str(updated) if updated else None,
@@ -821,10 +942,11 @@ def reconcile_vikunja_bridge(db: Session) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='VIKUNJA_PROJECT_ID must be configured before reconciling Vikunja tasks.',
-        )
+    )
     client = get_vikunja_client()
     raw_tasks = client.list_all_project_tasks(settings.vikunja_project_id)
-    snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task))]
+    task_status_map = build_vikunja_task_status_map(client, settings.vikunja_project_id)
+    snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task, task_status_map=task_status_map))]
     stats = _reconcile_snapshots(db, snapshots=snapshots, reason='poll_reconcile')
     return {**vikunja_bridge_summary(db), 'reconcile': stats}
 
@@ -838,7 +960,8 @@ def handle_vikunja_webhook(db: Session, payload: dict[str, Any]) -> dict[str, An
     try:
         client = get_vikunja_client()
         raw_tasks = client.list_all_project_tasks(settings.vikunja_project_id)
-        snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task))]
+        task_status_map = build_vikunja_task_status_map(client, settings.vikunja_project_id)
+        snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task, task_status_map=task_status_map))]
         stats = _reconcile_snapshots(db, snapshots=snapshots, reason='webhook')
     except Exception as exc:
         _set_state(db, 'last_webhook_error', {'received_at': _now().isoformat(), 'error': str(exc), 'payload': payload})

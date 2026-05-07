@@ -29,7 +29,7 @@ from .models import (
     User,
     VikunjaUserMapping,
 )
-from .vikunja import get_vikunja_client
+from .vikunja import build_vikunja_task_status_map, get_vikunja_client, vikunja_task_status_from_payload
 
 logger = getLogger(__name__)
 settings = get_settings()
@@ -419,14 +419,8 @@ def _parse_vikunja_date(value: Any) -> date | None:
     return parsed.date() if parsed else None
 
 
-def _vikunja_status_from_task(task: dict[str, Any]) -> str:
-    if bool(task.get('done')):
-        return TaskStatus.done.value
-    bucket_id = task.get('bucket_id')
-    reverse_bucket_map = {bucket_id: status for status, bucket_id in settings.vikunja_status_bucket_map.items()}
-    if bucket_id in reverse_bucket_map:
-        return reverse_bucket_map[bucket_id]
-    return TaskStatus.todo.value
+def _vikunja_status_from_task(task: dict[str, Any], task_status_map: dict[int, str] | None = None) -> str:
+    return vikunja_task_status_from_payload(task, task_status_map)
 
 
 def _vikunja_assignees(db: Session, task: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -460,7 +454,9 @@ def _fetch_vikunja_daily_snapshots(db: Session) -> list[DailyTaskSnapshot] | Non
         return None
 
     try:
-        tasks = get_vikunja_client().list_all_project_tasks(settings.vikunja_project_id)
+        client = get_vikunja_client()
+        tasks = client.list_all_project_tasks(settings.vikunja_project_id)
+        task_status_map = build_vikunja_task_status_map(client, settings.vikunja_project_id)
     except Exception as exc:
         logger.warning('Falling back to legacy daily notifications because Vikunja task fetch failed: %s', exc)
         return None
@@ -478,7 +474,7 @@ def _fetch_vikunja_daily_snapshots(db: Session) -> list[DailyTaskSnapshot] | Non
             DailyTaskSnapshot(
                 id=task_id,
                 title=str(task.get('title') or f'Task #{task_id}'),
-                status=_vikunja_status_from_task(task),
+                status=_vikunja_status_from_task(task, task_status_map),
                 done=bool(task.get('done')),
                 due_date=_parse_vikunja_date(task.get('due_date')),
                 updated_at=_parse_vikunja_datetime(task.get('updated')),

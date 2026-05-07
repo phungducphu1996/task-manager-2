@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.config import get_settings
-from app.models import NotificationEvent, Task, TaskStatus, VikunjaTaskMapping, VikunjaUserMapping
+from app.models import NotificationEvent, Task, TaskStatus, VikunjaBridgeState, VikunjaTaskMapping, VikunjaUserMapping
 import app.main as main_module
 import app.vikunja as vikunja_module
 
@@ -16,6 +16,8 @@ class DummyVikunjaClient:
         self.created_tasks: list[dict] = []
         self.comments: list[tuple[int, str]] = []
         self.project_tasks: list[dict] = []
+        self.project_views: list[dict] = []
+        self.view_tasks_by_filter: dict[str | None, list[dict]] = {}
 
     def find_users(self, search: str) -> list[dict]:
         return [{'id': abs(hash(search)) % 10000 + 1, 'username': search}]
@@ -35,6 +37,12 @@ class DummyVikunjaClient:
 
     def list_all_project_tasks(self, project_id: int) -> list[dict]:
         return self.project_tasks
+
+    def list_project_views(self, project_id: int) -> list[dict]:
+        return self.project_views
+
+    def list_all_view_tasks(self, project_id: int, view_id: int, *, filter_query: str | None = None, **kwargs) -> list[dict]:
+        return self.view_tasks_by_filter.get(filter_query, [])
 
 
 def configure_vikunja(monkeypatch, client: DummyVikunjaClient):
@@ -138,3 +146,32 @@ def test_vikunja_reconcile_seeds_then_notifies_changes(client, db_session, monke
     assert second.json()['reconcile']['changed'] == 1
     event = db_session.query(NotificationEvent).filter(NotificationEvent.event_type == 'vikunja_task_updated').one()
     assert event.payload['context']['vikunja_task_id'] == 501
+
+
+def test_vikunja_reconcile_uses_kanban_bucket_for_status(client, db_session, monkeypatch) -> None:
+    dummy = DummyVikunjaClient()
+    configure_vikunja(monkeypatch, dummy)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    monkeypatch.setattr(settings, 'vikunja_bucket_doing_id', 26)
+    dummy.project_views = [{'id': 36, 'view_kind': 'kanban'}]
+    dummy.project_tasks = [
+        {
+            'id': 601,
+            'title': 'Doing without bucket id in task payload',
+            'done': False,
+            'due_date': None,
+            'updated': '2026-05-06T09:00:00+07:00',
+            'assignees': [],
+        }
+    ]
+    dummy.view_tasks_by_filter = {
+        'bucket_id = 26': [{'id': 601, 'bucket_id': 26, 'done': False}],
+    }
+
+    response = client.post('/internal/vikunja/reconcile', headers=internal_headers())
+
+    assert response.status_code == 200
+    state = db_session.get(VikunjaBridgeState, 'vikunja_task:601')
+    assert state is not None
+    assert state.value['status'] == 'doing'

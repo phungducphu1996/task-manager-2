@@ -67,7 +67,13 @@ from .reminders import (
 )
 from .schemas import ZaloIncomingRequest
 from .services import get_task_or_404, list_tasks, local_today, next_list_order
-from .vikunja import VikunjaConfigError, ensure_vikunja_project, get_vikunja_client
+from .vikunja import (
+    VikunjaConfigError,
+    build_vikunja_task_status_map,
+    ensure_vikunja_project,
+    get_vikunja_client,
+    vikunja_task_status_from_payload,
+)
 
 settings = get_settings()
 T = TypeVar('T')
@@ -1106,14 +1112,8 @@ def _date_from_vikunja(value: Any) -> date | None:
         return None
 
 
-def _status_from_vikunja_payload(task: dict[str, Any]) -> str:
-    if bool(task.get('done')):
-        return TaskStatus.done.value
-    bucket_id = task.get('bucket_id')
-    reverse = {bucket_id: status for status, bucket_id in settings.vikunja_status_bucket_map.items()}
-    if bucket_id in reverse:
-        return reverse[bucket_id]
-    return TaskStatus.todo.value
+def _status_from_vikunja_payload(task: dict[str, Any], task_status_map: dict[int, str] | None = None) -> str:
+    return vikunja_task_status_from_payload(task, task_status_map)
 
 
 def _vikunja_assignee_social_ids(db: Session, task: dict[str, Any]) -> list[str]:
@@ -1159,7 +1159,12 @@ def _vikunja_assignee_names(db: Session, task: dict[str, Any]) -> list[str]:
     return names
 
 
-def _tool_vikunja_task_payload(db: Session, task: dict[str, Any]) -> dict[str, Any]:
+def _tool_vikunja_task_payload(
+    db: Session,
+    task: dict[str, Any],
+    *,
+    task_status_map: dict[int, str] | None = None,
+) -> dict[str, Any]:
     task_id = int(task.get('id'))
     due_date = _date_from_vikunja(task.get('due_date'))
     assignee_names = _vikunja_assignee_names(db, task)
@@ -1171,7 +1176,7 @@ def _tool_vikunja_task_payload(db: Session, task: dict[str, Any]) -> dict[str, A
     return {
         'id': task_id,
         'title': str(task.get('title') or f'Task #{task_id}'),
-        'status': _status_from_vikunja_payload(task),
+        'status': _status_from_vikunja_payload(task, task_status_map),
         'assignee': ', '.join(assignee_names) if assignee_names else None,
         'assigned_to': assignee_social_ids[0] if assignee_social_ids else None,
         'due_date': due_date.isoformat() if due_date else None,
@@ -1284,6 +1289,7 @@ def _tool_find_vikunja_tasks(db: Session, *, actor: User, query: str, status_tok
     else:
         candidates = client.list_all_project_tasks(project_id)
 
+    task_status_map = build_vikunja_task_status_map(client, project_id)
     normalized = _normalize_lookup(normalized_query)
     matched_user_ids = {user.id for user in _matching_users_for_token(db, normalized_query)}
     tasks: list[dict[str, Any]] = []
@@ -1296,7 +1302,7 @@ def _tool_find_vikunja_tasks(db: Session, *, actor: User, query: str, status_tok
         if not _actor_can_access_vikunja_task(db, actor=actor, task=task):
             continue
 
-        payload = _tool_vikunja_task_payload(db, task)
+        payload = _tool_vikunja_task_payload(db, task, task_status_map=task_status_map)
         if status_token and payload['status'] != status_token:
             continue
 
@@ -1330,13 +1336,14 @@ def _tool_list_vikunja_tasks(db: Session, *, actor: User, view: str) -> dict[str
     normalized_view = view if view in {'today', 'inbox', 'review', 'logbook'} else 'today'
     today = _today()
     tasks: list[dict[str, Any]] = []
+    task_status_map = build_vikunja_task_status_map(client, project_id)
 
     for task in client.list_all_project_tasks(project_id):
         if not isinstance(task, dict) or task.get('id') is None:
             continue
         if not _actor_can_access_vikunja_task(db, actor=actor, task=task):
             continue
-        payload = _tool_vikunja_task_payload(db, task)
+        payload = _tool_vikunja_task_payload(db, task, task_status_map=task_status_map)
         due_date = date.fromisoformat(payload['due_date']) if payload.get('due_date') else None
         is_done = payload['status'] == TaskStatus.done.value
 
@@ -1420,7 +1427,8 @@ def _tool_create_vikunja_task(
         payload['description'] = 'Task metadata:\n' + '\n'.join(f'- {item}' for item in metadata)
 
     task = get_vikunja_client().create_task(project_id, payload)
-    task_payload = _tool_vikunja_task_payload(db, task)
+    task_status_map = build_vikunja_task_status_map(get_vikunja_client(), project_id)
+    task_payload = _tool_vikunja_task_payload(db, task, task_status_map=task_status_map)
     if assignee_user and not task_payload.get('assignee'):
         task_payload['assignee'] = assignee_user.name
         task_payload['assigned_to'] = assignee_user.id
@@ -1434,7 +1442,8 @@ def _tool_update_vikunja_task_status(db: Session, *, actor: User, task_id: int, 
     if not _actor_can_edit_vikunja_task(db, actor=actor, task=task):
         return {'ok': False, 'error': 'Members can only update their own tasks.'}
 
-    previous_status = _status_from_vikunja_payload(task)
+    task_status_map = build_vikunja_task_status_map(client, _vikunja_project_id(db))
+    previous_status = _status_from_vikunja_payload(task, task_status_map)
     if not _is_admin(actor):
         next_status = TaskStatus(status_token) if status_token in {status.value for status in TaskStatus} else None
         if next_status is None:
@@ -1449,10 +1458,12 @@ def _tool_update_vikunja_task_status(db: Session, *, actor: User, task_id: int, 
     if error:
         return {'ok': False, 'error': error}
     updated = client.update_task(resolved_task_id, updates or {})
+    task_payload = _tool_vikunja_task_payload(db, updated)
+    task_payload['status'] = status_token
     return _attach_task_format(
         {
             'ok': True,
-            'task': _tool_vikunja_task_payload(db, updated),
+            'task': task_payload,
             'previous_status': previous_status,
             'changed_fields': ['status'],
         }
@@ -1465,14 +1476,17 @@ def _tool_approve_vikunja_task(db: Session, *, actor: User, task_id: int) -> dic
     client = get_vikunja_client()
     resolved_task_id = _resolve_vikunja_task_id(db, task_id)
     task = client.get_task(resolved_task_id)
-    previous_status = _status_from_vikunja_payload(task)
+    task_status_map = build_vikunja_task_status_map(client, _vikunja_project_id(db))
+    previous_status = _status_from_vikunja_payload(task, task_status_map)
     if previous_status != TaskStatus.review.value:
         return {'ok': False, 'error': 'Only tasks in review can be approved to ready.'}
     updates, error = _vikunja_status_payload(TaskStatus.ready.value)
     if error:
         return {'ok': False, 'error': error}
     updated = client.update_task(resolved_task_id, updates or {})
-    return _attach_task_format({'ok': True, 'task': _tool_vikunja_task_payload(db, updated), 'previous_status': previous_status})
+    task_payload = _tool_vikunja_task_payload(db, updated)
+    task_payload['status'] = TaskStatus.ready.value
+    return _attach_task_format({'ok': True, 'task': task_payload, 'previous_status': previous_status})
 
 
 def _tool_update_vikunja_task_fields(
@@ -1490,7 +1504,8 @@ def _tool_update_vikunja_task_fields(
         return {'ok': False, 'error': 'Members can only edit their own tasks.'}
 
     updates: dict[str, Any] = {}
-    previous_status = _status_from_vikunja_payload(task)
+    task_status_map = build_vikunja_task_status_map(client, _vikunja_project_id(db))
+    previous_status = _status_from_vikunja_payload(task, task_status_map)
 
     if 'title' in arguments:
         title = str(arguments.get('title') or '').strip()
@@ -1576,10 +1591,13 @@ def _tool_update_vikunja_task_fields(
         return {'ok': False, 'error': 'Không có field nào để cập nhật.'}
 
     updated = client.update_task(resolved_task_id, updates)
+    task_payload = _tool_vikunja_task_payload(db, updated, task_status_map=task_status_map)
+    if 'status' in arguments and str(arguments.get('status') or '').strip():
+        task_payload['status'] = str(arguments.get('status') or '').strip()
     return _attach_task_format(
         {
             'ok': True,
-            'task': _tool_vikunja_task_payload(db, updated),
+            'task': task_payload,
             'previous_status': previous_status,
             'changed_fields': _format_vikunja_changed_fields(updates),
             'attachments_added': [],
