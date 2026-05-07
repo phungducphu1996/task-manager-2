@@ -17,7 +17,7 @@ need_jq() {
   fi
 }
 
-echo "== Vikunja UI =="
+echo "== Hazeleo UI =="
 curl -sI "${BASE_URL}/vikunja/" | sed -n '1,8p'
 
 echo "\n== Legacy Task app still alive =="
@@ -26,7 +26,7 @@ curl -sI "${BASE_URL}/task/" | sed -n '1,8p'
 echo "\n== Hazel Bridge health =="
 curl -s "${BASE_URL}/task-api/health" | need_jq
 
-echo "\n== Vikunja bridge status =="
+echo "\n== Hazeleo bridge status =="
 curl -s "${BASE_URL}/task-api/internal/vikunja/status" \
   -H "X-Internal-Token: ${TOKEN}" | need_jq
 

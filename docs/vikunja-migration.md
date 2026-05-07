@@ -1,12 +1,12 @@
-# Vikunja Migration Runbook
+# Hazeleo Migration Runbook
 
-This runbook migrates Hazel Task Manager toward Vikunja as the task UI/source-of-truth while keeping the existing FastAPI backend as the Hazel Bridge for Zalo bot, notifications, reminders, and legacy archive.
+This runbook migrates Hazel Task Manager toward Hazeleo as the task UI/source-of-truth while keeping the existing FastAPI backend as the Hazel Bridge for Zalo bot, notifications, reminders, and legacy archive.
 
-## Phase: Vikunja Staging On VPS
+## Phase: Hazeleo Staging On VPS
 
 Staging routes:
 
-- Vikunja UI/API: `https://hazeleo.com/vikunja/`
+- Hazeleo UI/API: `https://hazeleo.com/vikunja/`
 - Legacy Task Manager: `https://hazeleo.com/task/`
 - Hazel Bridge API: `https://hazeleo.com/task-api/`
 
@@ -24,7 +24,9 @@ On VPS, after pulling this repository into `/opt/task-manager`:
 
 ```bash
 sudo mkdir -p /opt/vikunja/files
+sudo mkdir -p /opt/vikunja/assets
 sudo chown -R 1000:1000 /opt/vikunja/files
+sudo cp /opt/task-manager/deploy/vikunja/assets/* /opt/vikunja/assets/
 sudo cp /opt/task-manager/deploy/vikunja/docker-compose.yml /opt/vikunja/docker-compose.yml
 sudo cp /opt/task-manager/deploy/vikunja/.env.example /opt/vikunja/.env
 sudo nano /opt/vikunja/.env
@@ -34,11 +36,25 @@ Fill Supabase Postgres values in `/opt/vikunja/.env`.
 
 Important:
 
-- Use a database/schema dedicated to Vikunja. If using one Supabase database, set `VIKUNJA_DATABASE_SCHEMA=vikunja` and create that schema first.
-- Do not use the legacy `teamtask_manager` schema for Vikunja migrations.
+- Use a database/schema dedicated to Hazeleo. If using one Supabase database, set `VIKUNJA_DATABASE_SCHEMA=vikunja` and create that schema first.
+- Do not use the legacy `teamtask_manager` schema for Hazeleo migrations.
 - Keep `VIKUNJA_SERVICE_PUBLICURL=https://hazeleo.com/vikunja/` with the trailing slash.
 
-## 2. Start Vikunja
+For an existing Hazeleo install, do not overwrite `/opt/vikunja/.env`. Copy only the assets, add the logo env vars if they are missing, reload nginx, then recreate the container:
+
+```bash
+sudo mkdir -p /opt/vikunja/assets
+sudo cp /opt/task-manager/deploy/vikunja/assets/* /opt/vikunja/assets/
+sudo sed -i '/^VIKUNJA_SERVICE_ALLOWICONCHANGES=/d;/^VIKUNJA_SERVICE_CUSTOMLOGOURL=/d;/^VIKUNJA_SERVICE_CUSTOMLOGOURLDARK=/d' /opt/vikunja/.env
+printf '%s\n' \
+  'VIKUNJA_SERVICE_ALLOWICONCHANGES=false' \
+  'VIKUNJA_SERVICE_CUSTOMLOGOURL=https://hazeleo.com/hazeleo-assets/hazeleo-logo.png' \
+  'VIKUNJA_SERVICE_CUSTOMLOGOURLDARK=https://hazeleo.com/hazeleo-assets/hazeleo-logo.png' \
+  | sudo tee -a /opt/vikunja/.env
+cd /opt/vikunja && sudo docker compose up -d
+```
+
+## 2. Start Hazeleo
 
 ```bash
 cd /opt/vikunja
@@ -67,12 +83,13 @@ Then reload nginx:
 
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
+curl -I https://hazeleo.com/hazeleo-assets/hazeleo-logo.png
 curl -I https://hazeleo.com/vikunja/
 ```
 
 Keep existing `/task/` and `/task-api/` locations unchanged.
 
-## 4. Initial Vikunja Setup
+## 4. Initial Hazeleo Setup
 
 Open:
 
@@ -94,7 +111,7 @@ shindang
 Create project:
 
 ```text
-Hazel Task Manager
+Hazeleo
 ```
 
 Create Kanban buckets:
@@ -117,7 +134,7 @@ cd /opt/vikunja && sudo docker compose up -d
 
 ## 5. Configure Hazel Bridge
 
-Create a Vikunja API token from the admin account.
+Create a Hazeleo API token from the admin account.
 
 Copy values from:
 
@@ -138,7 +155,7 @@ VIKUNJA_API_URL=https://hazeleo.com/vikunja
 VIKUNJA_API_TOKEN=replace-with-vikunja-api-token
 VIKUNJA_PUBLIC_URL=https://hazeleo.com/vikunja
 VIKUNJA_TASK_URL_TEMPLATE=https://hazeleo.com/vikunja/projects/{project_id}/tasks/{task_id}
-VIKUNJA_PROJECT_TITLE=Hazel Task Manager
+VIKUNJA_PROJECT_TITLE=Hazeleo
 VIKUNJA_PROJECT_ID=
 VIKUNJA_BUCKET_INBOX_ID=
 VIKUNJA_BUCKET_TODO_ID=
@@ -190,7 +207,7 @@ curl -s -X POST 'https://hazeleo.com/task-api/internal/vikunja/migrate-tasks?lim
   -H "X-Internal-Token: $TOKEN" | jq
 ```
 
-If the first tasks look right in Vikunja, run the full migration:
+If the first tasks look right in Hazeleo, run the full migration:
 
 ```bash
 curl -s -X POST 'https://hazeleo.com/task-api/internal/vikunja/migrate-tasks' \
@@ -208,7 +225,7 @@ Verify:
 
 ## 8. Webhook Later
 
-Point Vikunja webhook to:
+Point the Hazeleo webhook to:
 
 ```text
 https://hazeleo.com/task-api/vikunja/webhook
@@ -220,11 +237,11 @@ Header:
 X-Vikunja-Secret: $VIKUNJA_WEBHOOK_SECRET
 ```
 
-V1 records webhook payloads. Enforcement/reconciliation can be expanded after real Vikunja event payloads are observed.
+V1 records webhook payloads. Enforcement/reconciliation can be expanded after real Hazeleo event payloads are observed.
 
 ## 8.1. Realtime Notification Reconcile
 
-After tasks are migrated and `VIKUNJA_PROJECT_ID` is configured, seed the first Vikunja snapshot before enabling cron/webhooks. The first reconcile only stores baseline state and does not notify everyone.
+After tasks are migrated and `VIKUNJA_PROJECT_ID` is configured, seed the first Hazeleo snapshot before enabling cron/webhooks. The first reconcile only stores baseline state and does not notify everyone.
 
 ```bash
 TOKEN="$NOTIFY_INTERNAL_TOKEN"
@@ -233,7 +250,7 @@ curl -s -X POST https://hazeleo.com/task-api/internal/vikunja/reconcile \
   -H "X-Internal-Token: $TOKEN" | jq
 ```
 
-Then add a VPS cron as a safety net. This catches task changes even if a Vikunja webhook is missed:
+Then add a VPS cron as a safety net. This catches task changes even if a Hazeleo webhook is missed:
 
 ```bash
 * * * * * curl -s -X POST https://hazeleo.com/task-api/internal/vikunja/reconcile -H "X-Internal-Token: $NOTIFY_INTERNAL_TOKEN" >/dev/null 2>&1
@@ -265,20 +282,20 @@ VIKUNJA_BUCKET_DONE_ID=
 
 Realtime notification rules currently handled by reconcile/webhook:
 
-- new assignee on an existing Vikunja task -> notify the new assignee
+- new assignee on an existing Hazeleo task -> notify the new assignee
 - status changes to `review` -> notify admins
 - `review -> ready` -> notify assignees
 - status changes to `done` -> notify admins
 - title/due date changes -> notify assignees
 
-Daily morning/evening notification jobs and Reminder Engine daily summaries read from Vikunja when `VIKUNJA_API_URL`, `VIKUNJA_API_TOKEN`, and `VIKUNJA_PROJECT_ID` are configured. If Vikunja API fails, they fall back to legacy task tables.
+Daily morning/evening notification jobs and Reminder Engine daily summaries read from Hazeleo when `VIKUNJA_API_URL`, `VIKUNJA_API_TOKEN`, and `VIKUNJA_PROJECT_ID` are configured. If Hazeleo API fails, they fall back to legacy task tables.
 
 ## 9. Cutover Later
 
 After staging smoke test and migration verification:
 
 - move current app from `/task/` to `/task-legacy/`
-- route `/task/` to Vikunja
+- route `/task/` to Hazeleo
 - keep `/task-api/` as Hazel Bridge
 
 Rollback is nginx-only: point `/task/` back to legacy frontend and keep bridge running.
