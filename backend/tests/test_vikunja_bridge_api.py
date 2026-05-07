@@ -175,3 +175,40 @@ def test_vikunja_reconcile_uses_kanban_bucket_for_status(client, db_session, mon
     state = db_session.get(VikunjaBridgeState, 'vikunja_task:601')
     assert state is not None
     assert state.value['status'] == 'doing'
+
+
+def test_vikunja_reconcile_notifies_new_assigned_tasks_after_baseline(client, db_session, monkeypatch) -> None:
+    dummy = DummyVikunjaClient()
+    configure_vikunja(monkeypatch, dummy)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+
+    sync = client.post('/internal/vikunja/sync-users', headers=internal_headers())
+    assert sync.status_code == 200
+    mapping = db_session.query(VikunjaUserMapping).filter(VikunjaUserMapping.zalo_user_id.isnot(None)).first()
+    assert mapping is not None
+
+    dummy.project_tasks = []
+    first = client.post('/internal/vikunja/reconcile', headers=internal_headers())
+    assert first.status_code == 200
+    assert db_session.query(NotificationEvent).count() == 0
+
+    dummy.project_tasks = [
+        {
+            'id': 701,
+            'title': 'New assigned task',
+            'done': False,
+            'due_date': None,
+            'updated': '2026-05-06T10:00:00+07:00',
+            'assignees': [{'id': mapping.vikunja_user_id, 'username': mapping.username}],
+        }
+    ]
+
+    second = client.post('/internal/vikunja/reconcile', headers=internal_headers())
+
+    assert second.status_code == 200
+    assert second.json()['reconcile']['seeded'] == 1
+    assert second.json()['reconcile']['events_created'] == 1
+    event = db_session.query(NotificationEvent).filter(NotificationEvent.event_type == 'vikunja_task_assigned').one()
+    assert event.target_id == mapping.zalo_user_id
+    assert event.payload['context']['reason'] == 'created_assigned'

@@ -579,14 +579,11 @@ def _notify_vikunja_task_changes(
     from .models import NotificationChannel
     from .notifications import NotificationSpec, dispatch_due_notification_events, enqueue_notification_event
 
-    if previous is None:
-        return {'created': 0, 'deduped': 0}
-
-    changed = _changed_fields(previous, current)
+    changed = ['created'] if previous is None else _changed_fields(previous, current)
     if not changed:
         return {'created': 0, 'deduped': 0}
 
-    previous_status = str(previous.get('status') or '')
+    previous_status = str(previous.get('status') or '') if previous else ''
     local_task_id = _local_task_id_for_vikunja(db, current.id)
     event_suffix = current.updated or _now().isoformat()
     specs: list[NotificationSpec] = []
@@ -617,7 +614,7 @@ def _notify_vikunja_task_changes(
                 'id': current.id,
                 'title': current.title,
                 'status': current.status,
-                'previous_status': previous.get('status'),
+                'previous_status': previous.get('status') if previous else None,
                 'assignee': ', '.join(current.assignee_names) or None,
                 'due_date': current.due_date,
                 'url': current.url,
@@ -638,8 +635,32 @@ def _notify_vikunja_task_changes(
             return fallback
         return message[:1200] if message else fallback
 
-    new_assignees = set(current.assignee_social_ids) - set(previous.get('assignee_social_ids') or [])
-    if previous.get('id') and new_assignees:
+    if previous is None:
+        for social_user_id in current.assignee_social_ids:
+            user = _user_for_social_id(db, social_user_id)
+            fallback = f'{user.name if user else "Bạn"} ơi, bạn vừa được giao task mới:\n{task_line()}'
+            message = render_message(
+                event_type='task_created_assigned',
+                recipient=user,
+                fallback=fallback,
+                context={'reason': 'created_assigned', 'task_id': current.id},
+            )
+            specs.append(
+                NotificationSpec(
+                    event_key=f'vikunja:task:{current.id}:created-assigned:{social_user_id}:{event_suffix}',
+                    event_type='vikunja_task_assigned',
+                    channel=NotificationChannel.user,
+                    target_id=user.zalo_user_id if user else None,
+                    task_id=local_task_id,
+                    user_id=social_user_id,
+                    payload={
+                        'message': message,
+                        'context': {'source': 'vikunja_realtime', 'reason': 'created_assigned', 'vikunja_task_id': current.id},
+                    },
+                )
+            )
+    new_assignees = set(current.assignee_social_ids) - set(previous.get('assignee_social_ids') or []) if previous else set()
+    if previous and previous.get('id') and new_assignees:
         for social_user_id in new_assignees:
             user = _user_for_social_id(db, social_user_id)
             fallback = f'{user.name if user else "Bạn"} ơi, bạn vừa được assign task mới:\n{task_line()}'
@@ -892,6 +913,7 @@ def _reconcile_snapshots(
     *,
     snapshots: list[VikunjaTaskSnapshot],
     reason: str,
+    notify_new_tasks: bool = False,
 ) -> dict[str, Any]:
     seeded = 0
     changed = 0
@@ -905,6 +927,10 @@ def _reconcile_snapshots(
         previous = existing.value if existing and isinstance(existing.value, dict) else None
         if previous is None:
             seeded += 1
+            if notify_new_tasks:
+                stats = _notify_vikunja_task_changes(db, previous=None, current=snapshot, reason=reason)
+                events_created += int(stats.get('created') or 0)
+                events_deduped += int(stats.get('deduped') or 0)
         else:
             change_names = _changed_fields(previous, snapshot)
             if change_names:
@@ -947,7 +973,8 @@ def reconcile_vikunja_bridge(db: Session) -> dict[str, Any]:
     raw_tasks = client.list_all_project_tasks(settings.vikunja_project_id)
     task_status_map = build_vikunja_task_status_map(client, settings.vikunja_project_id)
     snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task, task_status_map=task_status_map))]
-    stats = _reconcile_snapshots(db, snapshots=snapshots, reason='poll_reconcile')
+    notify_new_tasks = _state(db, 'vikunja_reconcile') is not None
+    stats = _reconcile_snapshots(db, snapshots=snapshots, reason='poll_reconcile', notify_new_tasks=notify_new_tasks)
     return {**vikunja_bridge_summary(db), 'reconcile': stats}
 
 
@@ -962,7 +989,8 @@ def handle_vikunja_webhook(db: Session, payload: dict[str, Any]) -> dict[str, An
         raw_tasks = client.list_all_project_tasks(settings.vikunja_project_id)
         task_status_map = build_vikunja_task_status_map(client, settings.vikunja_project_id)
         snapshots = [snapshot for task in raw_tasks if (snapshot := _snapshot_from_task(db, task, task_status_map=task_status_map))]
-        stats = _reconcile_snapshots(db, snapshots=snapshots, reason='webhook')
+        notify_new_tasks = _state(db, 'vikunja_reconcile') is not None
+        stats = _reconcile_snapshots(db, snapshots=snapshots, reason='webhook', notify_new_tasks=notify_new_tasks)
     except Exception as exc:
         _set_state(db, 'last_webhook_error', {'received_at': _now().isoformat(), 'error': str(exc), 'payload': payload})
         db.commit()
