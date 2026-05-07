@@ -829,6 +829,60 @@ def test_zalo_update_task_fields_uses_task_manager_bridge(client, db_session, mo
     assert result['task']['assigned_to'] == quang['id']
 
 
+def test_zalo_update_task_status_moves_vikunja_kanban_bucket(client, db_session, monkeypatch) -> None:
+    admin, _, _ = _users(client)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_api_url', 'https://tasks.local')
+    monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    monkeypatch.setattr(settings, 'vikunja_bucket_todo_id', 25)
+    monkeypatch.setattr(settings, 'vikunja_bucket_review_id', 37)
+
+    calls: list[tuple[str, dict | tuple]] = []
+
+    class FakeClient:
+        def list_project_views(self, project_id: int):
+            assert project_id == 9
+            return [{'id': 36, 'view_kind': 'kanban'}]
+
+        def list_all_view_tasks(self, project_id: int, view_id: int, *, filter_query: str | None = None, **kwargs):
+            if filter_query == 'bucket_id = 25':
+                return [{'id': 73, 'bucket_id': 25, 'done': False}]
+            if filter_query == 'bucket_id = 37':
+                return [{'id': 73, 'bucket_id': 37, 'done': False}]
+            return []
+
+        def get_task(self, task_id: int):
+            assert task_id == 73
+            return {
+                'id': 73,
+                'project_id': 9,
+                'title': 'Update video mockup Mario Collection Gen AI',
+                'done': False,
+                'priority': 3,
+                'bucket_id': 37 if any(call[0] == 'move_task_to_bucket' for call in calls) else 25,
+                'assignees': [],
+            }
+
+        def update_task(self, task_id: int, payload: dict):
+            calls.append(('update_task', payload))
+            return self.get_task(task_id)
+
+        def move_task_to_bucket(self, project_id: int, view_id: int, task_id: int, bucket_id: int, *, done: bool | None = None):
+            calls.append(('move_task_to_bucket', (project_id, view_id, task_id, bucket_id, done)))
+            return {'task_id': task_id, 'bucket_id': bucket_id}
+
+    monkeypatch.setattr(zalo_commands, 'get_vikunja_client', lambda: FakeClient())
+
+    actor = db_session.get(User, admin['id'])
+    result = zalo_commands._tool_update_task_status(db_session, actor=actor, task_id=73, status_token='review')
+
+    assert result['ok'] is True
+    assert result['task']['status'] == 'review'
+    assert ('update_task', {'done': False}) in calls
+    assert ('move_task_to_bucket', (9, 36, 73, 37, False)) in calls
+
+
 def test_zalo_tool_agent_can_relay_message_to_user(client, monkeypatch) -> None:
     replies = _install_zalo_reply_stub(monkeypatch)
     admin, _, quang = _users(client)

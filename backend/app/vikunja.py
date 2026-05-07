@@ -187,6 +187,24 @@ class VikunjaClient:
     def update_task(self, task_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request('POST', f'/tasks/{task_id}', json=payload)
 
+    def move_task_to_bucket(
+        self,
+        project_id: int,
+        view_id: int,
+        task_id: int,
+        bucket_id: int,
+        *,
+        done: bool | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            'task_id': task_id,
+            'bucket_id': bucket_id,
+            'project_view_id': view_id,
+        }
+        if done is not None:
+            payload['task_done'] = bool(done)
+        return self.request('POST', f'/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks', json=payload)
+
     def create_task_comment(self, task_id: int, comment: str) -> dict[str, Any]:
         return self.request('PUT', f'/tasks/{task_id}/comments', json={'comment': comment})
 
@@ -445,6 +463,34 @@ def _kanban_view_id(client: VikunjaClient, project_id: int) -> int | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def get_vikunja_kanban_view_id(client: VikunjaClient, project_id: int) -> int:
+    view_id = _kanban_view_id(client, project_id)
+    if not view_id:
+        raise RuntimeError('Không tìm thấy Kanban view trong Task Manager mới.')
+    return view_id
+
+
+def move_vikunja_task_to_status(client: VikunjaClient, project_id: int, task_id: int, status_token: str) -> dict[str, Any]:
+    if status_token not in {status.value for status in TaskStatus}:
+        raise ValueError(f'Unknown status: {status_token}')
+
+    bucket_id = settings.vikunja_status_bucket_map.get(status_token)
+    if not bucket_id:
+        raise RuntimeError(f'Chưa cấu hình bucket cho status "{status_token}" trong Task Manager mới.')
+
+    view_id = get_vikunja_kanban_view_id(client, project_id)
+    desired_done = status_token == TaskStatus.done.value
+
+    # Vikunja 2.3 stores Kanban membership in task_buckets. Updating /tasks/{id}
+    # with bucket_id returns a nice-looking payload but does not move the card.
+    if not desired_done:
+        client.update_task(task_id, {'done': False})
+    client.move_task_to_bucket(project_id, view_id, task_id, int(bucket_id), done=desired_done)
+    if desired_done:
+        client.update_task(task_id, {'done': True})
+    return client.get_task(task_id)
 
 
 def build_vikunja_task_status_map(client: VikunjaClient, project_id: int) -> dict[int, str]:
