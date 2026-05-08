@@ -254,6 +254,30 @@ def test_admin_notification_test_endpoint_sends_zalo(client, monkeypatch) -> Non
     ]
 
 
+def test_admin_notification_prompt_can_be_updated(client) -> None:
+    users = client.get('/users').json()
+    admin, member, _ = select_users(users)
+
+    forbidden = client.put(
+        '/admin/notifications/prompt',
+        json={'content': '# Nope'},
+        headers=actor_headers(member['id']),
+    )
+    assert forbidden.status_code == 403
+
+    updated = client.put(
+        '/admin/notifications/prompt',
+        json={'content': '# Notify Voice\nNói cực gọn và vui.'},
+        headers=actor_headers(admin['id']),
+    )
+    assert updated.status_code == 200
+    assert updated.json()['bytes'] > 0
+
+    loaded = client.get('/admin/notifications/prompt', headers=actor_headers(admin['id']))
+    assert loaded.status_code == 200
+    assert 'Nói cực gọn và vui.' in loaded.json()['content']
+
+
 def test_morning_job_builds_group_admin_and_user_messages(client, db_session, monkeypatch) -> None:
     install_worker_success_stub(monkeypatch)
     settings = get_settings()

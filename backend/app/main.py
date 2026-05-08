@@ -132,6 +132,10 @@ class AdminNotificationTestRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
     context: dict[str, Any] = Field(default_factory=dict)
 
+
+class AdminNotificationPromptUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -407,6 +411,22 @@ def _admin_notifications_ui_html() -> str:
     </div>
 
     <div class="card wide">
+      <h2>Cron / Reminder runs</h2>
+      <p>Nhìn nhanh cron app-level có tạo run/reconcile đều không. Cron hệ thống vẫn nằm ở VPS crontab, còn đây là dấu vết backend nhận được.</p>
+      <div id="runs"></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Notification prompt</h2>
+      <p>Prompt này dùng cho LLM render thông báo Zalo. Sửa xong bấm Save, không cần restart backend.</p>
+      <textarea id="notificationPrompt" style="min-height: 260px"></textarea>
+      <div class="actions">
+        <button onclick="savePrompt()">Save prompt</button>
+        <button class="secondary" onclick="loadPrompt()">Reload prompt</button>
+      </div>
+    </div>
+
+    <div class="card wide">
       <h2>Result</h2>
       <pre id="result">Sẵn sàng rồi anh.</pre>
     </div>
@@ -513,6 +533,29 @@ function renderRules(rules) {
     </tr>`).join('')
   }</tbody></table>`;
 }
+function renderRuns(status) {
+  const runs = status.latest_reminder_runs || [];
+  const interactions = status.latest_reminder_interactions || [];
+  const runRows = runs.map(run => `<tr>
+    <td>#${run.id}<br><span class="mini">rule #${run.rule_id}</span></td>
+    <td>${escapeHtml(run.rule_name || '')}<br><span class="mini">${escapeHtml(run.rule_type || '')}</span></td>
+    <td>${escapeHtml(run.status || '')}</td>
+    <td><span class="mono">${escapeHtml(run.scheduled_for || '')}</span><br><span class="mini">created ${escapeHtml(run.created_at || '')}</span></td>
+    <td>${run.notification_event_id ? '#' + run.notification_event_id : ''}</td>
+  </tr>`).join('');
+  const interactionRows = interactions.map(item => `<tr>
+    <td>#${item.id}<br><span class="mini">run #${item.run_id || ''}</span></td>
+    <td>${escapeHtml(item.interaction_type || '')}</td>
+    <td>${escapeHtml(item.text || '')}</td>
+    <td><span class="mono">${escapeHtml(item.conversation_id || '')}</span></td>
+    <td>${escapeHtml(item.created_at || '')}</td>
+  </tr>`).join('');
+  document.getElementById('runs').innerHTML = `
+    <h3>Latest runs</h3>
+    <table><thead><tr><th>ID</th><th>Rule</th><th>Status</th><th>Time</th><th>Event</th></tr></thead><tbody>${runRows || '<tr><td colspan="5">Chưa có run.</td></tr>'}</tbody></table>
+    <h3>Latest interactions</h3>
+    <table><thead><tr><th>ID</th><th>Type</th><th>Text</th><th>Conversation</th><th>Created</th></tr></thead><tbody>${interactionRows || '<tr><td colspan="5">Chưa có interaction.</td></tr>'}</tbody></table>`;
+}
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
@@ -521,13 +564,16 @@ function escapeAttr(value) {
 }
 async function loadAll() {
   setAuthState();
-  const [status, rules] = await Promise.all([
+  const [status, rules, promptData] = await Promise.all([
     api(adminBase + '/status'),
-    api(root + '/reminders')
+    api(root + '/reminders'),
+    api(adminBase + '/prompt')
   ]);
   renderMetrics(status);
   renderContacts(status);
   renderRules(rules);
+  renderRuns(status);
+  document.getElementById('notificationPrompt').value = promptData.content || '';
   show(status);
 }
 async function sendTest() {
@@ -574,6 +620,19 @@ async function createRule() {
     body: JSON.stringify(payload)
   }));
   await loadAll();
+}
+async function loadPrompt() {
+  const data = await api(adminBase + '/prompt');
+  document.getElementById('notificationPrompt').value = data.content || '';
+  show(data);
+}
+async function savePrompt() {
+  const data = await api(adminBase + '/prompt', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({content: document.getElementById('notificationPrompt').value})
+  });
+  show(data);
 }
 setAuthState();
 if (token) loadAll().catch(err => show(err.message));
@@ -1015,6 +1074,17 @@ def _admin_contact_snapshot(db: Session) -> dict[str, Any]:
     }
 
 
+def _notification_prompt_path():
+    return settings.resolve_runtime_path(settings.bot_notification_prompt_path)
+
+
+def _read_notification_prompt() -> str:
+    path = _notification_prompt_path()
+    if not path.exists():
+        ensure_bot_files()
+    return path.read_text(encoding='utf-8')
+
+
 @app.get('/admin/notifications/status')
 def admin_notifications_status(
     db: Session = Depends(get_db),
@@ -1036,6 +1106,17 @@ def admin_notifications_status(
     }
 
     latest_events = db.scalars(select(NotificationEvent).order_by(NotificationEvent.id.desc()).limit(8)).all()
+    latest_runs = db.scalars(
+        select(ReminderRun)
+        .options(joinedload(ReminderRun.rule))
+        .order_by(ReminderRun.id.desc())
+        .limit(12)
+    ).unique().all()
+    latest_interactions = db.scalars(
+        select(ReminderInteraction)
+        .order_by(ReminderInteraction.id.desc())
+        .limit(12)
+    ).all()
     now = datetime.now(ZoneInfo(settings.app_timezone))
     reconcile_state = db.get(VikunjaBridgeState, 'vikunja_reconcile')
     reconcile_value = reconcile_state.value if reconcile_state and isinstance(reconcile_state.value, dict) else {}
@@ -1082,7 +1163,65 @@ def admin_notifications_status(
             }
             for event in latest_events
         ],
+        'latest_reminder_runs': [
+            {
+                'id': run.id,
+                'rule_id': run.rule_id,
+                'rule_name': run.rule.name if run.rule else None,
+                'rule_type': run.rule.rule_type.value if run.rule else None,
+                'scheduled_for': run.scheduled_for.isoformat() if run.scheduled_for else None,
+                'status': run.status.value if hasattr(run.status, 'value') else str(run.status),
+                'notification_event_id': run.notification_event_id,
+                'run_key': run.run_key,
+                'acknowledged_at': run.acknowledged_at.isoformat() if run.acknowledged_at else None,
+                'snoozed_until': run.snoozed_until.isoformat() if run.snoozed_until else None,
+                'escalated_at': run.escalated_at.isoformat() if run.escalated_at else None,
+                'created_at': run.created_at.isoformat() if run.created_at else None,
+            }
+            for run in latest_runs
+        ],
+        'latest_reminder_interactions': [
+            {
+                'id': interaction.id,
+                'run_id': interaction.run_id,
+                'rule_id': interaction.rule_id,
+                'user_id': interaction.user_id,
+                'conversation_id': interaction.conversation_id,
+                'message_id': interaction.message_id,
+                'interaction_type': (
+                    interaction.interaction_type.value
+                    if hasattr(interaction.interaction_type, 'value')
+                    else str(interaction.interaction_type)
+                ),
+                'text': interaction.text,
+                'payload': interaction.payload,
+                'created_at': interaction.created_at.isoformat() if interaction.created_at else None,
+            }
+            for interaction in latest_interactions
+        ],
     }
+
+
+@app.get('/admin/notifications/prompt')
+def admin_notifications_get_prompt(
+    actor: User = Depends(get_actor),
+) -> dict[str, str]:
+    _ensure_admin(actor)
+    path = _notification_prompt_path()
+    return {'path': str(path), 'content': _read_notification_prompt()}
+
+
+@app.put('/admin/notifications/prompt')
+def admin_notifications_update_prompt(
+    payload: AdminNotificationPromptUpdate,
+    actor: User = Depends(get_actor),
+) -> dict[str, str | int]:
+    _ensure_admin(actor)
+    path = _notification_prompt_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = payload.content.strip() + '\n'
+    path.write_text(content, encoding='utf-8')
+    return {'path': str(path), 'bytes': len(content.encode('utf-8')), 'content': content}
 
 
 @app.post('/admin/notifications/test')
