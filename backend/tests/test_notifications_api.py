@@ -226,6 +226,9 @@ def test_admin_notification_ui_and_status(client) -> None:
     assert data['config']['zalo_worker_configured'] is True
     assert data['notification_counts']['pending'] == 0
     assert 'reminder_counts' in data
+    assert data['contacts']['groups'][0]['group_id'] == 'test-zalo-group'
+    assert any(user['zalo_user_id'] == admin['zalo_user_id'] for user in data['contacts']['users'])
+    assert data['cron_health']['vikunja_reconcile_running'] is False
 
 
 def test_admin_notification_test_endpoint_sends_zalo(client, monkeypatch) -> None:

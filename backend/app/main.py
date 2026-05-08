@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import hmac
 from logging import getLogger
 from os.path import basename
@@ -8,6 +9,7 @@ from re import sub
 from typing import Any, Literal
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -313,6 +315,8 @@ def _admin_notifications_ui_html() -> str:
     th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 11px 8px; vertical-align: top; }
     th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
     td { font-size: 14px; }
+    .mini { color: var(--muted); font-size: 12px; }
+    .mono { font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace; font-size: 12px; word-break: break-all; }
     pre { white-space: pre-wrap; overflow: auto; background: #11151d; border: 1px solid var(--line); border-radius: 14px; padding: 12px; max-height: 260px; }
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     @media (max-width: 760px) {
@@ -392,6 +396,12 @@ def _admin_notifications_ui_html() -> str:
     </div>
 
     <div class="card wide">
+      <h2>Contacts / Target IDs</h2>
+      <p>Bấm vào ID để fill qua form test Zalo hoặc target reminder.</p>
+      <div id="contacts"></div>
+    </div>
+
+    <div class="card wide">
       <h2>Reminder rules</h2>
       <div id="rules"></div>
     </div>
@@ -446,13 +456,45 @@ function renderMetrics(status) {
   const c = status.notification_counts || {};
   const r = status.reminder_counts || {};
   const config = status.config || {};
+  const cron = status.cron_health || {};
   document.getElementById('metrics').innerHTML = [
     ['Pending', c.pending || 0, 'Đang chờ gửi'],
     ['Sent', c.sent || 0, 'Đã gửi'],
     ['Failed', c.failed || 0, 'Lỗi'],
+    ['Cron', cron.vikunja_reconcile_running ? 'OK' : 'Stale', cron.vikunja_reconcile_last_run_at || 'Chưa có'],
     ['Rules', r.enabled || 0, 'Reminder bật'],
   ].map(x => `<div class="metric"><b>${x[1]}</b><span>${x[0]} · ${x[2]}</span></div>`).join('');
   if (config.zalo_group_id) document.getElementById('testTarget').placeholder = config.zalo_group_id;
+}
+function useTarget(channel, targetId) {
+  document.getElementById('testChannel').value = channel;
+  document.getElementById('testTarget').value = targetId;
+  document.getElementById('targetChannel').value = channel;
+  document.getElementById('targetId').value = targetId;
+  show(`Đã chọn ${channel}: ${targetId}`);
+}
+function renderContacts(status) {
+  const contacts = status.contacts || {};
+  const users = contacts.users || [];
+  const groups = contacts.groups || [];
+  const userRows = users.map(user => `<tr>
+    <td>${escapeHtml(user.name || user.username || '')}<br><span class="mini">${escapeHtml(user.username || '')} · ${escapeHtml(user.role || '')}</span></td>
+    <td><span class="mono">${escapeHtml(user.zalo_user_id || 'missing')}</span></td>
+    <td><span class="mono">${escapeHtml(user.user_id || '')}</span></td>
+    <td><span class="mono">${escapeHtml(user.vikunja_user_id || '')}</span></td>
+    <td>${user.zalo_user_id ? `<button class="secondary" onclick="useTarget('user', '${escapeAttr(user.zalo_user_id)}')">Use</button>` : '<span class="bad">No Zalo</span>'}</td>
+  </tr>`).join('');
+  const groupRows = groups.map(group => `<tr>
+    <td>${escapeHtml(group.name || 'Group')}<br><span class="mini">${escapeHtml(group.source || '')}</span></td>
+    <td><span class="mono">${escapeHtml(group.group_id || '')}</span></td>
+    <td colspan="2">${escapeHtml(group.note || '')}</td>
+    <td><button class="secondary" onclick="useTarget('group', '${escapeAttr(group.group_id)}')">Use</button></td>
+  </tr>`).join('');
+  document.getElementById('contacts').innerHTML = `
+    <table>
+      <thead><tr><th>Name</th><th>Zalo / Group ID</th><th>User ID</th><th>Vikunja ID</th><th></th></tr></thead>
+      <tbody>${groupRows}${userRows}</tbody>
+    </table>`;
 }
 function renderRules(rules) {
   if (!rules.length) {
@@ -474,6 +516,9 @@ function renderRules(rules) {
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
+function escapeAttr(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, ' ');
+}
 async function loadAll() {
   setAuthState();
   const [status, rules] = await Promise.all([
@@ -481,6 +526,7 @@ async function loadAll() {
     api(root + '/reminders')
   ]);
   renderMetrics(status);
+  renderContacts(status);
   renderRules(rules);
   show(status);
 }
@@ -896,6 +942,79 @@ def admin_notifications_ui() -> HTMLResponse:
     return HTMLResponse(_admin_notifications_ui_html())
 
 
+def _parse_admin_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=ZoneInfo(settings.app_timezone))
+    return parsed
+
+
+def _seconds_since(value: datetime | None, *, now: datetime) -> int | None:
+    if value is None:
+        return None
+    return max(0, int((now - value.astimezone(now.tzinfo)).total_seconds()))
+
+
+def _admin_contact_snapshot(db: Session) -> dict[str, Any]:
+    mappings_by_user_id = {
+        mapping.social_user_id: mapping
+        for mapping in db.scalars(select(VikunjaUserMapping)).all()
+    }
+    users = db.scalars(
+        select(User)
+        .where(User.is_active.is_(True))
+        .order_by(func.lower(func.coalesce(User.full_name, User.username)).asc(), func.lower(User.username).asc())
+    ).all()
+
+    group_ids: list[tuple[str, str]] = []
+    if settings.zalo_group_id:
+        group_ids.append(('ZALO_GROUP_ID', settings.zalo_group_id))
+    for group_id in settings.zalo_allowed_group_id_list:
+        group_ids.append(('ZALO_ALLOWED_GROUP_IDS', group_id))
+
+    seen_groups: set[str] = set()
+    groups: list[dict[str, str]] = []
+    for source, group_id in group_ids:
+        if not group_id or group_id in seen_groups:
+            continue
+        seen_groups.add(group_id)
+        groups.append(
+            {
+                'name': 'Hazel group' if group_id == settings.zalo_group_id else 'Allowed group',
+                'group_id': group_id,
+                'source': source,
+                'note': 'Dùng channel=group khi test gửi vào nhóm.',
+            }
+        )
+
+    return {
+        'users': [
+            {
+                'user_id': user.id,
+                'username': user.username,
+                'name': user.name,
+                'role': user.role,
+                'zalo_user_id': user.zalo_user_id,
+                'vikunja_user_id': (
+                    mappings_by_user_id[user.id].vikunja_user_id
+                    if user.id in mappings_by_user_id
+                    else None
+                ),
+            }
+            for user in users
+        ],
+        'groups': groups,
+    }
+
+
 @app.get('/admin/notifications/status')
 def admin_notifications_status(
     db: Session = Depends(get_db),
@@ -917,6 +1036,14 @@ def admin_notifications_status(
     }
 
     latest_events = db.scalars(select(NotificationEvent).order_by(NotificationEvent.id.desc()).limit(8)).all()
+    now = datetime.now(ZoneInfo(settings.app_timezone))
+    reconcile_state = db.get(VikunjaBridgeState, 'vikunja_reconcile')
+    reconcile_value = reconcile_state.value if reconcile_state and isinstance(reconcile_state.value, dict) else {}
+    reconcile_last_run_at = _parse_admin_datetime(reconcile_value.get('last_run_at'))
+    latest_reminder_run = db.scalar(select(ReminderRun).order_by(ReminderRun.id.desc()).limit(1))
+    latest_notification_event = latest_events[0] if latest_events else None
+    reconcile_seconds_since = _seconds_since(reconcile_last_run_at, now=now)
+
     return {
         'config': {
             'zalo_worker_configured': bool(settings.zalo_worker_url),
@@ -929,6 +1056,16 @@ def admin_notifications_status(
             'max_retries': settings.notification_max_retries,
             'delivery_batch_limit': settings.notification_delivery_batch_limit,
         },
+        'cron_health': {
+            'now': now.isoformat(),
+            'vikunja_reconcile_last_run_at': reconcile_last_run_at.isoformat() if reconcile_last_run_at else None,
+            'vikunja_reconcile_seconds_since': reconcile_seconds_since,
+            'vikunja_reconcile_running': reconcile_seconds_since is not None and reconcile_seconds_since <= 180,
+            'vikunja_reconcile_note': 'OK nếu cron chạy mỗi phút và giá trị này dưới 180 giây.',
+            'last_reminder_run_at': latest_reminder_run.created_at.isoformat() if latest_reminder_run else None,
+            'last_notification_event_at': latest_notification_event.created_at.isoformat() if latest_notification_event else None,
+        },
+        'contacts': _admin_contact_snapshot(db),
         'notification_counts': notification_counts,
         'reminder_counts': reminder_counts,
         'latest_events': [
