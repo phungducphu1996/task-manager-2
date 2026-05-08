@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 import hmac
 import re
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, cast, func, or_, select
@@ -432,9 +433,12 @@ def _create_run_and_event(
     target_id: str | None,
     user: User | None,
     now: datetime,
+    run_key_extra: str | None = None,
 ) -> tuple[ReminderRun, bool]:
     target_key = user.id if user else target_id or 'missing-target'
     run_key = f'reminder:{rule.id}:{target_key}:{scheduled_for.strftime("%Y%m%d%H%M")}'
+    if run_key_extra:
+        run_key = f'{run_key}:{run_key_extra}'
     existing = db.scalar(select(ReminderRun).where(ReminderRun.run_key == run_key))
     if existing:
         return existing, False
@@ -577,6 +581,42 @@ def run_reminder_tick(db: Session, *, now: datetime | None = None) -> dict[str, 
         'runs_created': runs_created,
         'runs_deduped': runs_deduped,
         'escalations_created': escalations_created,
+        'dispatch': dispatch,
+    }
+
+
+def run_reminder_rule_now(db: Session, *, rule: ReminderRule, now: datetime | None = None) -> dict[str, Any]:
+    current = now or now_reminder()
+    run_key_extra = f'test:{current.strftime("%Y%m%d%H%M%S")}:{uuid4().hex[:8]}'
+    targets = _targets_for_rule(db, rule)
+    runs_created = 0
+    runs_deduped = 0
+
+    for target_channel, target_id, user in targets:
+        _, created = _create_run_and_event(
+            db,
+            rule=rule,
+            scheduled_for=current,
+            target_channel=target_channel,
+            target_id=target_id,
+            user=user,
+            now=current,
+            run_key_extra=run_key_extra,
+        )
+        if created:
+            runs_created += 1
+        else:
+            runs_deduped += 1
+
+    db.commit()
+    dispatch = dispatch_due_notification_events(db)
+    return {
+        'now': current.isoformat(),
+        'rule_id': rule.id,
+        'rule_name': rule.name,
+        'targets_checked': len(targets),
+        'runs_created': runs_created,
+        'runs_deduped': runs_deduped,
         'dispatch': dispatch,
     }
 

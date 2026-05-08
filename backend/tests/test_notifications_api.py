@@ -278,6 +278,39 @@ def test_admin_notification_prompt_can_be_updated(client) -> None:
     assert 'Nói cực gọn và vui.' in loaded.json()['content']
 
 
+def test_admin_can_test_existing_reminder_rule_immediately(client, monkeypatch) -> None:
+    calls = install_worker_success_stub(monkeypatch)
+    users = client.get('/users').json()
+    admin, _, _ = select_users(users)
+
+    created = client.post(
+        '/reminders',
+        json={
+            'name': 'UI test group digest',
+            'rule_type': 'daily_group_digest',
+            'target_channel': 'group',
+            'target_id': 'test-zalo-group',
+            'schedule_type': 'daily',
+            'schedule_time': '08:00',
+        },
+        headers=actor_headers(admin['id']),
+    )
+    assert created.status_code == 201
+    rule_id = created.json()['id']
+
+    response = client.post(
+        f'/admin/notifications/reminders/{rule_id}/test',
+        headers=actor_headers(admin['id']),
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data['rule_id'] == rule_id
+    assert data['runs_created'] == 1
+    assert data['dispatch']['sent'] == 1
+    assert calls and calls[0]['channel'] == 'group'
+
+
 def test_morning_job_builds_group_admin_and_user_messages(client, db_session, monkeypatch) -> None:
     install_worker_success_stub(monkeypatch)
     settings = get_settings()

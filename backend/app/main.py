@@ -93,6 +93,7 @@ from .reminders import (
     create_task_nudge_rule,
     is_reminder_internal_token_valid,
     reminder_internal_token_configured,
+    run_reminder_rule_now,
     run_reminder_tick,
     update_reminder_rule,
 )
@@ -389,6 +390,10 @@ def _admin_notifications_ui_html() -> str:
         <div><label>Schedule</label><select id="scheduleType"><option value="daily">daily</option><option value="interval">interval</option></select></div>
       </div>
       <div class="split">
+        <div><label>Enabled</label><select id="ruleEnabled"><option value="true">enabled</option><option value="false">disabled</option></select></div>
+        <div></div>
+      </div>
+      <div class="split">
         <div><label>HH:MM</label><input id="scheduleTime" placeholder="08:00" /></div>
         <div><label>Interval minutes</label><input id="intervalMinutes" type="number" min="1" placeholder="60" /></div>
       </div>
@@ -396,7 +401,20 @@ def _admin_notifications_ui_html() -> str:
         <div><label>Target channel</label><select id="targetChannel"><option value="">auto</option><option value="user">user</option><option value="group">group</option></select></div>
         <div><label>Target ID</label><input id="targetId" placeholder="optional" /></div>
       </div>
-      <div class="actions"><button onclick="createRule()">Create rule</button></div>
+      <div class="split">
+        <div><label>User ID</label><input id="ruleUserId" placeholder="optional personal user id" /></div>
+        <div><label>Task ID</label><input id="ruleTaskId" type="number" min="1" placeholder="optional task id" /></div>
+      </div>
+      <div class="split">
+        <div><label>Max runs/day</label><input id="maxRunsPerDay" type="number" min="1" placeholder="optional" /></div>
+        <div><label>Escalation after</label><input id="escalationAfter" type="number" min="1" placeholder="minutes or runs" /></div>
+      </div>
+      <input id="editingRuleId" type="hidden" />
+      <div class="actions">
+        <button id="ruleCreateButton" onclick="createRule()">Create rule</button>
+        <button id="ruleSaveButton" class="good" onclick="saveRule()" style="display:none">Save rule</button>
+        <button id="ruleCancelButton" class="secondary" onclick="clearRuleForm()" style="display:none">Cancel edit</button>
+      </div>
     </div>
 
     <div class="card wide">
@@ -517,6 +535,7 @@ function renderContacts(status) {
     </table>`;
 }
 function renderRules(rules) {
+  window.reminderRulesById = Object.fromEntries(rules.map(rule => [String(rule.id), rule]));
   if (!rules.length) {
     document.getElementById('rules').innerHTML = '<p>Chưa có reminder rule.</p>';
     return;
@@ -527,9 +546,13 @@ function renderRules(rules) {
       <td>${escapeHtml(rule.name)}</td>
       <td>${rule.rule_type}</td>
       <td>${rule.schedule_type}${rule.schedule_time ? ' · ' + rule.schedule_time : ''}${rule.interval_minutes ? ' · ' + rule.interval_minutes + 'm' : ''}</td>
-      <td>${rule.target_channel || 'auto'}<br><span class="pill">${escapeHtml(rule.target_id || rule.user_id || '')}</span></td>
+      <td>${rule.target_channel || 'auto'}<br><span class="pill">${escapeHtml(rule.target_id || rule.user_id || rule.task_id || '')}</span></td>
       <td><span class="${rule.enabled ? 'ok' : 'bad'}">${rule.enabled ? 'enabled' : 'disabled'}</span></td>
-      <td><button class="secondary" onclick="toggleRule(${rule.id}, ${!rule.enabled})">${rule.enabled ? 'Disable' : 'Enable'}</button></td>
+      <td>
+        <button class="secondary" onclick="editRuleById(${rule.id})">Edit</button>
+        <button class="good" onclick="testRule(${rule.id})">Test now</button>
+        <button class="secondary" onclick="toggleRule(${rule.id}, ${!rule.enabled})">${rule.enabled ? 'Disable' : 'Enable'}</button>
+      </td>
     </tr>`).join('')
   }</tbody></table>`;
 }
@@ -601,24 +624,99 @@ async function toggleRule(id, enabled) {
   }));
   await loadAll();
 }
-async function createRule() {
+function clearRuleForm() {
+  editingRuleId.value = '';
+  ruleName.value = '';
+  ruleType.disabled = false;
+  ruleType.value = 'daily_group_digest';
+  ruleEnabled.value = 'true';
+  scheduleType.value = 'daily';
+  scheduleTime.value = '';
+  intervalMinutes.value = '';
+  targetChannel.value = '';
+  targetId.value = '';
+  ruleUserId.value = '';
+  ruleTaskId.value = '';
+  maxRunsPerDay.value = '';
+  escalationAfter.value = '';
+  document.getElementById('ruleCreateButton').style.display = '';
+  document.getElementById('ruleSaveButton').style.display = 'none';
+  document.getElementById('ruleCancelButton').style.display = 'none';
+}
+function editRule(rule) {
+  editingRuleId.value = rule.id;
+  ruleName.value = rule.name || '';
+  ruleType.value = rule.rule_type || 'daily_group_digest';
+  ruleType.disabled = true;
+  ruleEnabled.value = rule.enabled ? 'true' : 'false';
+  scheduleType.value = rule.schedule_type || 'daily';
+  scheduleTime.value = normalizeTime(rule.schedule_time || '');
+  intervalMinutes.value = rule.interval_minutes || '';
+  targetChannel.value = rule.target_channel || '';
+  targetId.value = rule.target_id || '';
+  ruleUserId.value = rule.user_id || '';
+  ruleTaskId.value = rule.task_id || '';
+  maxRunsPerDay.value = rule.max_runs_per_day || '';
+  escalationAfter.value = rule.escalation_after_minutes || rule.escalation_after_runs || '';
+  document.getElementById('ruleCreateButton').style.display = 'none';
+  document.getElementById('ruleSaveButton').style.display = '';
+  document.getElementById('ruleCancelButton').style.display = '';
+  show(`Đang edit reminder #${rule.id}`);
+}
+function editRuleById(id) {
+  const rule = (window.reminderRulesById || {})[String(id)];
+  if (!rule) return show(`Không tìm thấy rule #${id} trên UI hiện tại.`);
+  editRule(rule);
+}
+function normalizeTime(value) {
+  return String(value || '').slice(0, 5);
+}
+function buildRulePayload({forUpdate = false} = {}) {
   const payload = {
     name: ruleName.value,
-    rule_type: ruleType.value,
-    enabled: true,
+    enabled: ruleEnabled.value !== 'false',
     schedule_type: scheduleType.value,
     timezone: 'Asia/Ho_Chi_Minh',
+    target_channel: targetChannel.value || null,
+    target_id: targetId.value || null,
+    user_id: ruleUserId.value || null,
+    task_id: ruleTaskId.value ? Number(ruleTaskId.value) : null,
+    interval_minutes: intervalMinutes.value ? Number(intervalMinutes.value) : null,
+    max_runs_per_day: maxRunsPerDay.value ? Number(maxRunsPerDay.value) : null,
     payload: {}
   };
+  if (!forUpdate) payload.rule_type = ruleType.value;
   if (scheduleTime.value) payload.schedule_time = scheduleTime.value;
-  if (intervalMinutes.value) payload.interval_minutes = Number(intervalMinutes.value);
-  if (targetChannel.value) payload.target_channel = targetChannel.value;
-  if (targetId.value) payload.target_id = targetId.value;
+  const escalation = escalationAfter.value ? Number(escalationAfter.value) : null;
+  if (escalation) {
+    if ((forUpdate ? ruleType.value : payload.rule_type) === 'task_nudge') payload.escalation_after_runs = escalation;
+    else payload.escalation_after_minutes = escalation;
+  }
+  return payload;
+}
+async function createRule() {
+  const payload = buildRulePayload();
   show(await api(root + '/reminders', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
   }));
+  clearRuleForm();
+  await loadAll();
+}
+async function saveRule() {
+  if (!editingRuleId.value) return show('Chưa chọn rule để edit.');
+  const payload = buildRulePayload({forUpdate: true});
+  show(await api(root + '/reminders/' + editingRuleId.value, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }));
+  clearRuleForm();
+  await loadAll();
+}
+async function testRule(id) {
+  show(await api(adminBase + '/reminders/' + id + '/test', {method: 'POST'}));
   await loadAll();
 }
 async function loadPrompt() {
@@ -1222,6 +1320,19 @@ def admin_notifications_update_prompt(
     content = payload.content.strip() + '\n'
     path.write_text(content, encoding='utf-8')
     return {'path': str(path), 'bytes': len(content.encode('utf-8')), 'content': content}
+
+
+@app.post('/admin/notifications/reminders/{reminder_id}/test')
+def admin_notifications_test_reminder_rule(
+    reminder_id: int,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    rule = db.get(ReminderRule, reminder_id)
+    if not rule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Reminder not found.')
+    return run_reminder_rule_now(db, rule=rule)
 
 
 @app.post('/admin/notifications/test')
