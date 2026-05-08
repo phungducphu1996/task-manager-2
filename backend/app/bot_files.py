@@ -62,6 +62,16 @@ Bạn viết thông báo Zalo ngắn cho Task Manager của văn phòng Hazel.
 - Có thể dùng emoji rất ít, tối đa 1 emoji nếu hợp.
 """
 
+DEFAULT_NOTIFICATION_EVENT_PROMPT = """# Event-specific Notification Prompt
+
+File này áp dụng thêm cho riêng một loại notification.
+
+## Cách dùng
+- Ghi tone/cấu trúc riêng cho event này.
+- Không cần lặp lại toàn bộ prompt global.
+- Nếu để trống, bot chỉ dùng prompt global.
+"""
+
 
 def _resolve(raw_path: str) -> Path:
     return settings.resolve_runtime_path(raw_path)
@@ -82,6 +92,7 @@ def ensure_bot_files() -> None:
     notification_prompt_path.parent.mkdir(parents=True, exist_ok=True)
     if not notification_prompt_path.exists():
         notification_prompt_path.write_text(DEFAULT_NOTIFICATION_PROMPT, encoding='utf-8')
+    (notification_prompt_path.parent / 'notification-events').mkdir(parents=True, exist_ok=True)
 
     profiles_dir = _resolve(settings.bot_profiles_dir)
     profiles_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +120,32 @@ def persona_text() -> str:
 def notification_prompt_text() -> str:
     ensure_bot_files()
     return _resolve(settings.bot_notification_prompt_path).read_text(encoding='utf-8').strip()
+
+
+def notification_event_prompt_path(event_type: str) -> Path:
+    ensure_bot_files()
+    filename = f'{_slug(event_type)}.md'
+    return _resolve(settings.bot_notification_prompt_path).parent / 'notification-events' / filename
+
+
+def ensure_notification_event_prompt(event_type: str) -> Path:
+    path = notification_event_prompt_path(event_type)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(DEFAULT_NOTIFICATION_EVENT_PROMPT, encoding='utf-8')
+    return path
+
+
+def notification_event_prompt_text(event_type: str, *, max_chars: int = 2200) -> str:
+    if not event_type:
+        return ''
+    path = notification_event_prompt_path(event_type)
+    if not path.exists():
+        return ''
+    content = path.read_text(encoding='utf-8').strip()
+    if content == DEFAULT_NOTIFICATION_EVENT_PROMPT.strip():
+        return ''
+    return content[:max_chars]
 
 
 def user_contact_prompt_path(user: User) -> Path:

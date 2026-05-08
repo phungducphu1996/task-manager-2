@@ -69,6 +69,9 @@ def test_realtime_notification_message_can_be_rendered_by_llm(client, db_session
     prompt_path = Path(settings.bot_notification_prompt_path)
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text('# Custom Notify Voice\nNói chuyện duyên dáng kiểu Hazel.', encoding='utf-8')
+    event_prompt_path = prompt_path.parent / 'notification-events' / 'task_assigned_on_create.md'
+    event_prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    event_prompt_path.write_text('# Assigned Voice\nNhấn mạnh đây là task mới được giao.', encoding='utf-8')
 
     captured: dict[str, str] = {}
 
@@ -105,6 +108,7 @@ def test_realtime_notification_message_can_be_rendered_by_llm(client, db_session
     assert event.payload['message'] == 'LLM: task mới tới rồi, xử lý nhẹ nhàng nha.'
     assert event.payload['context']['llm_rendered'] is True
     assert 'Custom Notify Voice' in captured['system_prompt']
+    assert 'Assigned Voice' in captured['system_prompt']
     assert 'LLM assign' in captured['user_prompt']
     assert 'Nói với member bằng giọng cực ngắn.' in captured['user_prompt']
 
@@ -229,6 +233,8 @@ def test_admin_notification_ui_and_status(client) -> None:
     assert data['contacts']['groups'][0]['group_id'] == 'test-zalo-group'
     assert any(user['zalo_user_id'] == admin['zalo_user_id'] for user in data['contacts']['users'])
     assert data['cron_health']['vikunja_reconcile_running'] is False
+    assert data['cron_health']['timezone'] == 'Asia/Ho_Chi_Minh'
+    assert 'vikunja_task_assigned' in data['event_prompt_types']
 
 
 def test_admin_notification_test_endpoint_sends_zalo(client, monkeypatch) -> None:
@@ -276,6 +282,21 @@ def test_admin_notification_prompt_can_be_updated(client) -> None:
     loaded = client.get('/admin/notifications/prompt', headers=actor_headers(admin['id']))
     assert loaded.status_code == 200
     assert 'Nói cực gọn và vui.' in loaded.json()['content']
+
+    event_updated = client.put(
+        '/admin/notifications/prompt?event_type=vikunja_task_assigned',
+        json={'content': '# Assigned\nNói thân mật hơn khi giao task.'},
+        headers=actor_headers(admin['id']),
+    )
+    assert event_updated.status_code == 200
+    assert event_updated.json()['scope'] == 'vikunja_task_assigned'
+
+    event_loaded = client.get(
+        '/admin/notifications/prompt?event_type=vikunja_task_assigned',
+        headers=actor_headers(admin['id']),
+    )
+    assert event_loaded.status_code == 200
+    assert 'Nói thân mật hơn' in event_loaded.json()['content']
 
 
 def test_admin_can_test_existing_reminder_rule_immediately(client, monkeypatch) -> None:

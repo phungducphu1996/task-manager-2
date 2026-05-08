@@ -16,7 +16,7 @@ from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from .bot_files import contact_prompt_text_for_user, notification_prompt_text
+from .bot_files import contact_prompt_text_for_user, notification_event_prompt_text, notification_prompt_text
 from .bot_llm import BotLLMError, generate_bot_reply, is_bot_llm_configured
 from .config import get_settings
 from .models import (
@@ -559,8 +559,12 @@ def _render_realtime_notification_message(
         'Trả về duy nhất nội dung tin nhắn, không markdown fence, không JSON.\n\n'
         f'{json.dumps(event_payload, ensure_ascii=False, default=str)}'
     )
+    system_prompt = notification_prompt_text()
+    event_prompt = notification_event_prompt_text(event_type)
+    if event_prompt:
+        system_prompt = f'{system_prompt}\n\n# Prompt riêng cho event `{event_type}`\n{event_prompt}'
     try:
-        message = generate_bot_reply(system_prompt=notification_prompt_text(), user_prompt=user_prompt).strip()
+        message = generate_bot_reply(system_prompt=system_prompt, user_prompt=user_prompt).strip()
     except BotLLMError as exc:
         logger.warning('Failed to render notification with LLM for task_id=%s event=%s: %s', task.id, event_type, exc)
         return fallback

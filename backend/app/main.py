@@ -20,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from .auth import AuthError, create_access_token, decode_access_token, extract_bearer_token, verify_password
-from .bot_files import ensure_bot_files
+from .bot_files import ensure_bot_files, ensure_notification_event_prompt
 from .config import get_settings
 from .database import Base, engine, get_db
 from .models import (
@@ -136,6 +136,26 @@ class AdminNotificationTestRequest(BaseModel):
 
 class AdminNotificationPromptUpdate(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
+
+
+ADMIN_NOTIFICATION_EVENT_TYPES = [
+    'task_assigned_on_create',
+    'task_submitted_for_review',
+    'task_approved_ready',
+    'task_done_by_member',
+    'task_updated',
+    'task_deleted',
+    'vikunja_task_assigned',
+    'vikunja_task_review',
+    'vikunja_task_ready',
+    'vikunja_task_done',
+    'vikunja_task_changed',
+    'reminder_daily_group_digest',
+    'reminder_daily_member_checkin',
+    'reminder_daily_strategy',
+    'reminder_task_nudge',
+    'reminder_admin_escalation',
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -324,6 +344,31 @@ def _admin_notifications_ui_html() -> str:
     .mono { font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace; font-size: 12px; word-break: break-all; }
     pre { white-space: pre-wrap; overflow: auto; background: #11151d; border: 1px solid var(--line); border-radius: 14px; padding: 12px; max-height: 260px; }
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .tabs { display: flex; gap: 10px; flex-wrap: wrap; margin: 0 0 18px; }
+    .tab {
+      color: var(--text);
+      background: rgba(43,49,64,.72);
+      border: 1px solid var(--line);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.02);
+    }
+    .tab.active { color: #12151c; background: var(--accent); }
+    .hidden { display: none !important; }
+    .dashboard-note {
+      margin: 0 0 18px;
+      padding: 12px 14px;
+      border: 1px solid rgba(143,183,255,.28);
+      border-radius: 16px;
+      background: rgba(143,183,255,.08);
+      color: var(--muted);
+    }
+    .event-card {
+      border-left: 4px solid var(--accent);
+      background: rgba(17,21,29,.48);
+      border-radius: 14px;
+      padding: 10px 12px;
+      margin: 8px 0;
+    }
+    .toolbar { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
     @media (max-width: 760px) {
       header { display: block; }
       .card { grid-column: span 12; }
@@ -337,13 +382,22 @@ def _admin_notifications_ui_html() -> str:
     <div>
       <p class="pill">Hazel Bridge</p>
       <h1>Noti Control</h1>
-      <p>Quản lý reminder, test Zalo, chạy reconcile/tick thủ công.</p>
+      <p>Dashboard quản lý notification, reminder, prompt và cron theo giờ Việt Nam.</p>
     </div>
     <div class="pill" id="authState">Chưa đăng nhập</div>
   </header>
 
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview" onclick="showTab('overview')">Tổng quan</button>
+    <button class="tab" data-tab="rules" onclick="showTab('rules')">Reminder rules</button>
+    <button class="tab" data-tab="test" onclick="showTab('test')">Test lab</button>
+    <button class="tab" data-tab="prompts" onclick="showTab('prompts')">Prompts</button>
+    <button class="tab" data-tab="logs" onclick="showTab('logs')">Logs</button>
+  </nav>
+  <p class="dashboard-note" id="dashboardNote">Mọi thời gian trên dashboard hiển thị theo Asia/Ho_Chi_Minh (GMT+7). Prompt Markdown sửa xong có hiệu lực ngay, không cần restart.</p>
+
   <section class="grid">
-    <div class="card" id="loginCard">
+    <div class="card" id="loginCard" data-panel="overview">
       <h2>Đăng nhập</h2>
       <div class="split">
         <div><label>Username</label><input id="username" value="admin" autocomplete="username" /></div>
@@ -355,7 +409,7 @@ def _admin_notifications_ui_html() -> str:
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" data-panel="overview">
       <h2>System</h2>
       <div class="metric-row" id="metrics"></div>
       <div class="actions">
@@ -366,7 +420,7 @@ def _admin_notifications_ui_html() -> str:
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" data-panel="test">
       <h2>Test Zalo</h2>
       <div class="split">
         <div><label>Channel</label><select id="testChannel"><option value="user">user</option><option value="group">group</option></select></div>
@@ -377,7 +431,7 @@ def _admin_notifications_ui_html() -> str:
       <div class="actions"><button onclick="sendTest()">Send test</button></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-panel="rules">
       <h2>Tạo reminder nhanh</h2>
       <label>Name</label><input id="ruleName" placeholder="Daily group digest 08:00" />
       <div class="split">
@@ -417,26 +471,30 @@ def _admin_notifications_ui_html() -> str:
       </div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-panel="test">
       <h2>Contacts / Target IDs</h2>
       <p>Bấm vào ID để fill qua form test Zalo hoặc target reminder.</p>
       <div id="contacts"></div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-panel="rules">
       <h2>Reminder rules</h2>
       <div id="rules"></div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-panel="logs">
       <h2>Cron / Reminder runs</h2>
       <p>Nhìn nhanh cron app-level có tạo run/reconcile đều không. Cron hệ thống vẫn nằm ở VPS crontab, còn đây là dấu vết backend nhận được.</p>
       <div id="runs"></div>
     </div>
 
-    <div class="card wide">
-      <h2>Notification prompt</h2>
-      <p>Prompt này dùng cho LLM render thông báo Zalo. Sửa xong bấm Save, không cần restart backend.</p>
+    <div class="card wide" data-panel="prompts">
+      <h2>Notification prompts</h2>
+      <p>Prompt global là nền chung. Prompt theo event sẽ được ghép thêm khi đúng loại thông báo, giúp mỗi noti có giọng riêng.</p>
+      <div class="split">
+        <div><label>Prompt scope</label><select id="promptScope" onchange="loadPrompt()"><option value="">Global notification writer</option></select></div>
+        <div><label>File</label><input id="promptPath" readonly /></div>
+      </div>
       <textarea id="notificationPrompt" style="min-height: 260px"></textarea>
       <div class="actions">
         <button onclick="savePrompt()">Save prompt</button>
@@ -444,7 +502,7 @@ def _admin_notifications_ui_html() -> str:
       </div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-panel="overview logs test rules prompts">
       <h2>Result</h2>
       <pre id="result">Sẵn sàng rồi anh.</pre>
     </div>
@@ -455,6 +513,17 @@ def _admin_notifications_ui_html() -> str:
 const root = location.pathname.split('/admin/notifications')[0] || '';
 const adminBase = root + '/admin/notifications';
 let token = localStorage.getItem('hazel-noti-token') || '';
+let activeTab = 'overview';
+let promptEventTypes = [];
+
+function showTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(button => button.classList.toggle('active', button.dataset.tab === tab));
+  document.querySelectorAll('[data-panel]').forEach(panel => {
+    const panels = String(panel.dataset.panel || '').split(/\s+/);
+    panel.classList.toggle('hidden', !panels.includes(tab));
+  });
+}
 
 function headers(extra = {}) {
   return token ? {'Authorization': 'Bearer ' + token, ...extra} : extra;
@@ -464,6 +533,22 @@ function show(data) {
 }
 function setAuthState() {
   document.getElementById('authState').textContent = token ? 'Đã có token' : 'Chưa đăng nhập';
+}
+function formatDateTime(value, fallback = '') {
+  if (!value) return fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return fallback || value;
+  return new Intl.DateTimeFormat('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+  }).format(date) + ' GMT+7';
+}
+function secondsLabel(seconds) {
+  if (seconds === null || seconds === undefined) return 'chưa có';
+  if (seconds < 60) return `${seconds}s trước`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} phút trước`;
+  return `${Math.floor(seconds / 3600)} giờ trước`;
 }
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: headers(opts.headers || {}) });
@@ -495,13 +580,16 @@ function renderMetrics(status) {
   const r = status.reminder_counts || {};
   const config = status.config || {};
   const cron = status.cron_health || {};
+  const reconcileState = cron.vikunja_reconcile_running ? 'OK' : 'Cần kiểm tra';
   document.getElementById('metrics').innerHTML = [
     ['Pending', c.pending || 0, 'Đang chờ gửi'],
     ['Sent', c.sent || 0, 'Đã gửi'],
     ['Failed', c.failed || 0, 'Lỗi'],
-    ['Cron', cron.vikunja_reconcile_running ? 'OK' : 'Stale', cron.vikunja_reconcile_last_run_at || 'Chưa có'],
-    ['Rules', r.enabled || 0, 'Reminder bật'],
+    ['Reconcile', reconcileState, secondsLabel(cron.vikunja_reconcile_seconds_since)],
+    ['Rules', r.enabled || 0, `${r.total || 0} rules tổng`],
   ].map(x => `<div class="metric"><b>${x[1]}</b><span>${x[0]} · ${x[2]}</span></div>`).join('');
+  document.getElementById('dashboardNote').textContent =
+    `Giờ server: ${cron.now_label || formatDateTime(cron.now)} · Reconcile cuối: ${cron.vikunja_reconcile_last_run_label || 'chưa có'} · Event cuối: ${cron.last_notification_event_label || 'chưa có'}`;
   if (config.zalo_group_id) document.getElementById('testTarget').placeholder = config.zalo_group_id;
 }
 function useTarget(channel, targetId) {
@@ -540,12 +628,12 @@ function renderRules(rules) {
     document.getElementById('rules').innerHTML = '<p>Chưa có reminder rule.</p>';
     return;
   }
-  document.getElementById('rules').innerHTML = `<table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Schedule</th><th>Target</th><th>Status</th><th></th></tr></thead><tbody>${
+  document.getElementById('rules').innerHTML = `<div class="toolbar"><span class="pill">${rules.filter(rule => rule.enabled).length} enabled / ${rules.length} total</span><button class="secondary" onclick="clearRuleForm(); showTab('rules')">New rule</button></div><table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Schedule</th><th>Target</th><th>Status</th><th></th></tr></thead><tbody>${
     rules.map(rule => `<tr>
       <td>#${rule.id}</td>
       <td>${escapeHtml(rule.name)}</td>
-      <td>${rule.rule_type}</td>
-      <td>${rule.schedule_type}${rule.schedule_time ? ' · ' + rule.schedule_time : ''}${rule.interval_minutes ? ' · ' + rule.interval_minutes + 'm' : ''}</td>
+      <td>${ruleTypeLabel(rule.rule_type)}<br><span class="mini">${rule.rule_type}</span></td>
+      <td>${rule.schedule_type}${rule.schedule_time ? ' · ' + normalizeTime(rule.schedule_time) + ' GMT+7' : ''}${rule.interval_minutes ? ' · mỗi ' + rule.interval_minutes + 'm' : ''}</td>
       <td>${rule.target_channel || 'auto'}<br><span class="pill">${escapeHtml(rule.target_id || rule.user_id || rule.task_id || '')}</span></td>
       <td><span class="${rule.enabled ? 'ok' : 'bad'}">${rule.enabled ? 'enabled' : 'disabled'}</span></td>
       <td>
@@ -556,14 +644,30 @@ function renderRules(rules) {
     </tr>`).join('')
   }</tbody></table>`;
 }
+function ruleTypeLabel(type) {
+  return ({
+    daily_group_digest: 'Tổng quan group',
+    daily_member_checkin: 'Check-in từng người',
+    daily_strategy: 'Gợi ý chiến lược',
+    task_nudge: 'Nhắc task lặp lại',
+  })[type] || type;
+}
 function renderRuns(status) {
+  const events = status.latest_events || [];
   const runs = status.latest_reminder_runs || [];
   const interactions = status.latest_reminder_interactions || [];
+  const eventRows = events.map(event => `<tr>
+    <td>#${event.id}<br><span class="mini">${escapeHtml(event.event_type || '')}</span></td>
+    <td>${escapeHtml(event.channel || '')}<br><span class="mono">${escapeHtml(event.target_id || '')}</span></td>
+    <td><span class="${event.status === 'sent' ? 'ok' : event.status === 'failed' ? 'bad' : 'warn'}">${escapeHtml(event.status || '')}</span><br><span class="mini">${event.attempt_count || 0} attempts</span></td>
+    <td>${escapeHtml(event.message || '')}<br><span class="mini">${escapeHtml(event.last_error || '')}</span></td>
+    <td>${escapeHtml(event.created_at_label || formatDateTime(event.created_at))}</td>
+  </tr>`).join('');
   const runRows = runs.map(run => `<tr>
     <td>#${run.id}<br><span class="mini">rule #${run.rule_id}</span></td>
     <td>${escapeHtml(run.rule_name || '')}<br><span class="mini">${escapeHtml(run.rule_type || '')}</span></td>
     <td>${escapeHtml(run.status || '')}</td>
-    <td><span class="mono">${escapeHtml(run.scheduled_for || '')}</span><br><span class="mini">created ${escapeHtml(run.created_at || '')}</span></td>
+    <td><span class="mono">${escapeHtml(run.scheduled_for_label || formatDateTime(run.scheduled_for))}</span><br><span class="mini">created ${escapeHtml(run.created_at_label || formatDateTime(run.created_at))}</span></td>
     <td>${run.notification_event_id ? '#' + run.notification_event_id : ''}</td>
   </tr>`).join('');
   const interactionRows = interactions.map(item => `<tr>
@@ -571,13 +675,23 @@ function renderRuns(status) {
     <td>${escapeHtml(item.interaction_type || '')}</td>
     <td>${escapeHtml(item.text || '')}</td>
     <td><span class="mono">${escapeHtml(item.conversation_id || '')}</span></td>
-    <td>${escapeHtml(item.created_at || '')}</td>
+    <td>${escapeHtml(item.created_at_label || formatDateTime(item.created_at))}</td>
   </tr>`).join('');
   document.getElementById('runs').innerHTML = `
+    <h3>Latest notification events</h3>
+    <table><thead><tr><th>ID</th><th>Target</th><th>Status</th><th>Message/Error</th><th>Created</th></tr></thead><tbody>${eventRows || '<tr><td colspan="5">Chưa có event.</td></tr>'}</tbody></table>
     <h3>Latest runs</h3>
     <table><thead><tr><th>ID</th><th>Rule</th><th>Status</th><th>Time</th><th>Event</th></tr></thead><tbody>${runRows || '<tr><td colspan="5">Chưa có run.</td></tr>'}</tbody></table>
     <h3>Latest interactions</h3>
     <table><thead><tr><th>ID</th><th>Type</th><th>Text</th><th>Conversation</th><th>Created</th></tr></thead><tbody>${interactionRows || '<tr><td colspan="5">Chưa có interaction.</td></tr>'}</tbody></table>`;
+}
+function renderPromptScopes(types) {
+  promptEventTypes = types || [];
+  const current = document.getElementById('promptScope').value;
+  document.getElementById('promptScope').innerHTML =
+    '<option value="">Global notification writer</option>' +
+    promptEventTypes.map(type => `<option value="${escapeAttr(type)}">${escapeHtml(ruleTypeLabel(type) === type ? type : `${ruleTypeLabel(type)} · ${type}`)}</option>`).join('');
+  document.getElementById('promptScope').value = current;
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -596,7 +710,9 @@ async function loadAll() {
   renderContacts(status);
   renderRules(rules);
   renderRuns(status);
+  renderPromptScopes(status.event_prompt_types || []);
   document.getElementById('notificationPrompt').value = promptData.content || '';
+  document.getElementById('promptPath').value = promptData.path || '';
   show(status);
 }
 async function sendTest() {
@@ -720,19 +836,26 @@ async function testRule(id) {
   await loadAll();
 }
 async function loadPrompt() {
-  const data = await api(adminBase + '/prompt');
+  const eventType = document.getElementById('promptScope').value;
+  const suffix = eventType ? '?event_type=' + encodeURIComponent(eventType) : '';
+  const data = await api(adminBase + '/prompt' + suffix);
   document.getElementById('notificationPrompt').value = data.content || '';
+  document.getElementById('promptPath').value = data.path || '';
   show(data);
 }
 async function savePrompt() {
-  const data = await api(adminBase + '/prompt', {
+  const eventType = document.getElementById('promptScope').value;
+  const suffix = eventType ? '?event_type=' + encodeURIComponent(eventType) : '';
+  const data = await api(adminBase + '/prompt' + suffix, {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({content: document.getElementById('notificationPrompt').value})
   });
+  document.getElementById('promptPath').value = data.path || '';
   show(data);
 }
 setAuthState();
+showTab(activeTab);
 if (token) loadAll().catch(err => show(err.message));
 </script>
 </body>
@@ -1120,6 +1243,15 @@ def _seconds_since(value: datetime | None, *, now: datetime) -> int | None:
     return max(0, int((now - value.astimezone(now.tzinfo)).total_seconds()))
 
 
+def _admin_datetime_label(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    timezone = ZoneInfo(settings.app_timezone)
+    localized = value.astimezone(timezone) if value.tzinfo else value.replace(tzinfo=timezone)
+    suffix = 'GMT+7' if settings.app_timezone == 'Asia/Ho_Chi_Minh' else settings.app_timezone
+    return f'{localized:%d/%m/%Y %H:%M:%S} {suffix}'
+
+
 def _admin_contact_snapshot(db: Session) -> dict[str, Any]:
     mappings_by_user_id = {
         mapping.social_user_id: mapping
@@ -1172,12 +1304,21 @@ def _admin_contact_snapshot(db: Session) -> dict[str, Any]:
     }
 
 
-def _notification_prompt_path():
+def _safe_notification_event_type(event_type: str | None) -> str | None:
+    if not event_type:
+        return None
+    return sub(r'[^A-Za-z0-9._-]+', '-', event_type.strip()).strip('-') or None
+
+
+def _notification_prompt_path(event_type: str | None = None):
+    safe_event_type = _safe_notification_event_type(event_type)
+    if safe_event_type:
+        return ensure_notification_event_prompt(safe_event_type)
     return settings.resolve_runtime_path(settings.bot_notification_prompt_path)
 
 
-def _read_notification_prompt() -> str:
-    path = _notification_prompt_path()
+def _read_notification_prompt(event_type: str | None = None) -> str:
+    path = _notification_prompt_path(event_type)
     if not path.exists():
         ensure_bot_files()
     return path.read_text(encoding='utf-8')
@@ -1237,13 +1378,19 @@ def admin_notifications_status(
         },
         'cron_health': {
             'now': now.isoformat(),
+            'now_label': _admin_datetime_label(now),
             'vikunja_reconcile_last_run_at': reconcile_last_run_at.isoformat() if reconcile_last_run_at else None,
+            'vikunja_reconcile_last_run_label': _admin_datetime_label(reconcile_last_run_at),
             'vikunja_reconcile_seconds_since': reconcile_seconds_since,
             'vikunja_reconcile_running': reconcile_seconds_since is not None and reconcile_seconds_since <= 180,
             'vikunja_reconcile_note': 'OK nếu cron chạy mỗi phút và giá trị này dưới 180 giây.',
             'last_reminder_run_at': latest_reminder_run.created_at.isoformat() if latest_reminder_run else None,
+            'last_reminder_run_label': _admin_datetime_label(latest_reminder_run.created_at) if latest_reminder_run else None,
             'last_notification_event_at': latest_notification_event.created_at.isoformat() if latest_notification_event else None,
+            'last_notification_event_label': _admin_datetime_label(latest_notification_event.created_at) if latest_notification_event else None,
+            'timezone': settings.app_timezone,
         },
+        'event_prompt_types': ADMIN_NOTIFICATION_EVENT_TYPES,
         'contacts': _admin_contact_snapshot(db),
         'notification_counts': notification_counts,
         'reminder_counts': reminder_counts,
@@ -1258,6 +1405,7 @@ def admin_notifications_status(
                 'last_error': event.last_error,
                 'message': str((event.payload or {}).get('message') or '')[:240],
                 'created_at': event.created_at.isoformat() if event.created_at else None,
+                'created_at_label': _admin_datetime_label(event.created_at),
             }
             for event in latest_events
         ],
@@ -1268,6 +1416,7 @@ def admin_notifications_status(
                 'rule_name': run.rule.name if run.rule else None,
                 'rule_type': run.rule.rule_type.value if run.rule else None,
                 'scheduled_for': run.scheduled_for.isoformat() if run.scheduled_for else None,
+                'scheduled_for_label': _admin_datetime_label(run.scheduled_for),
                 'status': run.status.value if hasattr(run.status, 'value') else str(run.status),
                 'notification_event_id': run.notification_event_id,
                 'run_key': run.run_key,
@@ -1275,6 +1424,7 @@ def admin_notifications_status(
                 'snoozed_until': run.snoozed_until.isoformat() if run.snoozed_until else None,
                 'escalated_at': run.escalated_at.isoformat() if run.escalated_at else None,
                 'created_at': run.created_at.isoformat() if run.created_at else None,
+                'created_at_label': _admin_datetime_label(run.created_at),
             }
             for run in latest_runs
         ],
@@ -1294,6 +1444,7 @@ def admin_notifications_status(
                 'text': interaction.text,
                 'payload': interaction.payload,
                 'created_at': interaction.created_at.isoformat() if interaction.created_at else None,
+                'created_at_label': _admin_datetime_label(interaction.created_at),
             }
             for interaction in latest_interactions
         ],
@@ -1302,24 +1453,37 @@ def admin_notifications_status(
 
 @app.get('/admin/notifications/prompt')
 def admin_notifications_get_prompt(
+    event_type: str | None = Query(default=None),
     actor: User = Depends(get_actor),
 ) -> dict[str, str]:
     _ensure_admin(actor)
-    path = _notification_prompt_path()
-    return {'path': str(path), 'content': _read_notification_prompt()}
+    safe_event_type = _safe_notification_event_type(event_type)
+    path = _notification_prompt_path(safe_event_type)
+    return {
+        'scope': safe_event_type or 'global',
+        'path': str(path),
+        'content': _read_notification_prompt(safe_event_type),
+    }
 
 
 @app.put('/admin/notifications/prompt')
 def admin_notifications_update_prompt(
     payload: AdminNotificationPromptUpdate,
+    event_type: str | None = Query(default=None),
     actor: User = Depends(get_actor),
 ) -> dict[str, str | int]:
     _ensure_admin(actor)
-    path = _notification_prompt_path()
+    safe_event_type = _safe_notification_event_type(event_type)
+    path = _notification_prompt_path(safe_event_type)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = payload.content.strip() + '\n'
     path.write_text(content, encoding='utf-8')
-    return {'path': str(path), 'bytes': len(content.encode('utf-8')), 'content': content}
+    return {
+        'scope': safe_event_type or 'global',
+        'path': str(path),
+        'bytes': len(content.encode('utf-8')),
+        'content': content,
+    }
 
 
 @app.post('/admin/notifications/reminders/{reminder_id}/test')
