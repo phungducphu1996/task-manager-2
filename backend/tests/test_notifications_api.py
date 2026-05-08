@@ -209,6 +209,48 @@ def test_internal_notification_job_requires_token(client) -> None:
     assert wrong.status_code == 403
 
 
+def test_admin_notification_ui_and_status(client) -> None:
+    users = client.get('/users').json()
+    admin, member, _ = select_users(users)
+
+    page = client.get('/admin/notifications/ui')
+    assert page.status_code == 200
+    assert 'Noti Control' in page.text
+
+    forbidden = client.get('/admin/notifications/status', headers=actor_headers(member['id']))
+    assert forbidden.status_code == 403
+
+    status_response = client.get('/admin/notifications/status', headers=actor_headers(admin['id']))
+    assert status_response.status_code == 200
+    data = status_response.json()
+    assert data['config']['zalo_worker_configured'] is True
+    assert data['notification_counts']['pending'] == 0
+    assert 'reminder_counts' in data
+
+
+def test_admin_notification_test_endpoint_sends_zalo(client, monkeypatch) -> None:
+    calls = install_worker_success_stub(monkeypatch)
+    users = client.get('/users').json()
+    admin, _, _ = select_users(users)
+
+    response = client.post(
+        '/admin/notifications/test',
+        json={'channel': 'group', 'target_id': 'test-zalo-group', 'message': 'Ping noti UI'},
+        headers=actor_headers(admin['id']),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['ok'] is True
+    assert calls == [
+        {
+            'channel': 'group',
+            'target_id': 'test-zalo-group',
+            'message': 'Ping noti UI',
+            'context': {'source': 'admin_notification_ui'},
+        }
+    ]
+
+
 def test_morning_job_builds_group_admin_and_user_messages(client, db_session, monkeypatch) -> None:
     install_worker_success_stub(monkeypatch)
     settings = get_settings()

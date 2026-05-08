@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, inspect, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -23,8 +25,10 @@ from .models import (
     BotConversationMessage,
     BotConversationState,
     BotMemoryFact,
+    NotificationChannel,
     NotificationDelivery,
     NotificationEvent,
+    NotificationStatus,
     ReminderInteraction,
     ReminderRule,
     ReminderRun,
@@ -46,8 +50,10 @@ from .notifications import (
     enqueue_task_deleted_notifications,
     enqueue_task_status_transition_notifications,
     enqueue_task_updated_notifications,
+    dispatch_due_notification_events,
     is_internal_token_valid,
     run_daily_notification_job,
+    send_zalo_text,
 )
 from .schemas import (
     LoginRequest,
@@ -116,6 +122,13 @@ MEMBER_ALLOWED_STATUSES = {TaskStatus.todo, TaskStatus.doing, TaskStatus.review}
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
 logger = getLogger(__name__)
+
+
+class AdminNotificationTestRequest(BaseModel):
+    channel: NotificationChannel = NotificationChannel.user
+    target_id: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=2000)
+    context: dict[str, Any] = Field(default_factory=dict)
 
 app.add_middleware(
     CORSMiddleware,
@@ -216,6 +229,312 @@ def _create_link_attachment_record(
 
 def _forbidden(message: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=message)
+
+
+def _ensure_admin(actor: User) -> None:
+    if not _is_admin(actor):
+        raise _forbidden('Only admins can manage notification settings.')
+
+
+def _admin_notifications_ui_html() -> str:
+    return r"""
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hazel Noti Control</title>
+  <style>
+    :root {
+      --bg: #171a21;
+      --panel: #222733;
+      --panel-2: #2b3140;
+      --text: #f3f4f8;
+      --muted: #aeb6c8;
+      --line: #3a4252;
+      --accent: #8fb7ff;
+      --good: #8de6b2;
+      --warn: #ffd36e;
+      --bad: #ff9a9a;
+      --radius: 18px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 20% 0%, rgba(143,183,255,.22), transparent 34rem),
+        radial-gradient(circle at 90% 10%, rgba(141,230,178,.12), transparent 26rem),
+        var(--bg);
+      font-family: ui-rounded, "Avenir Next", "SF Pro Rounded", "Nunito", system-ui, sans-serif;
+    }
+    main { width: min(1180px, calc(100% - 28px)); margin: 0 auto; padding: 28px 0 48px; }
+    header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
+    h1 { margin: 0; font-size: clamp(32px, 5vw, 58px); line-height: .92; letter-spacing: -.04em; }
+    h2 { margin: 0 0 14px; font-size: 22px; }
+    p { color: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .card { grid-column: span 6; background: rgba(34,39,51,.86); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; box-shadow: 0 20px 60px rgba(0,0,0,.22); }
+    .wide { grid-column: span 12; }
+    .metric-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { background: var(--panel-2); border: 1px solid var(--line); border-radius: 14px; padding: 12px; }
+    .metric b { display: block; font-size: 26px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    label { display: block; color: var(--muted); font-size: 13px; margin: 10px 0 6px; }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 11px 12px;
+      color: var(--text);
+      background: #1d222c;
+      outline: none;
+      font: inherit;
+    }
+    textarea { min-height: 92px; resize: vertical; }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      color: #12151c;
+      background: var(--accent);
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button.secondary { background: #394254; color: var(--text); }
+    button.danger { background: #4b3035; color: var(--bad); }
+    button.good { background: #234536; color: var(--good); }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: #303747; color: var(--muted); font-size: 13px; }
+    .ok { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 11px 8px; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    td { font-size: 14px; }
+    pre { white-space: pre-wrap; overflow: auto; background: #11151d; border: 1px solid var(--line); border-radius: 14px; padding: 12px; max-height: 260px; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 760px) {
+      header { display: block; }
+      .card { grid-column: span 12; }
+      .metric-row, .split { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <p class="pill">Hazel Bridge</p>
+      <h1>Noti Control</h1>
+      <p>Quản lý reminder, test Zalo, chạy reconcile/tick thủ công.</p>
+    </div>
+    <div class="pill" id="authState">Chưa đăng nhập</div>
+  </header>
+
+  <section class="grid">
+    <div class="card" id="loginCard">
+      <h2>Đăng nhập</h2>
+      <div class="split">
+        <div><label>Username</label><input id="username" value="admin" autocomplete="username" /></div>
+        <div><label>Password</label><input id="password" type="password" autocomplete="current-password" /></div>
+      </div>
+      <div class="actions">
+        <button onclick="login()">Login</button>
+        <button class="secondary" onclick="logout()">Logout</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>System</h2>
+      <div class="metric-row" id="metrics"></div>
+      <div class="actions">
+        <button onclick="loadAll()">Refresh</button>
+        <button class="good" onclick="runReconcile()">Run reconcile</button>
+        <button class="secondary" onclick="runTick()">Run reminder tick</button>
+        <button class="secondary" onclick="dispatchPending()">Dispatch pending</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Test Zalo</h2>
+      <div class="split">
+        <div><label>Channel</label><select id="testChannel"><option value="user">user</option><option value="group">group</option></select></div>
+        <div><label>Target ID</label><input id="testTarget" placeholder="zalo user id hoặc group id" /></div>
+      </div>
+      <label>Message</label>
+      <textarea id="testMessage">Test noti từ Hazel Bridge nè.</textarea>
+      <div class="actions"><button onclick="sendTest()">Send test</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Tạo reminder nhanh</h2>
+      <label>Name</label><input id="ruleName" placeholder="Daily group digest 08:00" />
+      <div class="split">
+        <div><label>Type</label><select id="ruleType">
+          <option value="daily_group_digest">daily_group_digest</option>
+          <option value="daily_member_checkin">daily_member_checkin</option>
+          <option value="daily_strategy">daily_strategy</option>
+          <option value="task_nudge">task_nudge</option>
+        </select></div>
+        <div><label>Schedule</label><select id="scheduleType"><option value="daily">daily</option><option value="interval">interval</option></select></div>
+      </div>
+      <div class="split">
+        <div><label>HH:MM</label><input id="scheduleTime" placeholder="08:00" /></div>
+        <div><label>Interval minutes</label><input id="intervalMinutes" type="number" min="1" placeholder="60" /></div>
+      </div>
+      <div class="split">
+        <div><label>Target channel</label><select id="targetChannel"><option value="">auto</option><option value="user">user</option><option value="group">group</option></select></div>
+        <div><label>Target ID</label><input id="targetId" placeholder="optional" /></div>
+      </div>
+      <div class="actions"><button onclick="createRule()">Create rule</button></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Reminder rules</h2>
+      <div id="rules"></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Result</h2>
+      <pre id="result">Sẵn sàng rồi anh.</pre>
+    </div>
+  </section>
+</main>
+
+<script>
+const root = location.pathname.split('/admin/notifications')[0] || '';
+const adminBase = root + '/admin/notifications';
+let token = localStorage.getItem('hazel-noti-token') || '';
+
+function headers(extra = {}) {
+  return token ? {'Authorization': 'Bearer ' + token, ...extra} : extra;
+}
+function show(data) {
+  document.getElementById('result').textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+function setAuthState() {
+  document.getElementById('authState').textContent = token ? 'Đã có token' : 'Chưa đăng nhập';
+}
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: headers(opts.headers || {}) });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = text; }
+  if (!res.ok) throw new Error(typeof data === 'string' ? data : (data.detail || JSON.stringify(data)));
+  return data;
+}
+async function login() {
+  const data = await api(root + '/auth/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({username: username.value, password: password.value})
+  });
+  token = data.access_token;
+  localStorage.setItem('hazel-noti-token', token);
+  setAuthState();
+  await loadAll();
+}
+function logout() {
+  token = '';
+  localStorage.removeItem('hazel-noti-token');
+  setAuthState();
+  show('Đã logout.');
+}
+function renderMetrics(status) {
+  const c = status.notification_counts || {};
+  const r = status.reminder_counts || {};
+  const config = status.config || {};
+  document.getElementById('metrics').innerHTML = [
+    ['Pending', c.pending || 0, 'Đang chờ gửi'],
+    ['Sent', c.sent || 0, 'Đã gửi'],
+    ['Failed', c.failed || 0, 'Lỗi'],
+    ['Rules', r.enabled || 0, 'Reminder bật'],
+  ].map(x => `<div class="metric"><b>${x[1]}</b><span>${x[0]} · ${x[2]}</span></div>`).join('');
+  if (config.zalo_group_id) document.getElementById('testTarget').placeholder = config.zalo_group_id;
+}
+function renderRules(rules) {
+  if (!rules.length) {
+    document.getElementById('rules').innerHTML = '<p>Chưa có reminder rule.</p>';
+    return;
+  }
+  document.getElementById('rules').innerHTML = `<table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Schedule</th><th>Target</th><th>Status</th><th></th></tr></thead><tbody>${
+    rules.map(rule => `<tr>
+      <td>#${rule.id}</td>
+      <td>${escapeHtml(rule.name)}</td>
+      <td>${rule.rule_type}</td>
+      <td>${rule.schedule_type}${rule.schedule_time ? ' · ' + rule.schedule_time : ''}${rule.interval_minutes ? ' · ' + rule.interval_minutes + 'm' : ''}</td>
+      <td>${rule.target_channel || 'auto'}<br><span class="pill">${escapeHtml(rule.target_id || rule.user_id || '')}</span></td>
+      <td><span class="${rule.enabled ? 'ok' : 'bad'}">${rule.enabled ? 'enabled' : 'disabled'}</span></td>
+      <td><button class="secondary" onclick="toggleRule(${rule.id}, ${!rule.enabled})">${rule.enabled ? 'Disable' : 'Enable'}</button></td>
+    </tr>`).join('')
+  }</tbody></table>`;
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+async function loadAll() {
+  setAuthState();
+  const [status, rules] = await Promise.all([
+    api(adminBase + '/status'),
+    api(root + '/reminders')
+  ]);
+  renderMetrics(status);
+  renderRules(rules);
+  show(status);
+}
+async function sendTest() {
+  const data = await api(adminBase + '/test', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({channel: testChannel.value, target_id: testTarget.value, message: testMessage.value})
+  });
+  show(data);
+}
+async function runReconcile() {
+  show(await api(adminBase + '/reconcile', {method: 'POST'}));
+}
+async function dispatchPending() {
+  show(await api(adminBase + '/dispatch', {method: 'POST'}));
+}
+async function runTick() {
+  show(await api(root + '/reminders/tick', {method: 'POST'}));
+}
+async function toggleRule(id, enabled) {
+  show(await api(root + '/reminders/' + id, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled})
+  }));
+  await loadAll();
+}
+async function createRule() {
+  const payload = {
+    name: ruleName.value,
+    rule_type: ruleType.value,
+    enabled: true,
+    schedule_type: scheduleType.value,
+    timezone: 'Asia/Ho_Chi_Minh',
+    payload: {}
+  };
+  if (scheduleTime.value) payload.schedule_time = scheduleTime.value;
+  if (intervalMinutes.value) payload.interval_minutes = Number(intervalMinutes.value);
+  if (targetChannel.value) payload.target_channel = targetChannel.value;
+  if (targetId.value) payload.target_id = targetId.value;
+  show(await api(root + '/reminders', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }));
+  await loadAll();
+}
+setAuthState();
+if (token) loadAll().catch(err => show(err.message));
+</script>
+</body>
+</html>
+"""
 
 
 def _trigger_task_created_notification(db: Session, task: Task) -> None:
@@ -570,6 +889,101 @@ def on_startup() -> None:
 @app.get('/health')
 def healthcheck() -> dict[str, str]:
     return {'status': 'ok'}
+
+
+@app.get('/admin/notifications/ui', response_class=HTMLResponse)
+def admin_notifications_ui() -> HTMLResponse:
+    return HTMLResponse(_admin_notifications_ui_html())
+
+
+@app.get('/admin/notifications/status')
+def admin_notifications_status(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+
+    notification_counts = {status_value.value: 0 for status_value in NotificationStatus}
+    for status_value, count in db.execute(
+        select(NotificationEvent.status, func.count(NotificationEvent.id)).group_by(NotificationEvent.status)
+    ).all():
+        key = status_value.value if hasattr(status_value, 'value') else str(status_value)
+        notification_counts[key] = int(count or 0)
+
+    reminder_counts = {
+        'total': int(db.scalar(select(func.count(ReminderRule.id))) or 0),
+        'enabled': int(db.scalar(select(func.count(ReminderRule.id)).where(ReminderRule.enabled.is_(True))) or 0),
+        'disabled': int(db.scalar(select(func.count(ReminderRule.id)).where(ReminderRule.enabled.is_(False))) or 0),
+    }
+
+    latest_events = db.scalars(select(NotificationEvent).order_by(NotificationEvent.id.desc()).limit(8)).all()
+    return {
+        'config': {
+            'zalo_worker_configured': bool(settings.zalo_worker_url),
+            'zalo_group_id': settings.zalo_group_id,
+            'notify_internal_token_configured': bool(settings.notify_internal_token),
+            'reminder_tick_token_configured': reminder_internal_token_configured(),
+            'vikunja_configured': settings.vikunja_enabled,
+            'vikunja_project_id': settings.vikunja_project_id,
+            'retry_delays': settings.notification_retry_delays,
+            'max_retries': settings.notification_max_retries,
+            'delivery_batch_limit': settings.notification_delivery_batch_limit,
+        },
+        'notification_counts': notification_counts,
+        'reminder_counts': reminder_counts,
+        'latest_events': [
+            {
+                'id': event.id,
+                'event_type': event.event_type,
+                'channel': event.channel.value,
+                'target_id': event.target_id,
+                'status': event.status.value,
+                'attempt_count': event.attempt_count,
+                'last_error': event.last_error,
+                'message': str((event.payload or {}).get('message') or '')[:240],
+                'created_at': event.created_at.isoformat() if event.created_at else None,
+            }
+            for event in latest_events
+        ],
+    }
+
+
+@app.post('/admin/notifications/test')
+def admin_notifications_test(
+    payload: AdminNotificationTestRequest,
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    ok, response_status, response_body, error = send_zalo_text(
+        channel=payload.channel,
+        target_id=payload.target_id,
+        message=payload.message,
+        context={'source': 'admin_notification_ui', **payload.context},
+    )
+    return {
+        'ok': ok,
+        'status_code': response_status,
+        'body': response_body,
+        'error': error,
+    }
+
+
+@app.post('/admin/notifications/dispatch')
+def admin_notifications_dispatch(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, int]:
+    _ensure_admin(actor)
+    return dispatch_due_notification_events(db)
+
+
+@app.post('/admin/notifications/reconcile')
+def admin_notifications_reconcile(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    return reconcile_vikunja_bridge(db)
 
 
 @app.post('/internal/notifications/run')
