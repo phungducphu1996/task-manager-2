@@ -1,0 +1,10 @@
+[Unit]
+Description=Task Manager Reminder Tick
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/task-manager
+ExecStart=/opt/task-manager/deploy/systemd/run-reminder-tick.sh

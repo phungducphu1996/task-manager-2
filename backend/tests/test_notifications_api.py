@@ -235,6 +235,8 @@ def test_admin_notification_ui_and_status(client) -> None:
     assert data['cron_health']['vikunja_reconcile_running'] is False
     assert data['cron_health']['timezone'] == 'Asia/Ho_Chi_Minh'
     assert 'vikunja_task_assigned' in data['event_prompt_types']
+    assert 'daily_group_digest' in data['core_rule_summary']
+    assert data['scheduler_plan']['timer_name'] == 'taskmanager-reminder-tick.timer'
 
 
 def test_admin_notification_test_endpoint_sends_zalo(client, monkeypatch) -> None:
@@ -328,8 +330,70 @@ def test_admin_can_test_existing_reminder_rule_immediately(client, monkeypatch) 
     data = response.json()
     assert data['rule_id'] == rule_id
     assert data['runs_created'] == 1
+    assert data['targets_checked'] == 1
+    assert data['targets'][0]['channel'] == 'group'
     assert data['dispatch']['sent'] == 1
     assert calls and calls[0]['channel'] == 'group'
+
+
+def test_admin_can_bootstrap_core_daily_rules_and_read_scheduler_plan(client) -> None:
+    users = client.get('/users').json()
+    admin, member, _ = select_users(users)
+
+    forbidden = client.post(
+        '/admin/notifications/bootstrap-core-rules',
+        headers=actor_headers(member['id']),
+    )
+    assert forbidden.status_code == 403
+
+    bootstrapped = client.post(
+        '/admin/notifications/bootstrap-core-rules',
+        headers=actor_headers(admin['id']),
+    )
+    assert bootstrapped.status_code == 200
+    data = bootstrapped.json()
+    assert 'core_rule_summary' in data
+    assert data['core_rule_summary']['daily_group_digest']['canonical_rule_id'] is not None
+    assert data['core_rule_summary']['daily_member_checkin']['canonical_rule_id'] is not None
+    assert data['core_rule_summary']['daily_strategy']['canonical_rule_id'] is not None
+
+    plan = client.get(
+        '/admin/notifications/scheduler/install-plan',
+        headers=actor_headers(admin['id']),
+    )
+    assert plan.status_code == 200
+    assert plan.json()['service_name'] == 'taskmanager-reminder-tick.service'
+
+
+def test_admin_test_rule_reports_missing_target_cleanly(client) -> None:
+    users = client.get('/users').json()
+    admin, _, _ = select_users(users)
+
+    created = client.post(
+        '/reminders',
+        json={
+            'name': 'Broken task nudge',
+            'rule_type': 'daily_group_digest',
+            'target_channel': 'group',
+            'schedule_type': 'daily',
+            'schedule_time': '08:00',
+            'enabled': True,
+        },
+        headers=actor_headers(admin['id']),
+    )
+    assert created.status_code == 201
+    rule_id = created.json()['id']
+
+    response = client.post(
+        f'/admin/notifications/reminders/{rule_id}/test',
+        headers=actor_headers(admin['id']),
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data['targets_checked'] == 1
+    assert data['runs_created'] == 1
+    assert 'target' in (data['note'] or '').lower()
 
 
 def test_morning_job_builds_group_admin_and_user_messages(client, db_session, monkeypatch) -> None:

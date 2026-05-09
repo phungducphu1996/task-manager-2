@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, time
 import hmac
 from logging import getLogger
 from os.path import basename
@@ -91,6 +91,7 @@ from .schemas import (
 from .reminders import (
     create_reminder_rule,
     create_task_nudge_rule,
+    diagnose_reminder_rules,
     is_reminder_internal_token_valid,
     reminder_internal_token_configured,
     run_reminder_rule_now,
@@ -156,6 +157,28 @@ ADMIN_NOTIFICATION_EVENT_TYPES = [
     'reminder_task_nudge',
     'reminder_admin_escalation',
 ]
+
+CORE_DAILY_RULE_SPECS: dict[str, dict[str, Any]] = {
+    'daily_group_digest': {
+        'name': '8AM group digest',
+        'rule_type': 'daily_group_digest',
+        'schedule_type': 'daily',
+        'schedule_time': time(8, 0),
+        'target_channel': NotificationChannel.group,
+    },
+    'daily_member_checkin': {
+        'name': '9AM member check-in',
+        'rule_type': 'daily_member_checkin',
+        'schedule_type': 'daily',
+        'schedule_time': time(9, 0),
+    },
+    'daily_strategy': {
+        'name': '9AM daily strategy',
+        'rule_type': 'daily_strategy',
+        'schedule_type': 'daily',
+        'schedule_time': time(9, 0),
+    },
+}
 
 app.add_middleware(
     CORSMiddleware,
@@ -420,6 +443,22 @@ def _admin_notifications_ui_html() -> str:
       </div>
     </div>
 
+    <div class="card" data-panel="overview">
+      <h2>Skill Deck</h2>
+      <p>Những thao tác anh sẽ dùng nhiều: chuẩn hóa bộ daily, test nhanh từng nhóm việc, và lấy plan cài scheduler chắc chắn hơn cron.</p>
+      <div class="actions">
+        <button onclick="bootstrapCoreRules()">Chuẩn hóa daily</button>
+        <button class="secondary" onclick="bootstrapCoreRules(true)">Chuẩn hóa + tắt rule trùng</button>
+        <button class="secondary" onclick="showSchedulerPlan()">Xem plan systemd timer</button>
+      </div>
+      <div class="actions">
+        <button class="good" onclick="testCoreRule('daily_group_digest')">Test group digest</button>
+        <button class="good" onclick="testCoreRule('daily_member_checkin')">Test member check-in</button>
+        <button class="good" onclick="testCoreRule('daily_strategy')">Test daily strategy</button>
+      </div>
+      <div id="coreRules"></div>
+    </div>
+
     <div class="card" data-panel="test">
       <h2>Test Zalo</h2>
       <div class="split">
@@ -431,8 +470,9 @@ def _admin_notifications_ui_html() -> str:
       <div class="actions"><button onclick="sendTest()">Send test</button></div>
     </div>
 
-    <div class="card" data-panel="rules">
-      <h2>Tạo reminder nhanh</h2>
+    <div class="card" data-panel="rules" id="ruleFormCard">
+      <h2 id="ruleFormTitle">Tạo reminder nhanh</h2>
+      <p id="ruleFormHint">Chọn rule bên dưới để edit, hoặc tạo rule mới tại đây.</p>
       <label>Name</label><input id="ruleName" placeholder="Daily group digest 08:00" />
       <div class="split">
         <div><label>Type</label><select id="ruleType">
@@ -531,6 +571,10 @@ function headers(extra = {}) {
 function show(data) {
   document.getElementById('result').textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
 }
+function showError(error) {
+  const message = error && error.message ? error.message : String(error);
+  show(`Lỗi: ${message}`);
+}
 function setAuthState() {
   document.getElementById('authState').textContent = token ? 'Đã có token' : 'Chưa đăng nhập';
 }
@@ -557,6 +601,15 @@ async function api(path, opts = {}) {
   try { data = text ? JSON.parse(text) : {}; } catch { data = text; }
   if (!res.ok) throw new Error(typeof data === 'string' ? data : (data.detail || JSON.stringify(data)));
   return data;
+}
+async function runAction(label, fn) {
+  try {
+    show(`${label}...`);
+    return await fn();
+  } catch (error) {
+    showError(error);
+    throw error;
+  }
 }
 async function login() {
   const data = await api(root + '/auth/login', {
@@ -592,6 +645,19 @@ function renderMetrics(status) {
     `Giờ server: ${cron.now_label || formatDateTime(cron.now)} · Reconcile cuối: ${cron.vikunja_reconcile_last_run_label || 'chưa có'} · Event cuối: ${cron.last_notification_event_label || 'chưa có'}`;
   if (config.zalo_group_id) document.getElementById('testTarget').placeholder = config.zalo_group_id;
 }
+function renderCoreRules(summary) {
+  const entries = Object.entries(summary || {});
+  if (!entries.length) {
+    document.getElementById('coreRules').innerHTML = '<p class="mini">Chưa có core rule summary.</p>';
+    return;
+  }
+  document.getElementById('coreRules').innerHTML = entries.map(([ruleType, item]) => `
+    <div class="event-card">
+      <b>${escapeHtml(item.label || ruleType)}</b>
+      <div class="mini">rule #${item.canonical_rule_id || 'missing'} · ${item.schedule_time ? normalizeTime(item.schedule_time) + ' GMT+7' : 'chưa set giờ'} · ${item.enabled ? 'enabled' : 'disabled'} · duplicate: ${(item.duplicate_rule_ids || []).length}</div>
+    </div>
+  `).join('');
+}
 function useTarget(channel, targetId) {
   document.getElementById('testChannel').value = channel;
   document.getElementById('testTarget').value = targetId;
@@ -622,26 +688,35 @@ function renderContacts(status) {
       <tbody>${groupRows}${userRows}</tbody>
     </table>`;
 }
-function renderRules(rules) {
+function renderRules(rules, diagnostics = []) {
   window.reminderRulesById = Object.fromEntries(rules.map(rule => [String(rule.id), rule]));
+  window.reminderRulesByType = Object.fromEntries(rules.map(rule => [String(rule.rule_type), rule]));
+  const diagnosticsById = Object.fromEntries((diagnostics || []).map(item => [String(item.id), item]));
+  window.reminderRuleDiagnosticsById = diagnosticsById;
   if (!rules.length) {
     document.getElementById('rules').innerHTML = '<p>Chưa có reminder rule.</p>';
     return;
   }
   document.getElementById('rules').innerHTML = `<div class="toolbar"><span class="pill">${rules.filter(rule => rule.enabled).length} enabled / ${rules.length} total</span><button class="secondary" onclick="clearRuleForm(); showTab('rules')">New rule</button></div><table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Schedule</th><th>Target</th><th>Status</th><th></th></tr></thead><tbody>${
-    rules.map(rule => `<tr>
+    rules.map(rule => {
+      const diag = diagnosticsById[String(rule.id)] || {};
+      const targetText = (diag.targets || []).map(target => `${target.channel}:${target.user_name || target.target_id || 'missing'}`).join(', ');
+      const healthClass = !rule.enabled ? 'bad' : diag.due_now ? 'warn' : (diag.target_count === 0 ? 'bad' : 'ok');
+      return `<tr>
       <td>#${rule.id}</td>
-      <td>${escapeHtml(rule.name)}</td>
+      <td>${escapeHtml(rule.name)}<br><span class="mini">${escapeHtml(diag.note || '')}</span></td>
       <td>${ruleTypeLabel(rule.rule_type)}<br><span class="mini">${rule.rule_type}</span></td>
       <td>${rule.schedule_type}${rule.schedule_time ? ' · ' + normalizeTime(rule.schedule_time) + ' GMT+7' : ''}${rule.interval_minutes ? ' · mỗi ' + rule.interval_minutes + 'm' : ''}</td>
-      <td>${rule.target_channel || 'auto'}<br><span class="pill">${escapeHtml(rule.target_id || rule.user_id || rule.task_id || '')}</span></td>
-      <td><span class="${rule.enabled ? 'ok' : 'bad'}">${rule.enabled ? 'enabled' : 'disabled'}</span></td>
+      <td>${rule.target_channel || 'auto'}<br><span class="pill">${escapeHtml(targetText || rule.target_id || rule.user_id || rule.task_id || 'auto')}</span></td>
+      <td><span class="${rule.enabled ? 'ok' : 'bad'}">${rule.enabled ? 'enabled' : 'disabled'}</span><br><span class="${healthClass}">${diag.due_now ? 'due now' : `${diag.target_count ?? 0} targets`}</span><br><span class="mini">${escapeHtml(diag.last_run_at ? 'last ' + formatDateTime(diag.last_run_at) : 'chưa có run')}</span></td>
       <td>
         <button class="secondary" onclick="editRuleById(${rule.id})">Edit</button>
         <button class="good" onclick="testRule(${rule.id})">Test now</button>
+        <button class="secondary" onclick="inspectRule(${rule.id})">Inspect</button>
         <button class="secondary" onclick="toggleRule(${rule.id}, ${!rule.enabled})">${rule.enabled ? 'Disable' : 'Enable'}</button>
       </td>
-    </tr>`).join('')
+    </tr>`;
+    }).join('')
   }</tbody></table>`;
 }
 function ruleTypeLabel(type) {
@@ -707,8 +782,9 @@ async function loadAll() {
     api(adminBase + '/prompt')
   ]);
   renderMetrics(status);
+  renderCoreRules(status.core_rule_summary || {});
   renderContacts(status);
-  renderRules(rules);
+  renderRules(rules, status.rule_diagnostics || []);
   renderRuns(status);
   renderPromptScopes(status.event_prompt_types || []);
   document.getElementById('notificationPrompt').value = promptData.content || '';
@@ -716,32 +792,55 @@ async function loadAll() {
   show(status);
 }
 async function sendTest() {
-  const data = await api(adminBase + '/test', {
+  const data = await runAction('Đang gửi test Zalo', () => api(adminBase + '/test', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({channel: testChannel.value, target_id: testTarget.value, message: testMessage.value})
-  });
+  }));
   show(data);
 }
 async function runReconcile() {
-  show(await api(adminBase + '/reconcile', {method: 'POST'}));
+  show(await runAction('Đang chạy reconcile', () => api(adminBase + '/reconcile', {method: 'POST'})));
 }
 async function dispatchPending() {
-  show(await api(adminBase + '/dispatch', {method: 'POST'}));
+  show(await runAction('Đang dispatch pending notifications', () => api(adminBase + '/dispatch', {method: 'POST'})));
 }
 async function runTick() {
-  show(await api(root + '/reminders/tick', {method: 'POST'}));
+  show(await runAction('Đang chạy reminder tick', () => api(root + '/reminders/tick', {method: 'POST'})));
+}
+async function bootstrapCoreRules(cleanupDuplicates = false) {
+  const suffix = cleanupDuplicates ? '?cleanup_duplicates=true' : '';
+  const data = await runAction(
+    cleanupDuplicates ? 'Đang chuẩn hóa daily rules và tắt rule trùng' : 'Đang chuẩn hóa daily rules',
+    () => api(adminBase + '/bootstrap-core-rules' + suffix, {method: 'POST'})
+  );
+  show(data);
+  await loadAll();
+}
+async function showSchedulerPlan() {
+  const data = await runAction('Đang lấy plan systemd timer', () => api(adminBase + '/scheduler/install-plan'));
+  show(data);
+}
+async function testCoreRule(ruleType) {
+  const rule = (window.reminderRulesByType || {})[String(ruleType)];
+  if (!rule) {
+    show(`Chưa có rule loại ${ruleType}. Bấm "Chuẩn hóa daily" trước nha.`);
+    return;
+  }
+  await testRule(rule.id);
 }
 async function toggleRule(id, enabled) {
-  show(await api(root + '/reminders/' + id, {
+  show(await runAction(`Đang ${enabled ? 'enable' : 'disable'} rule #${id}`, () => api(root + '/reminders/' + id, {
     method: 'PATCH',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({enabled})
-  }));
+  })));
   await loadAll();
 }
 function clearRuleForm() {
   editingRuleId.value = '';
+  document.getElementById('ruleFormTitle').textContent = 'Tạo reminder nhanh';
+  document.getElementById('ruleFormHint').textContent = 'Chọn rule bên dưới để edit, hoặc tạo rule mới tại đây.';
   ruleName.value = '';
   ruleType.disabled = false;
   ruleType.value = 'daily_group_digest';
@@ -760,7 +859,10 @@ function clearRuleForm() {
   document.getElementById('ruleCancelButton').style.display = 'none';
 }
 function editRule(rule) {
+  showTab('rules');
   editingRuleId.value = rule.id;
+  document.getElementById('ruleFormTitle').textContent = `Đang edit reminder #${rule.id}`;
+  document.getElementById('ruleFormHint').textContent = 'Form đã được fill từ rule hiện tại. Chỉnh xong bấm Save rule để lưu.';
   ruleName.value = rule.name || '';
   ruleType.value = rule.rule_type || 'daily_group_digest';
   ruleType.disabled = true;
@@ -777,12 +879,18 @@ function editRule(rule) {
   document.getElementById('ruleCreateButton').style.display = 'none';
   document.getElementById('ruleSaveButton').style.display = '';
   document.getElementById('ruleCancelButton').style.display = '';
-  show(`Đang edit reminder #${rule.id}`);
+  setTimeout(() => document.getElementById('ruleFormCard').scrollIntoView({behavior: 'smooth', block: 'start'}), 50);
+  show(`Đã mở form edit reminder #${rule.id}. Chỉnh field phía trên rồi bấm "Save rule" để lưu.`);
 }
 function editRuleById(id) {
   const rule = (window.reminderRulesById || {})[String(id)];
   if (!rule) return show(`Không tìm thấy rule #${id} trên UI hiện tại.`);
   editRule(rule);
+}
+function inspectRule(id) {
+  const rule = (window.reminderRulesById || {})[String(id)];
+  const diagnostics = (window.reminderRuleDiagnosticsById || {})[String(id)];
+  show({rule, diagnostics});
 }
 function normalizeTime(value) {
   return String(value || '').slice(0, 5);
@@ -812,27 +920,38 @@ function buildRulePayload({forUpdate = false} = {}) {
 }
 async function createRule() {
   const payload = buildRulePayload();
-  show(await api(root + '/reminders', {
+  show(await runAction('Đang tạo reminder rule', () => api(root + '/reminders', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
-  }));
+  })));
   clearRuleForm();
   await loadAll();
 }
 async function saveRule() {
   if (!editingRuleId.value) return show('Chưa chọn rule để edit.');
   const payload = buildRulePayload({forUpdate: true});
-  show(await api(root + '/reminders/' + editingRuleId.value, {
+  show(await runAction(`Đang lưu reminder #${editingRuleId.value}`, () => api(root + '/reminders/' + editingRuleId.value, {
     method: 'PATCH',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
-  }));
+  })));
   clearRuleForm();
   await loadAll();
 }
 async function testRule(id) {
-  show(await api(adminBase + '/reminders/' + id + '/test', {method: 'POST'}));
+  const data = await runAction(`Đang test rule #${id}`, () => api(adminBase + '/reminders/' + id + '/test', {method: 'POST'}));
+  const summary = {
+    rule_id: data.rule_id,
+    rule_name: data.rule_name,
+    targets_checked: data.targets_checked,
+    runs_created: data.runs_created,
+    runs_deduped: data.runs_deduped,
+    note: data.note || null,
+    dispatch: data.dispatch,
+    targets: data.targets || [],
+  };
+  show(summary);
   await loadAll();
 }
 async function loadPrompt() {
@@ -846,11 +965,11 @@ async function loadPrompt() {
 async function savePrompt() {
   const eventType = document.getElementById('promptScope').value;
   const suffix = eventType ? '?event_type=' + encodeURIComponent(eventType) : '';
-  const data = await api(adminBase + '/prompt' + suffix, {
+  const data = await runAction('Đang lưu prompt', () => api(adminBase + '/prompt' + suffix, {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({content: document.getElementById('notificationPrompt').value})
-  });
+  }));
   document.getElementById('promptPath').value = data.path || '';
   show(data);
 }
@@ -1304,6 +1423,151 @@ def _admin_contact_snapshot(db: Session) -> dict[str, Any]:
     }
 
 
+def _core_daily_rule_candidates(db: Session) -> list[ReminderRule]:
+    return db.scalars(
+        select(ReminderRule)
+        .where(ReminderRule.task_id.is_(None))
+        .where(ReminderRule.rule_type.in_(list(CORE_DAILY_RULE_SPECS.keys())))
+        .order_by(ReminderRule.id.asc())
+    ).all()
+
+
+def _core_daily_rule_summary(db: Session) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    rules = _core_daily_rule_candidates(db)
+    for rule_type, spec in CORE_DAILY_RULE_SPECS.items():
+        matching = [rule for rule in rules if rule.rule_type.value == rule_type]
+        canonical = matching[0] if matching else None
+        summary[rule_type] = {
+            'label': spec['name'],
+            'canonical_rule_id': canonical.id if canonical else None,
+            'enabled': canonical.enabled if canonical else False,
+            'schedule_time': canonical.schedule_time.isoformat() if canonical and canonical.schedule_time else None,
+            'duplicate_rule_ids': [rule.id for rule in matching[1:]],
+            'count': len(matching),
+        }
+    return summary
+
+
+def _bootstrap_core_daily_rules(db: Session, *, actor: User, cleanup_duplicates: bool = False) -> dict[str, Any]:
+    existing = _core_daily_rule_candidates(db)
+    created_ids: list[int] = []
+    updated_ids: list[int] = []
+    disabled_duplicate_ids: list[int] = []
+
+    for rule_type, spec in CORE_DAILY_RULE_SPECS.items():
+        matching = [rule for rule in existing if rule.rule_type.value == rule_type]
+        canonical = matching[0] if matching else None
+        values = {
+            'name': spec['name'],
+            'enabled': True,
+            'schedule_type': spec['schedule_type'],
+            'schedule_time': spec['schedule_time'],
+            'timezone': settings.reminder_timezone,
+            'target_channel': spec.get('target_channel'),
+            'target_id': settings.zalo_group_id if rule_type == 'daily_group_digest' else None,
+            'user_id': actor.id if rule_type == 'daily_strategy' else None,
+            'task_id': None,
+            'interval_minutes': None,
+            'max_runs_per_day': None,
+            'payload': {},
+        }
+        if canonical is None:
+            created = create_reminder_rule(
+                db,
+                actor=actor,
+                values={'rule_type': rule_type, **values},
+            )
+            created_ids.append(created.id)
+            existing.append(created)
+            matching = [created]
+        else:
+            update_reminder_rule(db, rule=canonical, values=values)
+            updated_ids.append(canonical.id)
+
+        if cleanup_duplicates and len(matching) > 1:
+            for duplicate in matching[1:]:
+                if duplicate.enabled:
+                    duplicate.enabled = False
+                    db.add(duplicate)
+                    disabled_duplicate_ids.append(duplicate.id)
+            db.commit()
+
+    return {
+        'created_rule_ids': created_ids,
+        'updated_rule_ids': updated_ids,
+        'disabled_duplicate_rule_ids': disabled_duplicate_ids,
+        'core_rule_summary': _core_daily_rule_summary(db),
+    }
+
+
+def _scheduler_install_plan() -> dict[str, Any]:
+    app_dir = '/opt/task-manager'
+    service_name = 'taskmanager-reminder-tick.service'
+    timer_name = 'taskmanager-reminder-tick.timer'
+    service_path = f'{app_dir}/deploy/systemd/{service_name}'
+    timer_path = f'{app_dir}/deploy/systemd/{timer_name}'
+    runner_path = f'{app_dir}/deploy/systemd/run-reminder-tick.sh'
+    installer_path = f'{app_dir}/deploy/systemd/install-reminder-timer.sh'
+    readme_path = f'{app_dir}/deploy/systemd/README.md'
+    install_commands = [
+        f'cd {app_dir}',
+        f'bash {installer_path}',
+    ]
+    debug_commands = [
+        f'{runner_path}',
+        f'systemctl status {timer_name} --no-pager',
+        f'systemctl list-timers --all | grep {timer_name.replace(".timer", "")}',
+        f'journalctl -u {service_name} -n 50 --no-pager',
+    ]
+    return {
+        'app_dir': app_dir,
+        'service_name': service_name,
+        'timer_name': timer_name,
+        'service_path': service_path,
+        'timer_path': timer_path,
+        'runner_path': runner_path,
+        'installer_path': installer_path,
+        'readme_path': readme_path,
+        'install_commands': install_commands,
+        'debug_commands': debug_commands,
+    }
+
+    seen_groups: set[str] = set()
+    groups: list[dict[str, str]] = []
+    for source, group_id in group_ids:
+        if not group_id or group_id in seen_groups:
+            continue
+        seen_groups.add(group_id)
+        groups.append(
+            {
+                'name': 'Hazel group' if group_id == settings.zalo_group_id else 'Allowed group',
+                'group_id': group_id,
+                'source': source,
+                'note': 'Dùng channel=group khi test gửi vào nhóm.',
+            }
+        )
+
+    return {
+        'users': [
+            {
+                'user_id': user.id,
+                'username': user.username,
+                'name': user.name,
+                'role': user.role,
+                'zalo_user_id': user.zalo_user_id,
+                'vikunja_user_id': (
+                    mappings_by_user_id[user.id].vikunja_user_id
+                    if user.id in mappings_by_user_id
+                    else None
+                ),
+            }
+            for user in users
+        ],
+        'groups': groups,
+    }
+
+
 def _safe_notification_event_type(event_type: str | None) -> str | None:
     if not event_type:
         return None
@@ -1363,6 +1627,7 @@ def admin_notifications_status(
     latest_reminder_run = db.scalar(select(ReminderRun).order_by(ReminderRun.id.desc()).limit(1))
     latest_notification_event = latest_events[0] if latest_events else None
     reconcile_seconds_since = _seconds_since(reconcile_last_run_at, now=now)
+    rule_diagnostics = diagnose_reminder_rules(db, now=now)
 
     return {
         'config': {
@@ -1392,6 +1657,9 @@ def admin_notifications_status(
         },
         'event_prompt_types': ADMIN_NOTIFICATION_EVENT_TYPES,
         'contacts': _admin_contact_snapshot(db),
+        'rule_diagnostics': rule_diagnostics,
+        'core_rule_summary': _core_daily_rule_summary(db),
+        'scheduler_plan': _scheduler_install_plan(),
         'notification_counts': notification_counts,
         'reminder_counts': reminder_counts,
         'latest_events': [
@@ -1497,6 +1765,31 @@ def admin_notifications_test_reminder_rule(
     if not rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Reminder not found.')
     return run_reminder_rule_now(db, rule=rule)
+
+
+@app.post('/admin/notifications/bootstrap-core-rules')
+def admin_notifications_bootstrap_core_rules(
+    cleanup_duplicates: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    if not settings.zalo_group_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='ZALO_GROUP_ID is not configured, cannot bootstrap daily group digest.',
+        )
+    result = _bootstrap_core_daily_rules(db, actor=actor, cleanup_duplicates=cleanup_duplicates)
+    result['cleanup_duplicates'] = cleanup_duplicates
+    return result
+
+
+@app.get('/admin/notifications/scheduler/install-plan')
+def admin_notifications_scheduler_install_plan(
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    return _scheduler_install_plan()
 
 
 @app.post('/admin/notifications/test')

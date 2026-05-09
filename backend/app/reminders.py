@@ -389,8 +389,17 @@ def _render_daily_strategy(db: Session, *, now: datetime) -> str:
 
 
 def _targets_for_rule(db: Session, rule: ReminderRule) -> list[tuple[NotificationChannel, str | None, User | None]]:
+    if rule.rule_type == ReminderRuleType.daily_group_digest:
+        if rule.target_channel:
+            return [(rule.target_channel, rule.target_id, None)]
+        return [(NotificationChannel.group, settings.zalo_group_id, None)]
+
     if rule.rule_type == ReminderRuleType.daily_member_checkin and not rule.user_id:
         return [(NotificationChannel.user, user.zalo_user_id, user) for user in _active_users(db) if user.zalo_user_id]
+
+    if rule.rule_type == ReminderRuleType.daily_strategy and not rule.user_id and not rule.target_channel:
+        admins = _active_admins(db)
+        return [(NotificationChannel.user, admin.zalo_user_id, admin) for admin in admins if admin.zalo_user_id]
 
     if rule.user_id:
         user = rule.user or db.get(User, rule.user_id)
@@ -399,17 +408,69 @@ def _targets_for_rule(db: Session, rule: ReminderRule) -> list[tuple[Notificatio
     if rule.target_channel:
         return [(rule.target_channel, rule.target_id, None)]
 
-    if rule.rule_type == ReminderRuleType.daily_group_digest:
-        return [(NotificationChannel.group, settings.zalo_group_id, None)]
-
-    if rule.rule_type == ReminderRuleType.daily_strategy:
-        admins = _active_admins(db)
-        return [(NotificationChannel.user, admin.zalo_user_id, admin) for admin in admins if admin.zalo_user_id]
-
     if rule.task and rule.task.assignee and rule.task.assignee.zalo_user_id:
         return [(NotificationChannel.user, rule.task.assignee.zalo_user_id, rule.task.assignee)]
 
     return []
+
+
+def diagnose_reminder_rules(db: Session, *, now: datetime | None = None) -> list[dict[str, Any]]:
+    current = now or now_reminder()
+    rules = db.scalars(
+        select(ReminderRule)
+        .options(joinedload(ReminderRule.task).joinedload(Task.assignee), joinedload(ReminderRule.user))
+        .order_by(ReminderRule.created_at.desc(), ReminderRule.id.desc())
+    ).unique().all()
+    diagnostics: list[dict[str, Any]] = []
+    for rule in rules:
+        due = _due_time_for_rule(db, rule, current)
+        last_run = _last_run(db, rule.id)
+        targets = _targets_for_rule(db, rule)
+        target_preview = [
+            {
+                'channel': channel.value if hasattr(channel, 'value') else str(channel),
+                'target_id': target_id,
+                'user_id': user.id if user else None,
+                'user_name': user.name if user else None,
+            }
+            for channel, target_id, user in targets
+        ]
+        issue = None
+        if not rule.enabled:
+            issue = 'Rule đang disabled.'
+        elif not targets:
+            issue = 'Không có target để gửi.'
+        elif any(not item['target_id'] for item in target_preview):
+            issue = 'Có target thiếu Zalo ID hoặc group ID.'
+        elif not due:
+            issue = 'Chưa tới giờ hoặc đã đạt giới hạn trong ngày.'
+        else:
+            issue = 'Đang due, tick tiếp theo sẽ tạo/gửi run nếu chưa duplicate.'
+
+        diagnostics.append(
+            {
+                'id': rule.id,
+                'name': rule.name,
+                'enabled': rule.enabled,
+                'rule_type': rule.rule_type.value,
+                'schedule_type': rule.schedule_type.value,
+                'schedule_time': rule.schedule_time.isoformat() if rule.schedule_time else None,
+                'interval_minutes': rule.interval_minutes,
+                'timezone': rule.timezone or settings.reminder_timezone,
+                'due_now': due is not None,
+                'due_at': due.isoformat() if due else None,
+                'target_count': len(targets),
+                'targets': target_preview,
+                'last_run_id': last_run.id if last_run else None,
+                'last_run_status': (
+                    last_run.status.value if last_run and hasattr(last_run.status, 'value') else str(last_run.status) if last_run else None
+                ),
+                'last_run_at': last_run.created_at.isoformat() if last_run and last_run.created_at else None,
+                'last_scheduled_for': last_run.scheduled_for.isoformat() if last_run and last_run.scheduled_for else None,
+                'note': issue,
+            }
+        )
+    return diagnostics
 
 
 def _message_for_rule(db: Session, rule: ReminderRule, *, now: datetime, user: User | None) -> str:
@@ -610,14 +671,34 @@ def run_reminder_rule_now(db: Session, *, rule: ReminderRule, now: datetime | No
 
     db.commit()
     dispatch = dispatch_due_notification_events(db)
+    target_preview = [
+        {
+            'channel': target_channel.value if hasattr(target_channel, 'value') else str(target_channel),
+            'target_id': target_id,
+            'user_id': user.id if user else None,
+            'user_name': user.name if user else None,
+        }
+        for target_channel, target_id, user in targets
+    ]
+    note = None
+    if not targets:
+        note = 'Rule này hiện không resolve được target nào để gửi.'
+    elif any(not item['target_id'] for item in target_preview):
+        note = 'Có target đang thiếu Zalo ID hoặc group ID nên sẽ bị skip.'
+    elif runs_created == 0 and runs_deduped == 0:
+        note = 'Không tạo được run mới, cần kiểm tra cấu hình rule.'
+    elif runs_created == 0 and runs_deduped > 0:
+        note = 'Request test bị dedupe, không tạo thêm run mới.'
     return {
         'now': current.isoformat(),
         'rule_id': rule.id,
         'rule_name': rule.name,
         'targets_checked': len(targets),
+        'targets': target_preview,
         'runs_created': runs_created,
         'runs_deduped': runs_deduped,
         'dispatch': dispatch,
+        'note': note,
     }
 
 
