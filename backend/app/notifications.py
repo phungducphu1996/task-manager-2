@@ -29,6 +29,7 @@ from .models import (
     User,
     VikunjaUserMapping,
 )
+from .task_links import ensure_task_link, legacy_task_url, vikunja_task_url
 from .vikunja import build_vikunja_task_status_map, get_vikunja_client, vikunja_task_status_from_payload
 
 logger = getLogger(__name__)
@@ -379,25 +380,11 @@ def _task_title(task: Task) -> str:
 
 
 def _task_url(task_id: int | None) -> str | None:
-    if task_id is None:
-        return None
-    base_url = (settings.task_public_base_url or '').strip().rstrip('/')
-    if not base_url:
-        return None
-    return f'{base_url}/tasks/{task_id}'
+    return legacy_task_url(task_id)
 
 
 def _vikunja_task_url(task_id: int | None) -> str | None:
-    if task_id is None:
-        return None
-    template = (settings.vikunja_task_url_template or '').strip()
-    project_id = settings.vikunja_project_id
-    if template:
-        return template.format(project_id=project_id or '', task_id=task_id)
-    base_url = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
-    if not base_url:
-        return None
-    return f'{base_url}/tasks/{task_id}'
+    return vikunja_task_url(task_id)
 
 
 def _parse_vikunja_datetime(value: Any) -> datetime | None:
@@ -543,8 +530,9 @@ def _render_realtime_notification_message(
     previous_status: TaskStatus | None = None,
     changed_fields: list[str] | None = None,
 ) -> str:
+    task_url = _task_url(task.id)
     if not is_bot_llm_configured():
-        return fallback
+        return ensure_task_link(fallback, task_url)
 
     event_payload = _task_notification_payload(
         event_type=event_type,
@@ -567,9 +555,9 @@ def _render_realtime_notification_message(
         message = generate_bot_reply(system_prompt=system_prompt, user_prompt=user_prompt).strip()
     except BotLLMError as exc:
         logger.warning('Failed to render notification with LLM for task_id=%s event=%s: %s', task.id, event_type, exc)
-        return fallback
+        return ensure_task_link(fallback, task_url)
 
-    return message[:1200] if message else fallback
+    return ensure_task_link(message[:1200] if message else fallback, event_payload['task'].get('url') or task_url)
 
 
 def _assigned_to_user_clause(user_id: str):
@@ -945,7 +933,7 @@ def _snapshot_task_description(task: DailyTaskSnapshot) -> str:
     due = task.due_date.strftime('%d/%m') if task.due_date else 'Anytime'
     parts = [f'Status: {task.status}', f'Due: {due}']
     if task.url:
-        parts.append(task.url)
+        parts.append(f'Link task: {task.url}')
     return ' · '.join(parts)
 
 

@@ -38,6 +38,7 @@ from .notifications import (
     dispatch_due_notification_events,
     enqueue_notification_event,
 )
+from .task_links import ensure_task_link, legacy_task_url
 
 settings = get_settings()
 
@@ -237,13 +238,20 @@ def _pending_review_tasks(db: Session) -> list[Task]:
 def _task_line(task: Task) -> str:
     assignee = task.assignee.name if task.assignee else 'Unassigned'
     due = task.due_date.strftime('%d/%m') if task.due_date else 'no due'
-    return f'• #{task.id} {task.title} — {assignee} — {task.status.value} — {due}'
+    line = f'• #{task.id} {task.title} — {assignee} — {task.status.value} — {due}'
+    url = legacy_task_url(task.id)
+    if url:
+        return f'{line}\n  Link task: {url}'
+    return line
 
 
 def _snapshot_line(task: DailyTaskSnapshot) -> str:
     assignee = ', '.join(task.assignee_names) or 'Unassigned'
     due = task.due_date.strftime('%d/%m') if task.due_date else 'no due'
-    return f'• #{task.id} {task.title} — {assignee} — {task.status} — {due}'
+    line = f'• #{task.id} {task.title} — {assignee} — {task.status} — {due}'
+    if task.url:
+        return f'{line}\n  Link task: {task.url}'
+    return line
 
 
 def _render_group_digest(db: Session, *, now: datetime, rule: ReminderRule) -> str:
@@ -320,12 +328,13 @@ def _render_task_nudge(rule: ReminderRule) -> str:
     if not task:
         return 'Nhắc task: task này không còn tồn tại.'
     due = task.due_date.strftime('%d/%m/%Y') if task.due_date else 'chưa có deadline'
-    return (
+    message = (
         f'Nhắc nhẹ task này nha:\n'
         f'{_task_line(task)}\n'
         f'Deadline: {due}\n'
         'Reply "ok" nếu đã nhận, hoặc nói blocker nếu đang kẹt.'
     )
+    return ensure_task_link(message, legacy_task_url(task.id))
 
 
 def _strategy_fallback(db: Session, *, now: datetime) -> str:
@@ -521,6 +530,8 @@ def _create_run_and_event(
         raise
 
     message = _message_for_rule(db, rule, now=now, user=user)
+    if rule.task_id:
+        message = ensure_task_link(message, legacy_task_url(rule.task_id))
     event, _ = enqueue_notification_event(
         db,
         NotificationSpec(

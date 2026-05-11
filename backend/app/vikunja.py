@@ -24,6 +24,7 @@ from .models import (
     VikunjaTaskMapping,
     VikunjaUserMapping,
 )
+from .task_links import ensure_task_link, vikunja_task_url
 
 settings = get_settings()
 
@@ -411,15 +412,7 @@ def _extract_task_id(response: dict[str, Any]) -> int:
 
 
 def _vikunja_task_url(task_id: int | None) -> str | None:
-    if task_id is None:
-        return None
-    template = (settings.vikunja_task_url_template or '').strip()
-    if template:
-        return template.format(project_id=settings.vikunja_project_id or '', task_id=task_id)
-    base_url = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
-    if not base_url:
-        return None
-    return f'{base_url}/tasks/{task_id}'
+    return vikunja_task_url(task_id)
 
 
 def _task_id_from_payload(task: dict[str, Any]) -> int | None:
@@ -637,15 +630,14 @@ def _notify_vikunja_task_changes(
     def task_line() -> str:
         assignee = ', '.join(current.assignee_names) or 'Unassigned'
         due = current.due_date or 'no due'
-        link = f'\n{current.url}' if current.url else ''
-        return f'{current.title}\nAssignee: {assignee}\nStatus: {current.status}\nDue: {due}{link}'
+        return ensure_task_link(f'{current.title}\nAssignee: {assignee}\nStatus: {current.status}\nDue: {due}', current.url)
 
     def render_message(*, event_type: str, recipient: User | None, fallback: str, context: dict[str, Any]) -> str:
         from .bot_files import contact_prompt_text_for_user, notification_prompt_text
         from .bot_llm import BotLLMError, generate_bot_reply, is_bot_llm_configured
 
         if not is_bot_llm_configured():
-            return fallback
+            return ensure_task_link(fallback, current.url)
         payload = {
             'event_type': event_type,
             'recipient': {
@@ -678,8 +670,8 @@ def _notify_vikunja_task_changes(
         try:
             message = generate_bot_reply(system_prompt=notification_prompt_text(), user_prompt=prompt).strip()
         except BotLLMError:
-            return fallback
-        return message[:1200] if message else fallback
+            return ensure_task_link(fallback, current.url)
+        return ensure_task_link(message[:1200] if message else fallback, current.url)
 
     if previous is None:
         for social_user_id in current.assignee_social_ids:

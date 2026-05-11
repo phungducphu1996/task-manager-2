@@ -66,6 +66,7 @@ def test_realtime_notification_message_can_be_rendered_by_llm(client, db_session
     install_worker_success_stub(monkeypatch)
     settings = get_settings()
     settings.openai_api_key = 'test-openai-key'
+    monkeypatch.setattr(settings, 'task_public_base_url', 'https://hazeleo.com/task')
     prompt_path = Path(settings.bot_notification_prompt_path)
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text('# Custom Notify Voice\nNói chuyện duyên dáng kiểu Hazel.', encoding='utf-8')
@@ -105,7 +106,8 @@ def test_realtime_notification_message_can_be_rendered_by_llm(client, db_session
         select(NotificationEvent).where(NotificationEvent.event_type == 'task_assigned_on_create')
     )
     assert event is not None
-    assert event.payload['message'] == 'LLM: task mới tới rồi, xử lý nhẹ nhàng nha.'
+    assert event.payload['message'].startswith('LLM: task mới tới rồi, xử lý nhẹ nhàng nha.')
+    assert f'Link task: https://hazeleo.com/task/tasks/{created.json()["id"]}' in event.payload['message']
     assert event.payload['context']['llm_rendered'] is True
     assert 'Custom Notify Voice' in captured['system_prompt']
     assert 'Assigned Voice' in captured['system_prompt']

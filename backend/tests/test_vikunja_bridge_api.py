@@ -146,6 +146,7 @@ def test_vikunja_reconcile_seeds_then_notifies_changes(client, db_session, monke
     assert second.json()['reconcile']['changed'] == 1
     event = db_session.query(NotificationEvent).filter(NotificationEvent.event_type == 'vikunja_task_updated').one()
     assert event.payload['context']['vikunja_task_id'] == 501
+    assert 'Link task: http://vikunja.local/tasks/501' in event.payload['message']
 
 
 def test_vikunja_reconcile_uses_kanban_bucket_for_status(client, db_session, monkeypatch) -> None:
@@ -212,3 +213,4 @@ def test_vikunja_reconcile_notifies_new_assigned_tasks_after_baseline(client, db
     event = db_session.query(NotificationEvent).filter(NotificationEvent.event_type == 'vikunja_task_assigned').one()
     assert event.target_id == mapping.zalo_user_id
     assert event.payload['context']['reason'] == 'created_assigned'
+    assert 'Link task: http://vikunja.local/tasks/701' in event.payload['message']

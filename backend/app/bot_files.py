@@ -59,6 +59,7 @@ Bạn viết thông báo Zalo ngắn cho Task Manager của văn phòng Hazel.
 - Nếu task được sửa: nói rõ các field chính vừa đổi, nếu có.
 - Nếu task bị xoá: nói rõ task đã bị xoá bởi ai.
 - Nếu review/approve/done: nói rõ trạng thái mới và hành động mong muốn.
+- Nếu JSON event có task.url, luôn giữ link ở cuối theo format: `Link task: <url>`.
 - Có thể dùng emoji rất ít, tối đa 1 emoji nếu hợp.
 """
 
