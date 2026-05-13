@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import inspect
 import json
 from logging import getLogger
 import hmac
@@ -205,16 +206,44 @@ def _to_worker_send_text_payload(request_payload: dict[str, Any]) -> dict[str, A
     return payload
 
 
-def _call_worker(request_payload: dict[str, Any]) -> tuple[bool, int | None, str | None, str | None]:
-    worker_url = _resolve_worker_send_url()
+def _delivery_config(db: Session | None = None) -> dict[str, Any]:
+    if db is None:
+        return {}
+    from .gmail_monitor import gmail_zalo_config
+
+    return gmail_zalo_config(db)
+
+
+def _resolve_worker_send_url_from_config(config: dict[str, Any] | None = None) -> str | None:
+    raw_url = str((config or {}).get('zalo_worker_url') or settings.zalo_worker_url or '').strip()
+    if not raw_url:
+        return None
+
+    parsed = urlsplit(raw_url)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path or '/'
+        if path in {'', '/'}:
+            path = '/api/send-text'
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+    return raw_url
+
+
+def _call_worker(
+    request_payload: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+) -> tuple[bool, int | None, str | None, str | None]:
+    worker_url = _resolve_worker_send_url_from_config(config)
     if not worker_url:
         return False, None, None, 'ZALO_WORKER_URL is not configured.'
 
     headers = {'Content-Type': 'application/json'}
-    if settings.zalo_worker_token:
-        headers['Authorization'] = f'Bearer {settings.zalo_worker_token}'
-    if settings.zalo_shared_secret:
-        headers['X-Internal-Secret'] = settings.zalo_shared_secret
+    worker_token = str((config or {}).get('zalo_worker_token') or settings.zalo_worker_token or '').strip()
+    shared_secret = str((config or {}).get('zalo_shared_secret') or settings.zalo_shared_secret or '').strip()
+    if worker_token:
+        headers['Authorization'] = f'Bearer {worker_token}'
+    if shared_secret:
+        headers['X-Internal-Secret'] = shared_secret
 
     worker_payload = _to_worker_send_text_payload(request_payload)
 
@@ -304,6 +333,7 @@ def enqueue_notification_event(db: Session, spec: NotificationSpec) -> tuple[Not
 
 def _deliver_event_once(db: Session, event: NotificationEvent, *, now: datetime) -> NotificationDelivery:
     request_payload = _build_worker_request(event)
+    config = _delivery_config(db)
     next_attempt = event.attempt_count + 1
 
     delivery = NotificationDelivery(
@@ -312,7 +342,12 @@ def _deliver_event_once(db: Session, event: NotificationEvent, *, now: datetime)
         request_payload=request_payload,
     )
 
-    ok, response_status, response_body, error_message = _call_worker(request_payload)
+    worker_params = inspect.signature(_call_worker).parameters
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in worker_params.values())
+    if 'config' in worker_params or accepts_kwargs:
+        ok, response_status, response_body, error_message = _call_worker(request_payload, config=config)
+    else:
+        ok, response_status, response_body, error_message = _call_worker(request_payload)
 
     delivery.response_status = response_status
     delivery.response_body = response_body

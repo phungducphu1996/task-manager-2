@@ -179,3 +179,79 @@ export interface ReminderTickResult {
     failed: number
   }
 }
+
+export interface GmailZaloConfig {
+  gmail_address: string | null
+  gmail_app_password_configured: boolean
+  gmail_imap_host: string
+  gmail_imap_port: number
+  gmail_imap_mailbox: string
+  gmail_search_since_days: number
+  gmail_sale_from_addresses: string
+  gmail_sale_subject: string
+  gmail_message_from_addresses: string
+  gmail_poll_max_results: number
+  zalo_worker_url: string | null
+  zalo_worker_token_configured: boolean
+  zalo_shared_secret_configured: boolean
+  zalo_group_id: string | null
+  updated_at: string | null
+  updated_at_label: string | null
+  stored_keys: string[]
+}
+
+export interface GmailZaloEvent {
+  id: number
+  gmail_message_id: string
+  event_type: 'sale' | 'message' | string
+  sender: string | null
+  subject: string
+  snippet: string | null
+  received_at: string | null
+  received_at_label: string | null
+  sale_order_id: string | null
+  sale_total_cents: number | null
+  sale_currency: string | null
+  buyer_name: string | null
+  buyer_username: string | null
+  order_url: string | null
+  payload: Record<string, unknown>
+  notification: {
+    id: number
+    event_type: string
+    status: string
+    attempt_count: number
+    last_error: string | null
+    delivered_at: string | null
+    delivered_at_label: string | null
+    message: string
+  } | null
+}
+
+export interface GmailZaloStatus {
+  config: GmailZaloConfig
+  counts: {
+    total: number
+    sales: number
+    messages: number
+  }
+  notification_counts: Record<string, number>
+  recent_events: GmailZaloEvent[]
+}
+
+export interface GmailZaloConfigPayload {
+  gmail_address?: string | null
+  gmail_app_password?: string | null
+  gmail_imap_host?: string | null
+  gmail_imap_port?: number | null
+  gmail_imap_mailbox?: string | null
+  gmail_search_since_days?: number | null
+  gmail_sale_from_addresses?: string | null
+  gmail_sale_subject?: string | null
+  gmail_message_from_addresses?: string | null
+  gmail_poll_max_results?: number | null
+  zalo_worker_url?: string | null
+  zalo_worker_token?: string | null
+  zalo_shared_secret?: string | null
+  zalo_group_id?: string | null
+}

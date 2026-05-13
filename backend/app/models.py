@@ -295,6 +295,48 @@ class NotificationDelivery(Base):
     event: Mapped[NotificationEvent] = relationship('NotificationEvent', back_populates='deliveries')
 
 
+class GmailMonitorEvent(Base):
+    __tablename__ = 'gmail_monitor_events'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    gmail_message_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default='gmail')
+    sender: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    recipient: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    sale_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    sale_total_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sale_currency: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    buyer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    buyer_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    order_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    notification_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey('notification_events.id', ondelete='SET NULL'), nullable=True, index=True
+    )
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    notification_event: Mapped[NotificationEvent | None] = relationship('NotificationEvent')
+
+
+class IntegrationConfig(Base):
+    __tablename__ = 'integration_configs'
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class ReminderRule(Base):
     __tablename__ = 'reminder_rules'
 

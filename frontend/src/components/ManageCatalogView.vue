@@ -103,6 +103,10 @@ async function goBack() {
   await router.push('/today')
 }
 
+async function openGmailMonitor() {
+  await router.push('/integrations/gmail-zalo')
+}
+
 async function createType() {
   const name = newTypeName.value.trim()
   if (!name) return
@@ -302,7 +306,10 @@ async function runTickNow() {
         <h1>Manage Catalog</h1>
         <p>Edit names or add/remove shops and task types.</p>
       </div>
-      <button class="ghost-btn" type="button" @click="goBack">Back to Tasks</button>
+      <div class="manage-header-actions">
+        <button class="ghost-btn" type="button" @click="openGmailMonitor">Gmail/Zalo</button>
+        <button class="ghost-btn" type="button" @click="goBack">Back to Tasks</button>
+      </div>
     </header>
 
     <section v-if="bootstrapping" class="loading-state">Loading management data...</section>

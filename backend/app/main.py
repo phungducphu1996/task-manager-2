@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, time
+from datetime import date, datetime, time
 import hmac
 from logging import getLogger
 from os.path import basename
@@ -27,6 +27,8 @@ from .models import (
     BotConversationMessage,
     BotConversationState,
     BotMemoryFact,
+    GmailMonitorEvent,
+    IntegrationConfig,
     NotificationChannel,
     NotificationDelivery,
     NotificationEvent,
@@ -48,15 +50,18 @@ from .models import (
     ZaloIncomingCommand,
 )
 from .notifications import (
+    NotificationSpec,
     enqueue_task_created_notifications,
     enqueue_task_deleted_notifications,
     enqueue_task_status_transition_notifications,
     enqueue_task_updated_notifications,
     dispatch_due_notification_events,
+    enqueue_notification_event,
     is_internal_token_valid,
     run_daily_notification_job,
     send_zalo_text,
 )
+from .gmail_monitor import GMAIL_ZALO_CONFIG_KEY, GmailMonitorError, gmail_zalo_config, poll_gmail_and_notify, run_gmail_daily_digest
 from .schemas import (
     LoginRequest,
     LoginResponse,
@@ -139,6 +144,27 @@ class AdminNotificationPromptUpdate(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
 
 
+class AdminGmailZaloConfigUpdate(BaseModel):
+    gmail_address: str | None = Field(default=None, max_length=255)
+    gmail_app_password: str | None = Field(default=None, max_length=255)
+    gmail_imap_host: str | None = Field(default=None, max_length=255)
+    gmail_imap_port: int | None = Field(default=None, ge=1, le=65535)
+    gmail_imap_mailbox: str | None = Field(default=None, max_length=255)
+    gmail_search_since_days: int | None = Field(default=None, ge=1, le=90)
+    gmail_sale_from_addresses: str | None = Field(default=None, max_length=1000)
+    gmail_sale_subject: str | None = Field(default=None, max_length=255)
+    gmail_message_from_addresses: str | None = Field(default=None, max_length=1000)
+    gmail_poll_max_results: int | None = Field(default=None, ge=1, le=100)
+    zalo_worker_url: str | None = Field(default=None, max_length=1000)
+    zalo_worker_token: str | None = Field(default=None, max_length=1000)
+    zalo_shared_secret: str | None = Field(default=None, max_length=1000)
+    zalo_group_id: str | None = Field(default=None, max_length=128)
+
+
+class AdminGmailZaloTestRequest(BaseModel):
+    message: str = Field(default='Test Gmail/Zalo monitor từ Task Manager.', min_length=1, max_length=1000)
+
+
 ADMIN_NOTIFICATION_EVENT_TYPES = [
     'task_assigned_on_create',
     'task_submitted_for_review',
@@ -156,6 +182,9 @@ ADMIN_NOTIFICATION_EVENT_TYPES = [
     'reminder_daily_strategy',
     'reminder_task_nudge',
     'reminder_admin_escalation',
+    'gmail_sale_new',
+    'gmail_message_new',
+    'gmail_daily_digest',
 ]
 
 CORE_DAILY_RULE_SPECS: dict[str, dict[str, Any]] = {
@@ -1233,6 +1262,8 @@ def on_startup() -> None:
             'vikunja_user_mappings',
             'vikunja_task_mappings',
             'vikunja_bridge_state',
+            'gmail_monitor_events',
+            'integration_configs',
         ]
         if any(not inspector.has_table(table, schema=schema_name) for table in required_tables):
             # Safety fallback for local/dev environments where migrations are not yet aligned.
@@ -1258,6 +1289,8 @@ def on_startup() -> None:
                     VikunjaUserMapping.__table__,
                     VikunjaTaskMapping.__table__,
                     VikunjaBridgeState.__table__,
+                    GmailMonitorEvent.__table__,
+                    IntegrationConfig.__table__,
                 ],
             )
 
@@ -1588,6 +1621,101 @@ def _read_notification_prompt(event_type: str | None = None) -> str:
     return path.read_text(encoding='utf-8')
 
 
+def _admin_gmail_zalo_config_payload(db: Session) -> dict[str, Any]:
+    config = gmail_zalo_config(db)
+    stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
+    payload = stored.payload if stored and isinstance(stored.payload, dict) else {}
+    return {
+        'gmail_address': config.get('gmail_address'),
+        'gmail_app_password_configured': bool(config.get('gmail_app_password')),
+        'gmail_imap_host': config.get('gmail_imap_host'),
+        'gmail_imap_port': config.get('gmail_imap_port'),
+        'gmail_imap_mailbox': config.get('gmail_imap_mailbox'),
+        'gmail_search_since_days': config.get('gmail_search_since_days'),
+        'gmail_sale_from_addresses': config.get('gmail_sale_from_addresses'),
+        'gmail_sale_subject': config.get('gmail_sale_subject'),
+        'gmail_message_from_addresses': config.get('gmail_message_from_addresses'),
+        'gmail_poll_max_results': config.get('gmail_poll_max_results'),
+        'zalo_worker_url': config.get('zalo_worker_url'),
+        'zalo_worker_token_configured': bool(config.get('zalo_worker_token')),
+        'zalo_shared_secret_configured': bool(config.get('zalo_shared_secret')),
+        'zalo_group_id': config.get('zalo_group_id'),
+        'updated_at': stored.updated_at.isoformat() if stored and stored.updated_at else None,
+        'updated_at_label': _admin_datetime_label(stored.updated_at) if stored else None,
+        'stored_keys': sorted(payload.keys()),
+    }
+
+
+def _update_gmail_zalo_config(db: Session, update: AdminGmailZaloConfigUpdate) -> dict[str, Any]:
+    stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
+    payload = dict(stored.payload or {}) if stored and isinstance(stored.payload, dict) else {}
+    values = update.model_dump(exclude_unset=True)
+    secret_fields = {'gmail_app_password', 'zalo_worker_token', 'zalo_shared_secret'}
+    for key, value in values.items():
+        if key in secret_fields and (value is None or str(value).strip() == ''):
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+        if value is None:
+            payload.pop(key, None)
+            continue
+        payload[key] = value
+
+    if stored is None:
+        stored = IntegrationConfig(key=GMAIL_ZALO_CONFIG_KEY, payload=payload)
+    else:
+        stored.payload = payload
+    db.add(stored)
+    db.commit()
+    db.refresh(stored)
+    return _admin_gmail_zalo_config_payload(db)
+
+
+def _gmail_zalo_event_out(event: GmailMonitorEvent) -> dict[str, Any]:
+    notification = event.notification_event
+    return {
+        'id': event.id,
+        'gmail_message_id': event.gmail_message_id,
+        'event_type': event.event_type,
+        'sender': event.sender,
+        'subject': event.subject,
+        'snippet': event.snippet,
+        'received_at': event.received_at.isoformat() if event.received_at else None,
+        'received_at_label': _admin_datetime_label(event.received_at),
+        'sale_order_id': event.sale_order_id,
+        'sale_total_cents': event.sale_total_cents,
+        'sale_currency': event.sale_currency,
+        'buyer_name': event.buyer_name,
+        'buyer_username': event.buyer_username,
+        'order_url': event.order_url,
+        'payload': event.payload,
+        'notification': (
+            {
+                'id': notification.id,
+                'event_type': notification.event_type,
+                'status': notification.status.value if hasattr(notification.status, 'value') else str(notification.status),
+                'attempt_count': notification.attempt_count,
+                'last_error': notification.last_error,
+                'delivered_at': notification.delivered_at.isoformat() if notification.delivered_at else None,
+                'delivered_at_label': _admin_datetime_label(notification.delivered_at),
+                'message': str((notification.payload or {}).get('message') or ''),
+            }
+            if notification
+            else None
+        ),
+    }
+
+
+def _gmail_zalo_recent_events(db: Session, *, limit: int = 25) -> list[dict[str, Any]]:
+    events = db.scalars(
+        select(GmailMonitorEvent)
+        .options(joinedload(GmailMonitorEvent.notification_event))
+        .order_by(GmailMonitorEvent.received_at.desc().nullslast(), GmailMonitorEvent.id.desc())
+        .limit(max(1, min(limit, 100)))
+    ).unique().all()
+    return [_gmail_zalo_event_out(event) for event in events]
+
+
 @app.get('/admin/notifications/status')
 def admin_notifications_status(
     db: Session = Depends(get_db),
@@ -1830,6 +1958,105 @@ def admin_notifications_reconcile(
     return reconcile_vikunja_bridge(db)
 
 
+@app.get('/admin/integrations/gmail-zalo')
+def admin_gmail_zalo_status(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    counts = {
+        'total': int(db.scalar(select(func.count(GmailMonitorEvent.id))) or 0),
+        'sales': int(db.scalar(select(func.count(GmailMonitorEvent.id)).where(GmailMonitorEvent.event_type == 'sale')) or 0),
+        'messages': int(
+            db.scalar(select(func.count(GmailMonitorEvent.id)).where(GmailMonitorEvent.event_type == 'message')) or 0
+        ),
+    }
+    notification_counts = {status_value.value: 0 for status_value in NotificationStatus}
+    for status_value, count in db.execute(
+        select(NotificationEvent.status, func.count(NotificationEvent.id))
+        .where(NotificationEvent.event_type.in_(['gmail_sale_new', 'gmail_message_new', 'gmail_daily_digest']))
+        .group_by(NotificationEvent.status)
+    ).all():
+        key = status_value.value if hasattr(status_value, 'value') else str(status_value)
+        notification_counts[key] = int(count or 0)
+
+    return {
+        'config': _admin_gmail_zalo_config_payload(db),
+        'counts': counts,
+        'notification_counts': notification_counts,
+        'recent_events': _gmail_zalo_recent_events(db, limit=25),
+    }
+
+
+@app.patch('/admin/integrations/gmail-zalo')
+def admin_gmail_zalo_update(
+    payload: AdminGmailZaloConfigUpdate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    return {'config': _update_gmail_zalo_config(db, payload)}
+
+
+@app.get('/admin/integrations/gmail-zalo/events')
+def admin_gmail_zalo_events(
+    limit: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    return {'events': _gmail_zalo_recent_events(db, limit=limit)}
+
+
+@app.post('/admin/integrations/gmail-zalo/poll')
+def admin_gmail_zalo_poll(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    try:
+        result = poll_gmail_and_notify(db)
+    except GmailMonitorError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return {
+        'result': result,
+        'recent_events': _gmail_zalo_recent_events(db, limit=25),
+    }
+
+
+@app.post('/admin/integrations/gmail-zalo/test-zalo')
+def admin_gmail_zalo_test_zalo(
+    payload: AdminGmailZaloTestRequest,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    config = gmail_zalo_config(db)
+    target_id = str(config.get('zalo_group_id') or '').strip()
+    if not target_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Zalo group ID is not configured.')
+    notification_event, created = enqueue_notification_event(
+        db,
+        NotificationSpec(
+            event_key=f'gmail-zalo-admin-test:{uuid4()}',
+            event_type='gmail_zalo_admin_test',
+            channel=NotificationChannel.group,
+            target_id=target_id,
+            payload={'message': payload.message, 'context': {'source': 'admin_gmail_zalo_ui'}},
+        ),
+    )
+    db.commit()
+    dispatch = dispatch_due_notification_events(db)
+    return {
+        'created': created,
+        'notification_event_id': notification_event.id,
+        'dispatch': dispatch,
+    }
+
+
 @app.post('/internal/notifications/run')
 def run_internal_notifications_job(
     job: Literal['morning', 'evening'] = Query(...),
@@ -1843,6 +2070,37 @@ def run_internal_notifications_job(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f'Notification job failed: {exc}',
+        ) from exc
+
+
+@app.post('/internal/gmail/poll')
+def run_internal_gmail_poll(
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return poll_gmail_and_notify(db)
+    except GmailMonitorError as exc:
+        logger.exception('Internal Gmail poll failed')
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Gmail poll failed: {exc}',
+        ) from exc
+
+
+@app.post('/internal/gmail/digest')
+def run_internal_gmail_digest(
+    target_date: date | None = Query(default=None),
+    _: None = Depends(require_internal_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return run_gmail_daily_digest(db, target_date=target_date)
+    except GmailMonitorError as exc:
+        logger.exception('Internal Gmail digest failed')
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Gmail digest failed: {exc}',
         ) from exc
 
 

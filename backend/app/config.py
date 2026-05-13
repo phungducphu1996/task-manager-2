@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     notification_delivery_batch_limit: int = 100
     notification_http_timeout_seconds: float = 10.0
     notification_max_retries: int = 3
+    gmail_address: str | None = None
+    gmail_app_password: str | None = None
+    gmail_imap_host: str = 'imap.gmail.com'
+    gmail_imap_port: int = 993
+    gmail_imap_mailbox: str = 'INBOX'
+    gmail_search_since_days: int = 7
+    gmail_sale_from_addresses: str = 'transaction@etsy.com'
+    gmail_sale_subject: str = 'You made a sale on Etsy'
+    gmail_message_from_addresses: str = 'no-reply@account.etsy.com,conversations@mail.etsy.com'
+    gmail_poll_max_results: int = 10
     reminder_tick_internal_token: str | None = None
     reminder_timezone: str = 'Asia/Ho_Chi_Minh'
     reminder_default_quiet_start: str = '22:00'
@@ -116,6 +126,14 @@ class Settings(BaseSettings):
         if self.zalo_group_id and self.zalo_group_id not in group_ids:
             group_ids = [self.zalo_group_id, *group_ids]
         return [(group_id, f'Zalo group {index + 1}') for index, group_id in enumerate(group_ids)]
+
+    @property
+    def gmail_sale_from_address_list(self) -> list[str]:
+        return [item.strip() for item in self.gmail_sale_from_addresses.split(',') if item.strip()]
+
+    @property
+    def gmail_message_from_address_list(self) -> list[str]:
+        return [item.strip() for item in self.gmail_message_from_addresses.split(',') if item.strip()]
 
     @property
     def vikunja_enabled(self) -> bool:

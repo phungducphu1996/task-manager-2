@@ -1,5 +1,9 @@
 import type {
   LoginResponse,
+  GmailZaloConfig,
+  GmailZaloConfigPayload,
+  GmailZaloEvent,
+  GmailZaloStatus,
   ReminderRule,
   ReminderRulePayload,
   ReminderTickResult,
@@ -176,7 +180,32 @@ export const api = {
     actorId: string | null
   ) => request<TaskAttachment>(`/tasks/${taskId}/attachments/link`, { method: 'POST', body: JSON.stringify(payload), actorId }),
   deleteTaskAttachment: (taskId: number, attachmentId: number, actorId: string | null) =>
-    request<void>(`/tasks/${taskId}/attachments/${attachmentId}`, { method: 'DELETE', actorId })
+    request<void>(`/tasks/${taskId}/attachments/${attachmentId}`, { method: 'DELETE', actorId }),
+
+  getGmailZaloStatus: () => request<GmailZaloStatus>('/admin/integrations/gmail-zalo'),
+  updateGmailZaloConfig: (payload: GmailZaloConfigPayload) =>
+    request<{ config: GmailZaloConfig }>('/admin/integrations/gmail-zalo', {
+      method: 'PATCH',
+      body: JSON.stringify(payload)
+    }),
+  getGmailZaloEvents: (limit = 50) =>
+    request<{ events: GmailZaloEvent[] }>(`/admin/integrations/gmail-zalo/events?limit=${limit}`),
+  pollGmailZalo: () =>
+    request<{
+      result: {
+        fetched: number
+        created: number
+        skipped: number
+        detected: Record<string, number>
+        dispatch: Record<string, number>
+      }
+      recent_events: GmailZaloEvent[]
+    }>('/admin/integrations/gmail-zalo/poll', { method: 'POST' }),
+  testGmailZalo: (message: string) =>
+    request<{ created: boolean; notification_event_id: number; dispatch: Record<string, number> }>(
+      '/admin/integrations/gmail-zalo/test-zalo',
+      { method: 'POST', body: JSON.stringify({ message }) }
+    )
 }
 
 export function flattenGroups(groups: TaskGroup[]): Task[] {

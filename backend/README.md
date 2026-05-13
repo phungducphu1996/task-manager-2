@@ -54,6 +54,30 @@ Example crontab (server-side, Asia/Ho_Chi_Minh):
 0 18 * * * curl -sS -X POST "http://127.0.0.1:8010/internal/notifications/run?job=evening" -H "X-Internal-Token: ${NOTIFY_INTERNAL_TOKEN}"
 ```
 
+## Gmail Sale & Message Monitor
+
+The backend can read Gmail with IMAP app password, detect Etsy sale and conversation emails, and send Zalo group notifications through the existing notification pipeline.
+
+Required env:
+- `GMAIL_ADDRESS`
+- `GMAIL_APP_PASSWORD`
+- `GMAIL_IMAP_HOST` (default `imap.gmail.com`)
+- `GMAIL_IMAP_PORT` (default `993`)
+- `GMAIL_IMAP_MAILBOX` (default `INBOX`)
+- `GMAIL_SEARCH_SINCE_DAYS` (default `7`)
+- `GMAIL_SALE_FROM_ADDRESSES` (default `transaction@etsy.com`)
+- `GMAIL_SALE_SUBJECT` (default `You made a sale on Etsy`)
+- `GMAIL_MESSAGE_FROM_ADDRESSES` (default `no-reply@account.etsy.com,conversations@mail.etsy.com`)
+- `GMAIL_POLL_MAX_RESULTS` (default `10`)
+- `ZALO_GROUP_ID`
+
+Internal jobs:
+
+```bash
+*/2 * * * * curl -sS -X POST "http://127.0.0.1:8010/internal/gmail/poll" -H "X-Internal-Token: ${NOTIFY_INTERNAL_TOKEN}"
+0 18 * * * curl -sS -X POST "http://127.0.0.1:8010/internal/gmail/digest" -H "X-Internal-Token: ${NOTIFY_INTERNAL_TOKEN}"
+```
+
 ## Zalo Group Commands V1
 
 The `zalo-worker` listener can forward group messages to `POST /zalo/incoming`. The backend handles messages that start with a configured bot alias, or native mention payloads that match `ZALO_BOT_USER_IDS` / `ZALO_BOT_ALIASES`.

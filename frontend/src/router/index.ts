@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import LoginView from '../components/LoginView.vue'
 import TaskBoard from '../components/TaskBoard.vue'
 import ManageCatalogView from '../components/ManageCatalogView.vue'
+import GmailZaloMonitorView from '../components/GmailZaloMonitorView.vue'
 import { useAuthStore } from '../stores/authStore'
 
 const routes = [
@@ -15,6 +16,11 @@ const routes = [
     path: '/manage',
     name: 'manage',
     component: ManageCatalogView
+  },
+  {
+    path: '/integrations/gmail-zalo',
+    name: 'gmail-zalo',
+    component: GmailZaloMonitorView
   },
   {
     path: '/someday',
@@ -48,7 +54,7 @@ router.beforeEach(async (to) => {
     return { path: '/login' }
   }
 
-  if (to.name === 'manage' && (auth.user?.role ?? '').toLowerCase() !== 'admin') {
+  if ((to.name === 'manage' || to.name === 'gmail-zalo') && (auth.user?.role ?? '').toLowerCase() !== 'admin') {
     return { path: '/today' }
   }
 
