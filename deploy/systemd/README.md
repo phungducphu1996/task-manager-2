@@ -1,15 +1,26 @@
-# Task Manager Reminder Timer
+# Task Manager Systemd Timers
 
-Use `systemd timer` on the VPS instead of root crontab for reminder ticks.
+Use `systemd timer` on the VPS instead of root crontab for reminder and Gmail monitor jobs.
 
-## Install
+## Install Reminder Tick
 
 ```bash
 cd /opt/task-manager
 bash deploy/systemd/install-reminder-timer.sh
 ```
 
-## Verify
+## Install Gmail Monitor
+
+```bash
+cd /opt/task-manager
+bash deploy/systemd/install-gmail-timers.sh
+```
+
+This installs:
+- `taskmanager-gmail-poll.timer`: calls `/internal/gmail/poll` every 2 minutes.
+- `taskmanager-gmail-digest.timer`: calls `/internal/gmail/digest` daily at 18:00.
+
+## Verify Reminder
 
 ```bash
 systemctl status taskmanager-reminder-tick.timer --no-pager
@@ -17,12 +28,24 @@ systemctl list-timers --all | grep taskmanager-reminder-tick
 journalctl -u taskmanager-reminder-tick.service -n 50 --no-pager
 ```
 
-## Manual test
+## Verify Gmail Monitor
+
+```bash
+systemctl status taskmanager-gmail-poll.timer --no-pager
+systemctl status taskmanager-gmail-digest.timer --no-pager
+systemctl list-timers --all | grep taskmanager-gmail
+journalctl -u taskmanager-gmail-poll.service -n 50 --no-pager
+journalctl -u taskmanager-gmail-digest.service -n 50 --no-pager
+```
+
+## Manual Test
 
 ```bash
 /opt/task-manager/deploy/systemd/run-reminder-tick.sh
+/opt/task-manager/deploy/systemd/run-gmail-poll.sh
+/opt/task-manager/deploy/systemd/run-gmail-digest.sh
 ```
 
 ## Important
 
-Remove the old crontab entry for `/internal/reminders/tick` after the timer is healthy, otherwise notifications may be duplicated.
+Remove old crontab entries for `/internal/reminders/tick`, `/internal/gmail/poll`, or `/internal/gmail/digest` after the timers are healthy, otherwise notifications may be duplicated.

@@ -1,0 +1,10 @@
+[Unit]
+Description=Task Manager Gmail Daily Digest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/task-manager
+ExecStart=/opt/task-manager/deploy/systemd/run-gmail-digest.sh

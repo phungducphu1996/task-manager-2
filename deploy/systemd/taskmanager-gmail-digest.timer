@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Task Manager Gmail Daily Digest at 18:00
+
+[Timer]
+OnCalendar=*-*-* 18:00:00
+AccuracySec=1m
+RandomizedDelaySec=30s
+Persistent=true
+Unit=taskmanager-gmail-digest.service
+
+[Install]
+WantedBy=timers.target
