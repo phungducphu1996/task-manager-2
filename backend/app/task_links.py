@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .config import get_settings
 
 settings = get_settings()
@@ -19,7 +21,8 @@ def vikunja_task_url(task_id: int | None) -> str | None:
         return None
     template = (settings.vikunja_task_url_template or '').strip()
     if template:
-        return template.format(project_id=settings.vikunja_project_id or '', task_id=task_id)
+        rendered = template.format(project_id=settings.vikunja_project_id or '', task_id=task_id)
+        return re.sub(r'/projects/[^/]+/tasks/', '/tasks/', rendered)
     base_url = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
     if not base_url:
         return None

@@ -188,6 +188,34 @@ class VikunjaClient:
     def update_task(self, task_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request('POST', f'/tasks/{task_id}', json=payload)
 
+    def list_labels(self, *, search: str | None = None, page: int = 1, per_page: int = 100) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {'page': page, 'per_page': per_page}
+        if search:
+            params['s'] = search
+        data = self.request('GET', '/labels', params=params)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get('data'), list):
+            return data['data']
+        return []
+
+    def create_label(self, title: str) -> dict[str, Any]:
+        return self.request('PUT', '/labels', json={'title': title})
+
+    def list_task_labels(self, task_id: int) -> list[dict[str, Any]]:
+        data = self.request('GET', f'/tasks/{task_id}/labels')
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get('data'), list):
+            return data['data']
+        return []
+
+    def add_label_to_task(self, task_id: int, label_id: int) -> dict[str, Any]:
+        return self.request('PUT', f'/tasks/{task_id}/labels', json={'label_id': label_id})
+
+    def remove_label_from_task(self, task_id: int, label_id: int) -> Any:
+        return self.request('DELETE', f'/tasks/{task_id}/labels/{label_id}')
+
     def move_task_to_bucket(
         self,
         project_id: int,

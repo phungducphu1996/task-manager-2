@@ -760,6 +760,16 @@ def test_zalo_find_tasks_uses_task_manager_bridge(client, db_session, monkeypatc
     assert result['task_url'] == 'https://hazeleo.com/tasks/73'
 
 
+def test_zalo_task_url_strips_project_segment(client, db_session, monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_api_url', 'https://tasks.local')
+    monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    monkeypatch.setattr(settings, 'vikunja_task_url_template', 'https://hazeleo.com/projects/{project_id}/tasks/{task_id}')
+
+    assert zalo_commands._task_url(52) == 'https://hazeleo.com/tasks/52'
+
+
 def test_zalo_update_task_fields_uses_task_manager_bridge(client, db_session, monkeypatch) -> None:
     admin, _, quang = _users(client)
     settings = get_settings()
@@ -827,6 +837,102 @@ def test_zalo_update_task_fields_uses_task_manager_bridge(client, db_session, mo
     assert updates_seen['assignees'] == [{'id': 42}]
     assert updates_seen['due_date'].startswith(str(local_today()))
     assert result['task']['assigned_to'] == quang['id']
+
+
+def test_zalo_update_task_fields_updates_task_manager_labels_and_progress(client, db_session, monkeypatch) -> None:
+    admin, _, _ = _users(client)
+    settings = get_settings()
+    monkeypatch.setattr(settings, 'vikunja_api_url', 'https://tasks.local')
+    monkeypatch.setattr(settings, 'vikunja_api_token', 'test-token')
+    monkeypatch.setattr(settings, 'vikunja_project_id', 9)
+    monkeypatch.setattr(settings, 'vikunja_task_url_template', 'https://hazeleo.com/tasks/{task_id}')
+
+    updates_seen: dict = {}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.labels = {
+                1: {'id': 1, 'title': 'shop:OldShop'},
+                2: {'id': 2, 'title': 'keep-me'},
+            }
+            self.task_labels = [self.labels[1], self.labels[2]]
+            self.next_label_id = 3
+
+        def list_project_views(self, project_id: int):
+            return []
+
+        def list_all_view_tasks(self, project_id: int, view_id: int, *, filter_query: str | None = None, **kwargs):
+            return []
+
+        def get_task(self, task_id: int):
+            assert task_id == 73
+            return {
+                'id': 73,
+                'project_id': 9,
+                'title': 'Update video mockup Mario Collection Gen AI',
+                'done': False,
+                'priority': 3,
+                'percent_done': updates_seen.get('percent_done', 0),
+                'assignees': [],
+                'labels': list(self.task_labels),
+            }
+
+        def update_task(self, task_id: int, payload: dict):
+            updates_seen.update(payload)
+            return {**self.get_task(task_id), **payload}
+
+        def list_task_labels(self, task_id: int):
+            assert task_id == 73
+            return list(self.task_labels)
+
+        def list_labels(self, *, search: str | None = None, page: int = 1, per_page: int = 100):
+            if not search:
+                return list(self.labels.values())
+            return [label for label in self.labels.values() if label['title'].casefold() == search.casefold()]
+
+        def create_label(self, title: str):
+            label = {'id': self.next_label_id, 'title': title}
+            self.labels[self.next_label_id] = label
+            self.next_label_id += 1
+            return label
+
+        def add_label_to_task(self, task_id: int, label_id: int):
+            label = self.labels[label_id]
+            if label not in self.task_labels:
+                self.task_labels.append(label)
+            return label
+
+        def remove_label_from_task(self, task_id: int, label_id: int):
+            self.task_labels = [label for label in self.task_labels if label['id'] != label_id]
+            return None
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(zalo_commands, 'get_vikunja_client', lambda: fake_client)
+
+    actor = db_session.get(User, admin['id'])
+    result = zalo_commands._tool_update_task_fields(
+        db_session,
+        actor=actor,
+        task_id=73,
+        arguments={
+            'shop_token': 'AmzMage',
+            'type_token': 'Design',
+            'label_tokens': ['campaign:Mario'],
+            'progress_percent': 40,
+        },
+        original_text='đổi tag task này shop AmzMage type Design và progress 40%',
+    )
+
+    assert result['ok'] is True
+    assert updates_seen['percent_done'] == 0.4
+    assert 'labels' in result['changed_fields']
+    assert 'progress' in result['changed_fields']
+    assert 'shop:OldShop' not in result['task']['labels']
+    assert 'shop:AmzMage' in result['task']['labels']
+    assert 'type:Design' in result['task']['labels']
+    assert 'campaign:Mario' in result['task']['labels']
+    assert result['task']['progress_percent'] == 40
+    assert result['task_url'] == 'https://hazeleo.com/tasks/73'
 
 
 def test_zalo_update_task_status_moves_vikunja_kanban_bucket(client, db_session, monkeypatch) -> None:

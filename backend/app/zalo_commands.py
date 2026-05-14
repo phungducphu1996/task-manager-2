@@ -67,6 +67,7 @@ from .reminders import (
 )
 from .schemas import ZaloIncomingRequest
 from .services import get_task_or_404, list_tasks, local_today, next_list_order
+from .task_links import vikunja_task_url
 from .vikunja import (
     VikunjaConfigError,
     build_vikunja_task_status_map,
@@ -793,6 +794,11 @@ def _tool_specs() -> list[dict[str, Any]]:
                         'assignee_token': {'type': 'string'},
                         'shop_token': {'type': 'string'},
                         'type_token': {'type': 'string'},
+                        'label_tokens': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': 'Optional labels/tags to add, for example ["shop:AmzMage", "type:Design"].',
+                        },
                         'due_token': {'type': 'string'},
                         'priority': {'type': 'string', 'enum': ['low', 'medium', 'high']},
                     },
@@ -841,7 +847,8 @@ def _tool_specs() -> list[dict[str, Any]]:
                 'name': 'update_task_fields',
                 'description': (
                     'Edit existing task fields after finding the correct task. Supports title, description, assignee, '
-                    'shop, type, due date/deadline, priority, notes, status, and adding one link attachment. Use '
+                    'shop/type tags, arbitrary labels/tags, progress percent, due date/deadline, priority, notes, status, '
+                    'and adding one link attachment. Use '
                     'find_tasks first when the task is not identified by id.'
                 ),
                 'parameters': {
@@ -856,6 +863,18 @@ def _tool_specs() -> list[dict[str, Any]]:
                         'clear_shop': {'type': 'boolean'},
                         'type_token': {'type': 'string'},
                         'clear_type': {'type': 'boolean'},
+                        'label_tokens': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': 'Labels/tags to add to the task. Use shop_token/type_token for shop/type labels when possible.',
+                        },
+                        'clear_labels': {'type': 'boolean'},
+                        'progress_percent': {
+                            'type': 'number',
+                            'minimum': 0,
+                            'maximum': 100,
+                            'description': 'Task progress from 0 to 100 percent.',
+                        },
                         'due_token': {
                             'type': 'string',
                             'description': 'today, tomorrow, dd/mm, dd/mm/yyyy, yyyy-mm-dd, or empty when unchanged.',
@@ -1015,7 +1034,8 @@ def _tool_system_prompt(actor: User) -> str:
         'Khi trả lời link hoặc chi tiết task, dùng format plain text từ tool result, không dùng markdown link và không tự bịa domain. '
         'Không tự bịa task_id. Nếu người dùng muốn approve/review mà chưa xác định rõ task, hãy dùng find_tasks trước. '
         'Nếu người dùng muốn đổi status mà chưa xác định rõ task, hãy dùng find_tasks trước rồi update_task_status. '
-        'Nếu người dùng muốn sửa deadline/assignee/description/link/field khác của task cũ, hãy dùng find_tasks trước rồi update_task_fields. '
+        'Nếu người dùng muốn sửa deadline/assignee/description/link/tag/label/shop/type/progress/field khác của task cũ, hãy dùng find_tasks trước rồi update_task_fields. '
+        'Tag shop/type nên truyền bằng shop_token/type_token; tag tự do truyền bằng label_tokens; tiến độ truyền bằng progress_percent từ 0-100. '
         'Nếu người dùng muốn nhắc việc, check-in hằng ngày, nudge task lặp lại, hoặc tắt/sửa reminder, hãy dùng reminder tools. '
         'Chỉ gọi create_task khi người dùng thực sự muốn tạo task mới. '
         'Nếu tool trả ok=false hoặc một phần tool fail, phải nói rõ phần chưa làm được; không được nói đã cập nhật field bị fail. '
@@ -1076,12 +1096,7 @@ def _tool_task_payload(task: Task) -> dict[str, Any]:
 
 def _task_url(task_id: int) -> str | None:
     if settings.vikunja_enabled:
-        template = (settings.vikunja_task_url_template or '').strip()
-        if template:
-            return template.format(project_id=settings.vikunja_project_id or '', task_id=task_id)
-        base = (settings.vikunja_public_url or settings.vikunja_api_url or '').strip().rstrip('/')
-        if base:
-            return f'{base}/tasks/{task_id}'
+        return vikunja_task_url(task_id)
 
     base = (settings.task_public_base_url or '').strip().rstrip('/')
     if not base:
@@ -1174,6 +1189,19 @@ def _tool_vikunja_task_payload(
         priority_number = int(task.get('priority') or 0)
     except (TypeError, ValueError):
         priority_number = 0
+    labels = task.get('labels') if isinstance(task.get('labels'), list) else []
+    label_titles = [
+        str(label.get('title') or '').strip()
+        for label in labels
+        if isinstance(label, dict) and str(label.get('title') or '').strip()
+    ]
+    raw_progress = task.get('percent_done')
+    progress_percent: int | None = None
+    try:
+        progress_value = float(raw_progress)
+        progress_percent = round(progress_value * 100) if progress_value <= 1 else round(progress_value)
+    except (TypeError, ValueError):
+        progress_percent = None
     return {
         'id': task_id,
         'title': str(task.get('title') or f'Task #{task_id}'),
@@ -1184,6 +1212,8 @@ def _tool_vikunja_task_payload(
         'shop': None,
         'type': None,
         'priority': VIKUNJA_PRIORITY_TO_TASK_PRIORITY.get(priority_number, TaskPriority.medium.value),
+        'labels': label_titles,
+        'progress_percent': progress_percent,
     }
 
 
@@ -1239,9 +1269,104 @@ def _format_vikunja_changed_fields(changes: dict[str, Any]) -> list[str]:
             translated.append('assigned_to')
         elif key == 'bucket_id':
             translated.append('status')
+        elif key == 'percent_done':
+            translated.append('progress')
+        elif key == 'labels':
+            translated.append('labels')
         else:
             translated.append(key)
     return sorted(set(translated))
+
+
+def _coerce_label_tokens(value: Any) -> list[str]:
+    raw_items: list[Any]
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r'[,;\n]+', value)
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = [value]
+
+    labels: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        token = str(raw or '').strip()
+        if not token:
+            continue
+        token = token.lstrip('#').strip()
+        if not token:
+            continue
+        key = token.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        labels.append(token)
+    return labels
+
+
+def _parse_progress_percent(value: Any) -> tuple[float | None, str | None]:
+    if value is None or value == '':
+        return None, None
+    raw = str(value).strip().removesuffix('%').strip()
+    try:
+        percent = float(raw)
+    except ValueError:
+        return None, f'Không hiểu progress "{value}".'
+    if percent < 0 or percent > 100:
+        return None, 'Progress phải nằm trong khoảng 0-100%.'
+    return round(percent / 100, 4), None
+
+
+def _label_title(label: dict[str, Any]) -> str:
+    return str(label.get('title') or '').strip()
+
+
+def _ensure_vikunja_label(client: Any, title: str) -> dict[str, Any]:
+    clean_title = title.strip()
+    for label in client.list_labels(search=clean_title):
+        if isinstance(label, dict) and _label_title(label).casefold() == clean_title.casefold():
+            return label
+    return client.create_label(clean_title)
+
+
+def _sync_vikunja_task_labels(
+    client: Any,
+    *,
+    task_id: int,
+    add_titles: list[str],
+    remove_prefixes: list[str] | None = None,
+    clear_labels: bool = False,
+) -> list[dict[str, Any]]:
+    current_labels = [label for label in client.list_task_labels(task_id) if isinstance(label, dict)]
+    remove_prefixes = [prefix.casefold() for prefix in (remove_prefixes or []) if prefix]
+
+    for label in current_labels:
+        title = _label_title(label)
+        raw_id = label.get('id')
+        if not title or raw_id is None:
+            continue
+        should_remove = clear_labels or any(title.casefold().startswith(prefix) for prefix in remove_prefixes)
+        if should_remove:
+            client.remove_label_from_task(task_id, int(raw_id))
+
+    existing_after_remove = [
+        label for label in client.list_task_labels(task_id) if isinstance(label, dict)
+    ] if (clear_labels or remove_prefixes) else current_labels
+    existing_titles = {_label_title(label).casefold() for label in existing_after_remove}
+
+    for title in _coerce_label_tokens(add_titles):
+        if title.casefold() in existing_titles:
+            continue
+        label = _ensure_vikunja_label(client, title)
+        label_id = label.get('id') if isinstance(label, dict) else None
+        if label_id is None:
+            continue
+        client.add_label_to_task(task_id, int(label_id))
+        existing_titles.add(title.casefold())
+
+    return [label for label in client.list_task_labels(task_id) if isinstance(label, dict)]
 
 
 def _task_manager_error(exc: Exception) -> str:
@@ -1263,6 +1388,11 @@ def _format_task_detail(task: dict[str, Any], *, compact: bool = False) -> str:
                 f'Deadline: {due_date}',
             ]
         )
+        labels = task.get('labels')
+        if isinstance(labels, list) and labels:
+            lines.append(f'Tag: {", ".join(str(label) for label in labels if label)}')
+        if task.get('progress_percent') is not None:
+            lines.append(f'Progress: {task.get("progress_percent")}%')
     url = _task_url(int(task['id'])) if task.get('id') is not None else None
     if url:
         lines.append(f'Link task: {url}')
@@ -1379,6 +1509,7 @@ def _tool_create_vikunja_task(
     assignee_token: str | None,
     shop_token: str | None = None,
     type_token: str | None = None,
+    label_tokens: Any = None,
     due_token: str | None = None,
     priority_token: str | None = None,
 ) -> dict[str, Any]:
@@ -1427,8 +1558,17 @@ def _tool_create_vikunja_task(
     if metadata:
         payload['description'] = 'Task metadata:\n' + '\n'.join(f'- {item}' for item in metadata)
 
-    task = get_vikunja_client().create_task(project_id, payload)
-    task_status_map = build_vikunja_task_status_map(get_vikunja_client(), project_id)
+    client = get_vikunja_client()
+    task = client.create_task(project_id, payload)
+    label_titles = _coerce_label_tokens(label_tokens)
+    if shop:
+        label_titles.append(f'shop:{shop.name}')
+    if task_type:
+        label_titles.append(f'type:{task_type.name}')
+    if label_titles:
+        labels = _sync_vikunja_task_labels(client, task_id=int(task['id']), add_titles=label_titles)
+        task['labels'] = labels
+    task_status_map = build_vikunja_task_status_map(client, project_id)
     task_payload = _tool_vikunja_task_payload(db, task, task_status_map=task_status_map)
     if assignee_user and not task_payload.get('assignee'):
         task_payload['assignee'] = assignee_user.name
@@ -1509,6 +1649,9 @@ def _tool_update_vikunja_task_fields(
 
     updates: dict[str, Any] = {}
     status_token_update: str | None = None
+    label_titles_to_add: list[str] = _coerce_label_tokens(arguments.get('label_tokens'))
+    label_prefixes_to_remove: list[str] = []
+    clear_labels = bool(arguments.get('clear_labels'))
     task_status_map = build_vikunja_task_status_map(client, project_id)
     previous_status = _status_from_vikunja_payload(task, task_status_map)
 
@@ -1523,21 +1666,27 @@ def _tool_update_vikunja_task_fields(
 
     metadata_updates: list[str] = []
     if arguments.get('clear_shop') or _is_clear_token(str(arguments.get('shop_token') or '')):
+        label_prefixes_to_remove.append('shop:')
         metadata_updates.append('Shop: None')
     elif 'shop_token' in arguments and str(arguments.get('shop_token') or '').strip():
         shop = _resolve_shop(db, str(arguments.get('shop_token') or ''))
         if not shop:
             return {'ok': False, 'error': f'Không tìm thấy shop {arguments.get("shop_token")}.'}
+        label_prefixes_to_remove.append('shop:')
+        label_titles_to_add.append(f'shop:{shop.name}')
         metadata_updates.append(f'Shop: {shop.name}')
 
     if arguments.get('clear_type') or _is_clear_token(str(arguments.get('type_token') or '')):
         updates['title'] = _replace_type_prefix_for_title(db, str(updates.get('title') or task.get('title') or ''), None)
+        label_prefixes_to_remove.append('type:')
         metadata_updates.append('Type: None')
     elif 'type_token' in arguments and str(arguments.get('type_token') or '').strip():
         task_type = _resolve_task_type(db, str(arguments.get('type_token') or ''))
         if not task_type:
             return {'ok': False, 'error': f'Không tìm thấy task type {arguments.get("type_token")}.'}
         updates['title'] = _replace_type_prefix_for_title(db, str(updates.get('title') or task.get('title') or ''), task_type)
+        label_prefixes_to_remove.append('type:')
+        label_titles_to_add.append(f'type:{task_type.name}')
         metadata_updates.append(f'Type: {task_type.name}')
 
     if arguments.get('clear_assignee'):
@@ -1574,6 +1723,13 @@ def _tool_update_vikunja_task_fields(
             return {'ok': False, 'error': f'Unknown priority: {priority_token}'}
         updates['priority'] = TASK_PRIORITY_TO_VIKUNJA_PRIORITY[priority_token]
 
+    if 'progress_percent' in arguments:
+        progress, error = _parse_progress_percent(arguments.get('progress_percent'))
+        if error:
+            return {'ok': False, 'error': error}
+        if progress is not None:
+            updates['percent_done'] = progress
+
     if 'status' in arguments and str(arguments.get('status') or '').strip():
         status_token_update = str(arguments.get('status') or '').strip()
         status_updates, error = _vikunja_status_payload(status_token_update)
@@ -1592,11 +1748,22 @@ def _tool_update_vikunja_task_fields(
         updates['description'] = f'{current_description}\n\nTask metadata update:\n' + '\n'.join(f'- {item}' for item in metadata_updates)
         updates['description'] = updates['description'].strip()
 
-    if not updates and not status_token_update:
+    labels_changed = bool(clear_labels or label_prefixes_to_remove or label_titles_to_add)
+    if not updates and not status_token_update and not labels_changed:
         return {'ok': False, 'error': 'Không có field nào để cập nhật.'}
 
     updated = client.update_task(resolved_task_id, updates) if updates else task
     changed_field_payload = dict(updates)
+    if labels_changed:
+        labels = _sync_vikunja_task_labels(
+            client,
+            task_id=resolved_task_id,
+            add_titles=label_titles_to_add,
+            remove_prefixes=label_prefixes_to_remove,
+            clear_labels=clear_labels,
+        )
+        updated['labels'] = labels
+        changed_field_payload['labels'] = [label.get('title') for label in labels if isinstance(label, dict)]
     if status_token_update:
         updated = move_vikunja_task_to_status(client, project_id, resolved_task_id, status_token_update)
         changed_field_payload['bucket_id'] = settings.vikunja_status_bucket_map.get(status_token_update)
@@ -1689,6 +1856,7 @@ def _tool_create_task(
     assignee_token: str | None,
     shop_token: str | None,
     type_token: str | None,
+    label_tokens: Any = None,
     due_token: str | None,
     priority_token: str | None,
 ) -> dict[str, Any]:
@@ -1701,6 +1869,7 @@ def _tool_create_task(
                 assignee_token=assignee_token,
                 shop_token=shop_token,
                 type_token=type_token,
+                label_tokens=label_tokens,
                 due_token=due_token,
                 priority_token=priority_token,
             )
@@ -2274,6 +2443,7 @@ def _execute_tool_call(
                 assignee_token=str(arguments.get('assignee_token') or '').strip() or None,
                 shop_token=str(arguments.get('shop_token') or '').strip() or None,
                 type_token=str(arguments.get('type_token') or '').strip() or None,
+                label_tokens=arguments.get('label_tokens'),
                 due_token=str(arguments.get('due_token') or '').strip() or None,
                 priority_token=str(arguments.get('priority') or '').strip() or None,
             )
