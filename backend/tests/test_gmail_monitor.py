@@ -1,4 +1,5 @@
 from datetime import date
+import base64
 
 from sqlalchemy import select
 
@@ -241,6 +242,88 @@ def test_poll_gmail_and_notify_reads_imap_app_password_messages(db_session, monk
     }
 
 
+def test_poll_gmail_and_notify_reads_gmail_api_oauth_messages(db_session, monkeypatch) -> None:
+    import app.gmail_monitor as gmail_monitor
+
+    class FakeResponse:
+        def __init__(self, payload: dict, status_code: int = 200) -> None:
+            self.payload = payload
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise gmail_monitor.httpx.HTTPStatusError('bad', request=None, response=None)
+
+        def json(self) -> dict:
+            return self.payload
+
+    def encoded(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+    class FakeHTTPClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url: str, data: dict):
+            assert data['grant_type'] == 'refresh_token'
+            return FakeResponse({'access_token': 'access-token'})
+
+        def get(self, url: str, headers: dict, params: dict | None = None):
+            assert headers['Authorization'] == 'Bearer access-token'
+            if url.endswith('/users/me/messages'):
+                query = params['q']
+                if 'transaction@etsy.com' in query:
+                    return FakeResponse({'messages': [{'id': 'sale-1'}]})
+                if 'no-reply@account.etsy.com' in query:
+                    return FakeResponse({'messages': [{'id': 'message-1'}]})
+                if 'conversations@mail.etsy.com' in query:
+                    return FakeResponse({'messages': [{'id': 'message-2'}]})
+                return FakeResponse({'messages': []})
+            if url.endswith('/sale-1'):
+                return FakeResponse({'id': 'sale-1', 'threadId': 'thread-sale', 'raw': encoded(SALE_EML)})
+            if url.endswith('/message-1'):
+                return FakeResponse({'id': 'message-1', 'threadId': 'thread-message-1', 'raw': encoded(MESSAGE_EML)})
+            if url.endswith('/message-2'):
+                return FakeResponse({'id': 'message-2', 'threadId': 'thread-message-2', 'raw': encoded(HELP_REQUEST_EML)})
+            return FakeResponse({}, status_code=404)
+
+    db_session.add(
+        IntegrationConfig(
+            key='gmail_zalo_monitor',
+            payload={
+                'gmail_oauth_client_id': 'client-id',
+                'gmail_oauth_client_secret': 'client-secret',
+                'gmail_oauth_refresh_token': 'refresh-token',
+                'gmail_sale_from_addresses': 'transaction@etsy.com',
+                'gmail_sale_subject': 'You made a sale on Etsy',
+                'gmail_message_from_addresses': 'no-reply@account.etsy.com,conversations@mail.etsy.com',
+                'gmail_poll_max_results': 10,
+            },
+        )
+    )
+    db_session.commit()
+    monkeypatch.setattr(gmail_monitor.httpx, 'Client', FakeHTTPClient)
+    monkeypatch.setattr('app.notifications._call_worker', lambda payload: (True, 200, '{"ok":true}', None))
+
+    result = poll_gmail_and_notify(db_session)
+
+    assert result['fetched'] == 3
+    assert result['created'] == 3
+    assert result['detected'] == {'sale': 1, 'message': 2}
+    stored_events = db_session.scalars(select(GmailMonitorEvent).order_by(GmailMonitorEvent.gmail_message_id)).all()
+    assert {event.gmail_message_id for event in stored_events} == {
+        'gmailapi:message-1',
+        'gmailapi:message-2',
+        'gmailapi:sale-1',
+    }
+
+
 def test_gmail_monitor_paused_skips_poll_and_digest(db_session, monkeypatch) -> None:
     import app.gmail_monitor as gmail_monitor
 
@@ -279,6 +362,9 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
         json={
             'gmail_address': 'etsy@example.com',
             'gmail_app_password': 'app-password',
+            'gmail_oauth_client_id': 'oauth-client-id',
+            'gmail_oauth_client_secret': 'oauth-client-secret',
+            'gmail_oauth_redirect_uri': 'https://hazeleo.com/task-api/admin/integrations/gmail-zalo/oauth/callback',
             'enabled': False,
             'zalo_worker_url': 'http://worker.local',
             'zalo_worker_token': 'worker-token',
@@ -291,7 +377,11 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
     assert config['enabled'] is False
     assert config['gmail_address'] == 'etsy@example.com'
     assert config['gmail_app_password_configured'] is True
+    assert config['gmail_oauth_client_id'] == 'oauth-client-id'
+    assert config['gmail_oauth_client_secret_configured'] is True
+    assert config['gmail_oauth_redirect_uri'].endswith('/oauth/callback')
     assert 'app-password' not in str(config)
+    assert 'oauth-client-secret' not in str(config)
     assert config['zalo_worker_token_configured'] is True
     assert config['zalo_shared_secret_configured'] is True
 
@@ -305,3 +395,53 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
     assert calls
     assert calls[-1]['payload']['target_id'] == 'zalo-group-from-ui'
     assert calls[-1]['kwargs']['config']['zalo_worker_url'] == 'http://worker.local'
+
+
+def test_admin_gmail_oauth_start_and_callback_store_refresh_token(client, monkeypatch, db_session) -> None:
+    import app.main as main_module
+
+    login = client.post('/auth/login', json={'username': 'trang', 'password': 'trang123'})
+    token = login.json()['access_token']
+    headers = {'Authorization': f'Bearer {token}'}
+    redirect_uri = 'https://hazeleo.com/task-api/admin/integrations/gmail-zalo/oauth/callback'
+
+    update = client.patch(
+        '/admin/integrations/gmail-zalo',
+        headers=headers,
+        json={
+            'gmail_oauth_client_id': 'oauth-client-id',
+            'gmail_oauth_client_secret': 'oauth-client-secret',
+            'gmail_oauth_redirect_uri': redirect_uri,
+        },
+    )
+    assert update.status_code == 200
+
+    start = client.post('/admin/integrations/gmail-zalo/oauth/start', headers=headers)
+    assert start.status_code == 200
+    auth_url = start.json()['auth_url']
+    assert 'accounts.google.com' in auth_url
+    stored = db_session.get(IntegrationConfig, 'gmail_zalo_monitor')
+    assert stored is not None
+    state = stored.payload['gmail_oauth_state']
+
+    monkeypatch.setattr(
+        main_module,
+        'exchange_gmail_oauth_code',
+        lambda config, code: {
+            'refresh_token': 'refresh-token',
+            'access_token': 'access-token',
+            'email_address': 'etsy@example.com',
+        },
+    )
+    callback = client.get(
+        '/admin/integrations/gmail-zalo/oauth/callback',
+        params={'code': 'oauth-code', 'state': state},
+    )
+    assert callback.status_code == 200
+
+    db_session.expire_all()
+    refreshed = db_session.get(IntegrationConfig, 'gmail_zalo_monitor')
+    assert refreshed is not None
+    assert refreshed.payload['gmail_oauth_refresh_token'] == 'refresh-token'
+    assert refreshed.payload['gmail_oauth_email'] == 'etsy@example.com'
+    assert 'gmail_oauth_state' not in refreshed.payload

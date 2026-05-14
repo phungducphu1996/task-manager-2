@@ -12,6 +12,7 @@ const loading = ref(true)
 const saving = ref(false)
 const polling = ref(false)
 const testing = ref(false)
+const connecting = ref(false)
 const error = ref<string | null>(null)
 const notice = ref<string | null>(null)
 const status = ref<GmailZaloStatus | null>(null)
@@ -20,6 +21,9 @@ const form = ref({
   enabled: true,
   gmail_address: '',
   gmail_app_password: '',
+  gmail_oauth_client_id: '',
+  gmail_oauth_client_secret: '',
+  gmail_oauth_redirect_uri: '',
   gmail_imap_host: 'imap.gmail.com',
   gmail_imap_port: 993,
   gmail_imap_mailbox: 'INBOX',
@@ -36,6 +40,10 @@ const form = ref({
 
 const recentEvents = computed<GmailZaloEvent[]>(() => status.value?.recent_events ?? [])
 const config = computed(() => status.value?.config ?? null)
+const recommendedRedirectUri = computed(() => {
+  if (typeof window === 'undefined') return ''
+  return `${window.location.origin}/task-api/admin/integrations/gmail-zalo/oauth/callback`
+})
 
 function applyConfig(next: GmailZaloStatus) {
   status.value = next
@@ -45,6 +53,9 @@ function applyConfig(next: GmailZaloStatus) {
     enabled: cfg.enabled,
     gmail_address: cfg.gmail_address ?? '',
     gmail_app_password: '',
+    gmail_oauth_client_id: cfg.gmail_oauth_client_id ?? '',
+    gmail_oauth_client_secret: '',
+    gmail_oauth_redirect_uri: cfg.gmail_oauth_redirect_uri || recommendedRedirectUri.value,
     gmail_imap_host: cfg.gmail_imap_host || 'imap.gmail.com',
     gmail_imap_port: cfg.gmail_imap_port || 993,
     gmail_imap_mailbox: cfg.gmail_imap_mailbox || 'INBOX',
@@ -59,6 +70,32 @@ function applyConfig(next: GmailZaloStatus) {
     zalo_shared_secret: '',
     zalo_group_id: cfg.zalo_group_id ?? ''
   }
+}
+
+function buildConfigPayload(): GmailZaloConfigPayload {
+  const payload: GmailZaloConfigPayload = {
+    enabled: form.value.enabled,
+    gmail_address: form.value.gmail_address,
+    gmail_oauth_client_id: form.value.gmail_oauth_client_id,
+    gmail_oauth_redirect_uri: form.value.gmail_oauth_redirect_uri || recommendedRedirectUri.value,
+    gmail_imap_host: form.value.gmail_imap_host,
+    gmail_imap_port: Number(form.value.gmail_imap_port),
+    gmail_imap_mailbox: form.value.gmail_imap_mailbox,
+    gmail_search_since_days: Number(form.value.gmail_search_since_days),
+    gmail_sale_from_addresses: form.value.gmail_sale_from_addresses,
+    gmail_sale_subject: form.value.gmail_sale_subject,
+    gmail_message_from_addresses: form.value.gmail_message_from_addresses,
+    gmail_poll_max_results: Number(form.value.gmail_poll_max_results),
+    zalo_worker_url: form.value.zalo_worker_url,
+    zalo_group_id: form.value.zalo_group_id
+  }
+  if (form.value.gmail_oauth_client_secret.trim()) {
+    payload.gmail_oauth_client_secret = form.value.gmail_oauth_client_secret.trim()
+  }
+  if (form.value.gmail_app_password.trim()) payload.gmail_app_password = form.value.gmail_app_password.trim()
+  if (form.value.zalo_worker_token.trim()) payload.zalo_worker_token = form.value.zalo_worker_token.trim()
+  if (form.value.zalo_shared_secret.trim()) payload.zalo_shared_secret = form.value.zalo_shared_secret.trim()
+  return payload
 }
 
 async function loadStatus() {
@@ -77,32 +114,46 @@ async function saveConfig() {
   saving.value = true
   error.value = null
   notice.value = null
-  const payload: GmailZaloConfigPayload = {
-    enabled: form.value.enabled,
-    gmail_address: form.value.gmail_address,
-    gmail_imap_host: form.value.gmail_imap_host,
-    gmail_imap_port: Number(form.value.gmail_imap_port),
-    gmail_imap_mailbox: form.value.gmail_imap_mailbox,
-    gmail_search_since_days: Number(form.value.gmail_search_since_days),
-    gmail_sale_from_addresses: form.value.gmail_sale_from_addresses,
-    gmail_sale_subject: form.value.gmail_sale_subject,
-    gmail_message_from_addresses: form.value.gmail_message_from_addresses,
-    gmail_poll_max_results: Number(form.value.gmail_poll_max_results),
-    zalo_worker_url: form.value.zalo_worker_url,
-    zalo_group_id: form.value.zalo_group_id
-  }
-  if (form.value.gmail_app_password.trim()) payload.gmail_app_password = form.value.gmail_app_password.trim()
-  if (form.value.zalo_worker_token.trim()) payload.zalo_worker_token = form.value.zalo_worker_token.trim()
-  if (form.value.zalo_shared_secret.trim()) payload.zalo_shared_secret = form.value.zalo_shared_secret.trim()
 
   try {
-    await api.updateGmailZaloConfig(payload)
+    await api.updateGmailZaloConfig(buildConfigPayload())
     notice.value = 'Config saved.'
     await loadStatus()
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to save config.'
   } finally {
     saving.value = false
+  }
+}
+
+async function connectGmail() {
+  connecting.value = true
+  error.value = null
+  notice.value = null
+  try {
+    await api.updateGmailZaloConfig(buildConfigPayload())
+    const response = await api.startGmailOAuth()
+    window.location.href = response.auth_url
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to start Gmail OAuth.'
+    connecting.value = false
+  }
+}
+
+async function disconnectGmail() {
+  const accepted = window.confirm('Disconnect Gmail OAuth? Existing received events stay in the dashboard.')
+  if (!accepted) return
+  connecting.value = true
+  error.value = null
+  notice.value = null
+  try {
+    await api.disconnectGmailOAuth()
+    notice.value = 'Gmail disconnected.'
+    await loadStatus()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to disconnect Gmail.'
+  } finally {
+    connecting.value = false
   }
 }
 
@@ -130,7 +181,7 @@ async function pollNow() {
     status.value = status.value
       ? { ...status.value, recent_events: response.recent_events }
       : await api.getGmailZaloStatus()
-    notice.value = response.result.skipped
+    notice.value = response.result.skipped === true
       ? response.result.reason || 'Monitor paused.'
       : `Poll xong: ${response.result.created} event mới, ${response.result.dispatch.sent ?? 0} đã gửi.`
     await loadStatus()
@@ -215,6 +266,10 @@ onMounted(async () => {
           <span>Status</span>
           <strong>{{ config?.enabled ? 'On' : 'Paused' }}</strong>
         </div>
+        <div class="integration-stat">
+          <span>Gmail</span>
+          <strong>{{ config?.gmail_oauth_connected ? 'Connected' : 'Not connected' }}</strong>
+        </div>
         <button
           class="ghost-btn"
           type="button"
@@ -239,7 +294,7 @@ onMounted(async () => {
           <div class="manage-card-head">
             <div>
               <h2>Connection</h2>
-              <p>Secrets are write-only. Leave a secret blank to keep the current value.</p>
+              <p>Use Google OAuth for Gmail. Secrets are write-only; leave a secret blank to keep it.</p>
             </div>
           </div>
 
@@ -253,29 +308,25 @@ onMounted(async () => {
 
           <div class="integration-form">
             <label>
-              Gmail address
+              Gmail address / connected email
               <input v-model="form.gmail_address" type="email" autocomplete="off" />
             </label>
             <label>
-              App password
+              OAuth client ID
+              <input v-model="form.gmail_oauth_client_id" type="text" autocomplete="off" />
+            </label>
+            <label>
+              OAuth client secret
               <input
-                v-model="form.gmail_app_password"
+                v-model="form.gmail_oauth_client_secret"
                 type="password"
                 autocomplete="new-password"
-                :placeholder="config?.gmail_app_password_configured ? 'Configured' : 'Required'"
+                :placeholder="config?.gmail_oauth_client_secret_configured ? 'Configured' : 'Required'"
               />
             </label>
             <label>
-              IMAP host
-              <input v-model="form.gmail_imap_host" type="text" />
-            </label>
-            <label>
-              IMAP port
-              <input v-model.number="form.gmail_imap_port" type="number" min="1" max="65535" />
-            </label>
-            <label>
-              Mailbox
-              <input v-model="form.gmail_imap_mailbox" type="text" />
+              Redirect URI
+              <input v-model="form.gmail_oauth_redirect_uri" type="url" />
             </label>
             <label>
               Lookback days
@@ -329,7 +380,25 @@ onMounted(async () => {
             <button class="primary-btn" type="button" :disabled="saving" @click="saveConfig">
               {{ saving ? 'Saving...' : 'Save config' }}
             </button>
+            <button
+              class="ghost-btn"
+              type="button"
+              :disabled="connecting || saving"
+              @click="connectGmail"
+            >
+              {{ connecting ? 'Connecting...' : config?.gmail_oauth_connected ? 'Reconnect Gmail' : 'Connect Gmail' }}
+            </button>
+            <button
+              v-if="config?.gmail_oauth_connected"
+              class="ghost-btn danger"
+              type="button"
+              :disabled="connecting"
+              @click="disconnectGmail"
+            >
+              Disconnect
+            </button>
             <small v-if="config?.updated_at_label">Updated {{ config.updated_at_label }}</small>
+            <small v-if="config?.gmail_oauth_email">Connected as {{ config.gmail_oauth_email }}</small>
           </div>
         </section>
 

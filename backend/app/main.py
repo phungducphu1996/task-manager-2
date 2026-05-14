@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 import hmac
 from logging import getLogger
 from os.path import basename
@@ -61,7 +61,17 @@ from .notifications import (
     run_daily_notification_job,
     send_zalo_text,
 )
-from .gmail_monitor import GMAIL_ZALO_CONFIG_KEY, GmailMonitorError, gmail_zalo_config, poll_gmail_and_notify, run_gmail_daily_digest
+from .gmail_monitor import (
+    GMAIL_ZALO_CONFIG_KEY,
+    GmailMonitorError,
+    build_gmail_oauth_url,
+    exchange_gmail_oauth_code,
+    gmail_oauth_configured,
+    gmail_oauth_connected,
+    gmail_zalo_config,
+    poll_gmail_and_notify,
+    run_gmail_daily_digest,
+)
 from .schemas import (
     LoginRequest,
     LoginResponse,
@@ -148,6 +158,9 @@ class AdminGmailZaloConfigUpdate(BaseModel):
     enabled: bool | None = None
     gmail_address: str | None = Field(default=None, max_length=255)
     gmail_app_password: str | None = Field(default=None, max_length=255)
+    gmail_oauth_client_id: str | None = Field(default=None, max_length=255)
+    gmail_oauth_client_secret: str | None = Field(default=None, max_length=1000)
+    gmail_oauth_redirect_uri: str | None = Field(default=None, max_length=1000)
     gmail_imap_host: str | None = Field(default=None, max_length=255)
     gmail_imap_port: int | None = Field(default=None, ge=1, le=65535)
     gmail_imap_mailbox: str | None = Field(default=None, max_length=255)
@@ -1630,6 +1643,13 @@ def _admin_gmail_zalo_config_payload(db: Session) -> dict[str, Any]:
         'enabled': bool(config.get('enabled', True)),
         'gmail_address': config.get('gmail_address'),
         'gmail_app_password_configured': bool(config.get('gmail_app_password')),
+        'gmail_oauth_client_id': config.get('gmail_oauth_client_id'),
+        'gmail_oauth_client_secret_configured': bool(config.get('gmail_oauth_client_secret')),
+        'gmail_oauth_redirect_uri': config.get('gmail_oauth_redirect_uri'),
+        'gmail_oauth_configured': gmail_oauth_configured(config),
+        'gmail_oauth_connected': gmail_oauth_connected(config),
+        'gmail_oauth_email': config.get('gmail_oauth_email'),
+        'gmail_oauth_connected_at': config.get('gmail_oauth_connected_at'),
         'gmail_imap_host': config.get('gmail_imap_host'),
         'gmail_imap_port': config.get('gmail_imap_port'),
         'gmail_imap_mailbox': config.get('gmail_imap_mailbox'),
@@ -1652,7 +1672,7 @@ def _update_gmail_zalo_config(db: Session, update: AdminGmailZaloConfigUpdate) -
     stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
     payload = dict(stored.payload or {}) if stored and isinstance(stored.payload, dict) else {}
     values = update.model_dump(exclude_unset=True)
-    secret_fields = {'gmail_app_password', 'zalo_worker_token', 'zalo_shared_secret'}
+    secret_fields = {'gmail_app_password', 'gmail_oauth_client_secret', 'zalo_worker_token', 'zalo_shared_secret'}
     for key, value in values.items():
         if key in secret_fields and (value is None or str(value).strip() == ''):
             continue
@@ -1998,6 +2018,115 @@ def admin_gmail_zalo_update(
 ) -> dict[str, Any]:
     _ensure_admin(actor)
     return {'config': _update_gmail_zalo_config(db, payload)}
+
+
+@app.post('/admin/integrations/gmail-zalo/oauth/start')
+def admin_gmail_zalo_oauth_start(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, str]:
+    _ensure_admin(actor)
+    stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
+    payload = dict(stored.payload or {}) if stored and isinstance(stored.payload, dict) else {}
+    config = gmail_zalo_config(db)
+    state = uuid4().hex
+    payload['gmail_oauth_state'] = state
+    payload['gmail_oauth_state_expires_at'] = (
+        datetime.now(ZoneInfo(settings.app_timezone)) + timedelta(minutes=15)
+    ).isoformat()
+    if stored is None:
+        stored = IntegrationConfig(key=GMAIL_ZALO_CONFIG_KEY, payload=payload)
+    else:
+        stored.payload = payload
+    db.add(stored)
+    db.commit()
+    try:
+        auth_url = build_gmail_oauth_url(gmail_zalo_config(db), state=state)
+    except GmailMonitorError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        'auth_url': auth_url,
+        'redirect_uri': str(config.get('gmail_oauth_redirect_uri') or ''),
+    }
+
+
+@app.post('/admin/integrations/gmail-zalo/oauth/disconnect')
+def admin_gmail_zalo_oauth_disconnect(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_actor),
+) -> dict[str, Any]:
+    _ensure_admin(actor)
+    stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
+    payload = dict(stored.payload or {}) if stored and isinstance(stored.payload, dict) else {}
+    for key in [
+        'gmail_oauth_refresh_token',
+        'gmail_oauth_email',
+        'gmail_oauth_connected_at',
+        'gmail_oauth_state',
+        'gmail_oauth_state_expires_at',
+    ]:
+        payload.pop(key, None)
+    if stored is None:
+        stored = IntegrationConfig(key=GMAIL_ZALO_CONFIG_KEY, payload=payload)
+    else:
+        stored.payload = payload
+    db.add(stored)
+    db.commit()
+    return {'config': _admin_gmail_zalo_config_payload(db)}
+
+
+@app.get('/admin/integrations/gmail-zalo/oauth/callback', response_class=HTMLResponse)
+def admin_gmail_zalo_oauth_callback(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    if error:
+        return HTMLResponse(f'<h1>Gmail connect failed</h1><p>{error}</p>', status_code=400)
+    if not code or not state:
+        return HTMLResponse('<h1>Gmail connect failed</h1><p>Missing code or state.</p>', status_code=400)
+
+    stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
+    payload = dict(stored.payload or {}) if stored and isinstance(stored.payload, dict) else {}
+    expected_state = str(payload.get('gmail_oauth_state') or '')
+    expires_at = _parse_admin_datetime(payload.get('gmail_oauth_state_expires_at'))
+    now = datetime.now(ZoneInfo(settings.app_timezone))
+    if not expected_state or not hmac.compare_digest(expected_state, state):
+        return HTMLResponse('<h1>Gmail connect failed</h1><p>OAuth state is invalid.</p>', status_code=400)
+    if expires_at and expires_at < now:
+        return HTMLResponse('<h1>Gmail connect failed</h1><p>OAuth state expired. Start again.</p>', status_code=400)
+
+    try:
+        token = exchange_gmail_oauth_code(gmail_zalo_config(db), code=code)
+    except GmailMonitorError as exc:
+        return HTMLResponse(f'<h1>Gmail connect failed</h1><p>{exc}</p>', status_code=400)
+
+    payload['gmail_oauth_refresh_token'] = token['refresh_token']
+    if token.get('email_address'):
+        payload['gmail_oauth_email'] = token['email_address']
+        payload['gmail_address'] = token['email_address']
+    payload['gmail_oauth_connected_at'] = now.isoformat()
+    payload.pop('gmail_oauth_state', None)
+    payload.pop('gmail_oauth_state_expires_at', None)
+    if stored is None:
+        stored = IntegrationConfig(key=GMAIL_ZALO_CONFIG_KEY, payload=payload)
+    else:
+        stored.payload = payload
+    db.add(stored)
+    db.commit()
+    return HTMLResponse(
+        """
+        <!doctype html>
+        <html lang="vi">
+          <head><meta charset="utf-8"><title>Gmail connected</title></head>
+          <body style="font-family:system-ui;padding:32px">
+            <h1>Gmail connected</h1>
+            <p>You can close this tab and return to Task Manager.</p>
+          </body>
+        </html>
+        """
+    )
 
 
 @app.get('/admin/integrations/gmail-zalo/events')

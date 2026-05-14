@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     notification_max_retries: int = 3
     gmail_address: str | None = None
     gmail_app_password: str | None = None
+    gmail_oauth_client_id: str | None = None
+    gmail_oauth_client_secret: str | None = None
+    gmail_oauth_redirect_uri: str | None = None
     gmail_imap_host: str = 'imap.gmail.com'
     gmail_imap_port: int = 993
     gmail_imap_mailbox: str = 'INBOX'

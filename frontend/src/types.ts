@@ -184,6 +184,13 @@ export interface GmailZaloConfig {
   enabled: boolean
   gmail_address: string | null
   gmail_app_password_configured: boolean
+  gmail_oauth_client_id: string | null
+  gmail_oauth_client_secret_configured: boolean
+  gmail_oauth_redirect_uri: string | null
+  gmail_oauth_configured: boolean
+  gmail_oauth_connected: boolean
+  gmail_oauth_email: string | null
+  gmail_oauth_connected_at: string | null
   gmail_imap_host: string
   gmail_imap_port: number
   gmail_imap_mailbox: string
@@ -244,6 +251,9 @@ export interface GmailZaloConfigPayload {
   enabled?: boolean | null
   gmail_address?: string | null
   gmail_app_password?: string | null
+  gmail_oauth_client_id?: string | null
+  gmail_oauth_client_secret?: string | null
+  gmail_oauth_redirect_uri?: string | null
   gmail_imap_host?: string | null
   gmail_imap_port?: number | null
   gmail_imap_mailbox?: string | null

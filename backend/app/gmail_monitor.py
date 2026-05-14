@@ -9,10 +9,13 @@ from email.utils import parsedate_to_datetime
 from hashlib import sha1
 from html import unescape
 import imaplib
+import base64
 import re
 from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import httpx
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
@@ -22,6 +25,10 @@ from .notifications import NotificationSpec, dispatch_due_notification_events, e
 
 settings = get_settings()
 GMAIL_ZALO_CONFIG_KEY = 'gmail_zalo_monitor'
+GMAIL_OAUTH_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+GMAIL_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
+GMAIL_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+GMAIL_API_URL = 'https://gmail.googleapis.com/gmail/v1'
 
 
 def _string_list(value: str | None) -> list[str]:
@@ -38,6 +45,12 @@ def gmail_zalo_config(db: Session | None = None) -> dict[str, Any]:
         'enabled': bool(payload.get('enabled', True)),
         'gmail_address': payload.get('gmail_address') or settings.gmail_address,
         'gmail_app_password': payload.get('gmail_app_password') or settings.gmail_app_password,
+        'gmail_oauth_client_id': payload.get('gmail_oauth_client_id') or settings.gmail_oauth_client_id,
+        'gmail_oauth_client_secret': payload.get('gmail_oauth_client_secret') or settings.gmail_oauth_client_secret,
+        'gmail_oauth_redirect_uri': payload.get('gmail_oauth_redirect_uri') or settings.gmail_oauth_redirect_uri,
+        'gmail_oauth_refresh_token': payload.get('gmail_oauth_refresh_token'),
+        'gmail_oauth_email': payload.get('gmail_oauth_email'),
+        'gmail_oauth_connected_at': payload.get('gmail_oauth_connected_at'),
         'gmail_imap_host': payload.get('gmail_imap_host') or settings.gmail_imap_host,
         'gmail_imap_port': int(payload.get('gmail_imap_port') or settings.gmail_imap_port),
         'gmail_imap_mailbox': payload.get('gmail_imap_mailbox') or settings.gmail_imap_mailbox,
@@ -373,12 +386,115 @@ def parse_eml_bytes(raw: bytes, **kwargs: Any) -> ParsedGmailEvent | None:
 
 
 def _gmail_configured(config: dict[str, Any]) -> bool:
-    return bool(config.get('gmail_address') and config.get('gmail_app_password'))
+    return _gmail_oauth_configured(config) or bool(config.get('gmail_address') and config.get('gmail_app_password'))
+
+
+def _gmail_oauth_configured(config: dict[str, Any]) -> bool:
+    return bool(
+        config.get('gmail_oauth_client_id')
+        and config.get('gmail_oauth_client_secret')
+        and config.get('gmail_oauth_refresh_token')
+    )
 
 
 def _require_gmail_config(config: dict[str, Any]) -> None:
     if not _gmail_configured(config):
-        raise GmailMonitorConfigError('Gmail IMAP is not configured. Set GMAIL_ADDRESS and GMAIL_APP_PASSWORD.')
+        raise GmailMonitorConfigError('Gmail is not connected. Connect Gmail with OAuth in the admin UI.')
+
+
+def gmail_oauth_configured(config: dict[str, Any]) -> bool:
+    return bool(config.get('gmail_oauth_client_id') and config.get('gmail_oauth_client_secret'))
+
+
+def gmail_oauth_connected(config: dict[str, Any]) -> bool:
+    return _gmail_oauth_configured(config)
+
+
+def build_gmail_oauth_url(config: dict[str, Any], *, state: str) -> str:
+    if not gmail_oauth_configured(config):
+        raise GmailMonitorConfigError('Gmail OAuth client ID and client secret are required.')
+    redirect_uri = str(config.get('gmail_oauth_redirect_uri') or '').strip()
+    if not redirect_uri:
+        raise GmailMonitorConfigError('Gmail OAuth redirect URI is required.')
+    params = {
+        'client_id': str(config.get('gmail_oauth_client_id')),
+        'redirect_uri': redirect_uri,
+        'response_type': 'code',
+        'scope': GMAIL_OAUTH_SCOPE,
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'include_granted_scopes': 'true',
+        'state': state,
+    }
+    return f'{GMAIL_AUTH_URL}?{urlencode(params)}'
+
+
+def exchange_gmail_oauth_code(config: dict[str, Any], *, code: str) -> dict[str, Any]:
+    if not gmail_oauth_configured(config):
+        raise GmailMonitorConfigError('Gmail OAuth client ID and client secret are required.')
+    redirect_uri = str(config.get('gmail_oauth_redirect_uri') or '').strip()
+    if not redirect_uri:
+        raise GmailMonitorConfigError('Gmail OAuth redirect URI is required.')
+
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(
+                GMAIL_TOKEN_URL,
+                data={
+                    'client_id': str(config.get('gmail_oauth_client_id')),
+                    'client_secret': str(config.get('gmail_oauth_client_secret')),
+                    'code': code,
+                    'grant_type': 'authorization_code',
+                    'redirect_uri': redirect_uri,
+                },
+            )
+            response.raise_for_status()
+            token = response.json()
+            access_token = str(token.get('access_token') or '')
+            email_address = None
+            if access_token:
+                profile_response = client.get(
+                    f'{GMAIL_API_URL}/users/me/profile',
+                    headers={'Authorization': f'Bearer {access_token}'},
+                )
+                if profile_response.status_code < 400:
+                    profile = profile_response.json()
+                    email_address = profile.get('emailAddress')
+    except httpx.HTTPError as exc:
+        raise GmailMonitorError(f'Gmail OAuth token exchange failed: {exc}') from exc
+
+    if not token.get('refresh_token'):
+        raise GmailMonitorError('Google did not return a refresh token. Try connecting again and approve offline access.')
+    return {
+        'refresh_token': token.get('refresh_token'),
+        'access_token': token.get('access_token'),
+        'expires_in': token.get('expires_in'),
+        'email_address': email_address,
+    }
+
+
+def _refresh_gmail_access_token(config: dict[str, Any]) -> str:
+    if not _gmail_oauth_configured(config):
+        raise GmailMonitorConfigError('Gmail OAuth is not connected.')
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(
+                GMAIL_TOKEN_URL,
+                data={
+                    'client_id': str(config.get('gmail_oauth_client_id')),
+                    'client_secret': str(config.get('gmail_oauth_client_secret')),
+                    'refresh_token': str(config.get('gmail_oauth_refresh_token')),
+                    'grant_type': 'refresh_token',
+                },
+            )
+            response.raise_for_status()
+            token = response.json()
+    except httpx.HTTPError as exc:
+        raise GmailMonitorError(f'Gmail OAuth refresh failed: {exc}') from exc
+    access_token = str(token.get('access_token') or '')
+    if not access_token:
+        raise GmailMonitorError('Gmail OAuth refresh did not return an access token.')
+    return access_token
 
 
 def _quote_imap_value(value: str) -> str:
@@ -479,6 +595,89 @@ def _fetch_imap_messages(config: dict[str, Any]) -> dict[str, list[tuple[str, by
                 client.logout()
             except imaplib.IMAP4.error:
                 pass
+
+
+def _gmail_api_query(config: dict[str, Any], *, from_address: str, subject: str | None = None) -> str:
+    days = max(1, int(config.get('gmail_search_since_days') or settings.gmail_search_since_days))
+    parts = [f'newer_than:{days}d', f'from:{from_address}']
+    if subject:
+        escaped = subject.replace('"', '\\"')
+        parts.append(f'subject:"{escaped}"')
+    return ' '.join(parts)
+
+
+def _gmail_api_internal_date(value: str | int | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        milliseconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
+
+
+def _decode_gmail_api_raw(raw: str) -> bytes:
+    padded = raw + '=' * (-len(raw) % 4)
+    return base64.urlsafe_b64decode(padded.encode('ascii'))
+
+
+def _fetch_gmail_api_messages(config: dict[str, Any]) -> dict[str, list[tuple[str, bytes, dict[str, Any]]]]:
+    _require_gmail_config(config)
+    access_token = _refresh_gmail_access_token(config)
+    headers = {'Authorization': f'Bearer {access_token}'}
+    result: dict[str, list[tuple[str, bytes, dict[str, Any]]]] = {'sale': [], 'message': []}
+    max_results = max(1, int(config.get('gmail_poll_max_results') or settings.gmail_poll_max_results))
+    search_specs = {
+        'sale': {
+            'from_addresses': _string_list(str(config.get('gmail_sale_from_addresses') or '')),
+            'subject': str(config.get('gmail_sale_subject') or '') or None,
+        },
+        'message': {
+            'from_addresses': _string_list(str(config.get('gmail_message_from_addresses') or '')),
+            'subject': None,
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=25.0) as client:
+            for event_type, spec in search_specs.items():
+                seen_ids: set[str] = set()
+                for sender in spec['from_addresses']:
+                    list_response = client.get(
+                        f'{GMAIL_API_URL}/users/me/messages',
+                        headers=headers,
+                        params={
+                            'q': _gmail_api_query(config, from_address=sender, subject=spec['subject']),
+                            'maxResults': max_results,
+                        },
+                    )
+                    list_response.raise_for_status()
+                    messages = list_response.json().get('messages') or []
+                    for item in messages:
+                        message_id = str(item.get('id') or '')
+                        if not message_id or message_id in seen_ids:
+                            continue
+                        seen_ids.add(message_id)
+                        message_response = client.get(
+                            f'{GMAIL_API_URL}/users/me/messages/{message_id}',
+                            headers=headers,
+                            params={'format': 'raw'},
+                        )
+                        message_response.raise_for_status()
+                        message_payload = message_response.json()
+                        raw = str(message_payload.get('raw') or '')
+                        if not raw:
+                            continue
+                        result[event_type].append((message_id, _decode_gmail_api_raw(raw), message_payload))
+                        if len(result[event_type]) >= max_results:
+                            break
+                    if len(result[event_type]) >= max_results:
+                        break
+    except httpx.HTTPError as exc:
+        raise GmailMonitorError(f'Gmail API request failed: {exc}') from exc
+    except (ValueError, TypeError) as exc:
+        raise GmailMonitorError(f'Gmail API response could not be parsed: {exc}') from exc
+    return result
 
 
 def _event_key(event_type: str, gmail_message_id: str) -> str:
@@ -620,7 +819,8 @@ def poll_gmail_and_notify(db: Session) -> dict[str, Any]:
             'detected': {'sale': 0, 'message': 0},
             'dispatch': {'processed': 0, 'sent': 0, 'pending': 0, 'failed': 0},
         }
-    messages_by_type = _fetch_imap_messages(config)
+    use_gmail_api = _gmail_oauth_configured(config)
+    messages_by_type = _fetch_gmail_api_messages(config) if use_gmail_api else _fetch_imap_messages(config)
     seen: set[str] = set()
     created = 0
     skipped = 0
@@ -628,14 +828,31 @@ def poll_gmail_and_notify(db: Session) -> dict[str, Any]:
     detected: dict[str, int] = {'sale': 0, 'message': 0}
 
     for expected_type, messages in messages_by_type.items():
-        for uid, raw in messages:
+        for message in messages:
             fetched += 1
-            mailbox = str(config.get('gmail_imap_mailbox') or settings.gmail_imap_mailbox)
-            gmail_id = f'imap:{mailbox}:{uid}'
+            if use_gmail_api:
+                uid, raw, metadata = message
+                gmail_id = f'gmailapi:{uid}'
+                gmail_thread_id = str(metadata.get('threadId') or '') or None
+                snippet = str(metadata.get('snippet') or '') or None
+                internal_date = _gmail_api_internal_date(metadata.get('internalDate'))
+            else:
+                uid, raw = message
+                mailbox = str(config.get('gmail_imap_mailbox') or settings.gmail_imap_mailbox)
+                gmail_id = f'imap:{mailbox}:{uid}'
+                gmail_thread_id = None
+                snippet = None
+                internal_date = None
             if not gmail_id or gmail_id in seen:
                 continue
             seen.add(gmail_id)
-            parsed = parse_eml_bytes(raw, gmail_message_id=gmail_id)
+            parsed = parse_eml_bytes(
+                raw,
+                gmail_message_id=gmail_id,
+                gmail_thread_id=gmail_thread_id,
+                snippet=snippet,
+                internal_date=internal_date,
+            )
             if parsed is None or parsed.event_type != expected_type:
                 skipped += 1
                 continue

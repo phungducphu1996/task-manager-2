@@ -188,16 +188,23 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(payload)
     }),
+  startGmailOAuth: () =>
+    request<{ auth_url: string; redirect_uri: string }>('/admin/integrations/gmail-zalo/oauth/start', {
+      method: 'POST'
+    }),
+  disconnectGmailOAuth: () =>
+    request<{ config: GmailZaloConfig }>('/admin/integrations/gmail-zalo/oauth/disconnect', {
+      method: 'POST'
+    }),
   getGmailZaloEvents: (limit = 50) =>
     request<{ events: GmailZaloEvent[] }>(`/admin/integrations/gmail-zalo/events?limit=${limit}`),
   pollGmailZalo: () =>
     request<{
       result: {
-        skipped?: boolean
+        skipped?: boolean | number
         reason?: string
         fetched: number
         created: number
-        skipped: number
         detected: Record<string, number>
         dispatch: Record<string, number>
       }
