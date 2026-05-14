@@ -145,6 +145,7 @@ class AdminNotificationPromptUpdate(BaseModel):
 
 
 class AdminGmailZaloConfigUpdate(BaseModel):
+    enabled: bool | None = None
     gmail_address: str | None = Field(default=None, max_length=255)
     gmail_app_password: str | None = Field(default=None, max_length=255)
     gmail_imap_host: str | None = Field(default=None, max_length=255)
@@ -1626,6 +1627,7 @@ def _admin_gmail_zalo_config_payload(db: Session) -> dict[str, Any]:
     stored = db.get(IntegrationConfig, GMAIL_ZALO_CONFIG_KEY)
     payload = stored.payload if stored and isinstance(stored.payload, dict) else {}
     return {
+        'enabled': bool(config.get('enabled', True)),
         'gmail_address': config.get('gmail_address'),
         'gmail_app_password_configured': bool(config.get('gmail_app_password')),
         'gmail_imap_host': config.get('gmail_imap_host'),

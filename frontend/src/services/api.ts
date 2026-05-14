@@ -193,6 +193,8 @@ export const api = {
   pollGmailZalo: () =>
     request<{
       result: {
+        skipped?: boolean
+        reason?: string
         fetched: number
         created: number
         skipped: number

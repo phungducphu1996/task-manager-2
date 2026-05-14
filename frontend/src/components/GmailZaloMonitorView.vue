@@ -17,6 +17,7 @@ const notice = ref<string | null>(null)
 const status = ref<GmailZaloStatus | null>(null)
 
 const form = ref({
+  enabled: true,
   gmail_address: '',
   gmail_app_password: '',
   gmail_imap_host: 'imap.gmail.com',
@@ -41,6 +42,7 @@ function applyConfig(next: GmailZaloStatus) {
   const cfg = next.config
   form.value = {
     ...form.value,
+    enabled: cfg.enabled,
     gmail_address: cfg.gmail_address ?? '',
     gmail_app_password: '',
     gmail_imap_host: cfg.gmail_imap_host || 'imap.gmail.com',
@@ -76,6 +78,7 @@ async function saveConfig() {
   error.value = null
   notice.value = null
   const payload: GmailZaloConfigPayload = {
+    enabled: form.value.enabled,
     gmail_address: form.value.gmail_address,
     gmail_imap_host: form.value.gmail_imap_host,
     gmail_imap_port: Number(form.value.gmail_imap_port),
@@ -103,6 +106,21 @@ async function saveConfig() {
   }
 }
 
+async function setMonitorEnabled(enabled: boolean) {
+  saving.value = true
+  error.value = null
+  notice.value = null
+  try {
+    await api.updateGmailZaloConfig({ enabled })
+    notice.value = enabled ? 'Monitor enabled.' : 'Monitor paused.'
+    await loadStatus()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Failed to update monitor state.'
+  } finally {
+    saving.value = false
+  }
+}
+
 async function pollNow() {
   polling.value = true
   error.value = null
@@ -112,7 +130,9 @@ async function pollNow() {
     status.value = status.value
       ? { ...status.value, recent_events: response.recent_events }
       : await api.getGmailZaloStatus()
-    notice.value = `Poll xong: ${response.result.created} event mới, ${response.result.dispatch.sent ?? 0} đã gửi.`
+    notice.value = response.result.skipped
+      ? response.result.reason || 'Monitor paused.'
+      : `Poll xong: ${response.result.created} event mới, ${response.result.dispatch.sent ?? 0} đã gửi.`
     await loadStatus()
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to poll Gmail.'
@@ -192,9 +212,17 @@ onMounted(async () => {
           <strong>{{ status?.counts.messages ?? 0 }}</strong>
         </div>
         <div class="integration-stat">
-          <span>Sent</span>
-          <strong>{{ status?.notification_counts.sent ?? 0 }}</strong>
+          <span>Status</span>
+          <strong>{{ config?.enabled ? 'On' : 'Paused' }}</strong>
         </div>
+        <button
+          class="ghost-btn"
+          type="button"
+          :disabled="saving"
+          @click="setMonitorEnabled(!config?.enabled)"
+        >
+          {{ config?.enabled ? 'Pause' : 'Enable' }}
+        </button>
         <button class="primary-btn" type="button" :disabled="polling" @click="pollNow">
           {{ polling ? 'Polling...' : 'Poll Gmail' }}
         </button>
@@ -214,6 +242,14 @@ onMounted(async () => {
               <p>Secrets are write-only. Leave a secret blank to keep the current value.</p>
             </div>
           </div>
+
+          <label class="integration-toggle">
+            <input v-model="form.enabled" type="checkbox" />
+            <span>
+              <strong>{{ form.enabled ? 'Monitor enabled' : 'Monitor paused' }}</strong>
+              <small>Systemd timers keep running, but backend skips Gmail work while paused.</small>
+            </span>
+          </label>
 
           <div class="integration-form">
             <label>

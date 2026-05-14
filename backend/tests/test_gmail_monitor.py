@@ -3,7 +3,7 @@ from datetime import date
 from sqlalchemy import select
 
 from app.gmail_monitor import parse_eml_bytes, poll_gmail_and_notify, run_gmail_daily_digest, save_and_enqueue_gmail_event
-from app.models import GmailMonitorEvent, NotificationEvent
+from app.models import GmailMonitorEvent, IntegrationConfig, NotificationEvent
 
 
 SALE_EML = b"""From: Etsy Transactions <transaction@etsy.com>
@@ -241,6 +241,26 @@ def test_poll_gmail_and_notify_reads_imap_app_password_messages(db_session, monk
     }
 
 
+def test_gmail_monitor_paused_skips_poll_and_digest(db_session, monkeypatch) -> None:
+    import app.gmail_monitor as gmail_monitor
+
+    db_session.add(IntegrationConfig(key='gmail_zalo_monitor', payload={'enabled': False}))
+    db_session.commit()
+    monkeypatch.setattr(
+        gmail_monitor,
+        '_fetch_imap_messages',
+        lambda config: (_ for _ in ()).throw(AssertionError('IMAP should not be called while paused')),
+    )
+
+    poll_result = poll_gmail_and_notify(db_session)
+    digest_result = run_gmail_daily_digest(db_session, target_date=date(2026, 5, 11))
+
+    assert poll_result['skipped'] is True
+    assert digest_result['skipped'] is True
+    assert poll_result['created'] == 0
+    assert digest_result['notification_event_id'] is None
+
+
 def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, monkeypatch) -> None:
     login = client.post('/auth/login', json={'username': 'trang', 'password': 'trang123'})
     token = login.json()['access_token']
@@ -259,6 +279,7 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
         json={
             'gmail_address': 'etsy@example.com',
             'gmail_app_password': 'app-password',
+            'enabled': False,
             'zalo_worker_url': 'http://worker.local',
             'zalo_worker_token': 'worker-token',
             'zalo_shared_secret': 'shared-secret',
@@ -267,6 +288,7 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
     )
     assert update.status_code == 200
     config = update.json()['config']
+    assert config['enabled'] is False
     assert config['gmail_address'] == 'etsy@example.com'
     assert config['gmail_app_password_configured'] is True
     assert 'app-password' not in str(config)

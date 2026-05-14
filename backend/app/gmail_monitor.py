@@ -35,6 +35,7 @@ def gmail_zalo_config(db: Session | None = None) -> dict[str, Any]:
         if stored and isinstance(stored.payload, dict):
             payload = stored.payload
     return {
+        'enabled': bool(payload.get('enabled', True)),
         'gmail_address': payload.get('gmail_address') or settings.gmail_address,
         'gmail_app_password': payload.get('gmail_app_password') or settings.gmail_app_password,
         'gmail_imap_host': payload.get('gmail_imap_host') or settings.gmail_imap_host,
@@ -610,6 +611,15 @@ def save_and_enqueue_gmail_event(
 
 def poll_gmail_and_notify(db: Session) -> dict[str, Any]:
     config = gmail_zalo_config(db)
+    if not config.get('enabled', True):
+        return {
+            'skipped': True,
+            'reason': 'Gmail/Zalo monitor is paused.',
+            'fetched': 0,
+            'created': 0,
+            'detected': {'sale': 0, 'message': 0},
+            'dispatch': {'processed': 0, 'sent': 0, 'pending': 0, 'failed': 0},
+        }
     messages_by_type = _fetch_imap_messages(config)
     seen: set[str] = set()
     created = 0
@@ -692,6 +702,17 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
 
 
 def run_gmail_daily_digest(db: Session, *, target_date: date | None = None) -> dict[str, Any]:
+    config = gmail_zalo_config(db)
+    if not config.get('enabled', True):
+        return {
+            'skipped': True,
+            'reason': 'Gmail/Zalo monitor is paused.',
+            'target_date': (target_date or datetime.now(ZoneInfo(settings.notify_timezone)).date()).isoformat(),
+            'event_count': 0,
+            'created': False,
+            'notification_event_id': None,
+            'dispatch': {'processed': 0, 'sent': 0, 'pending': 0, 'failed': 0},
+        }
     target_date = target_date or datetime.now(ZoneInfo(settings.notify_timezone)).date()
     start, end = _local_day_bounds(target_date)
     events = db.scalars(
@@ -707,7 +728,7 @@ def run_gmail_daily_digest(db: Session, *, target_date: date | None = None) -> d
             event_key=f'gmail:digest:{target_date.isoformat()}',
             event_type='gmail_daily_digest',
             channel=NotificationChannel.group,
-            target_id=settings.zalo_group_id,
+            target_id=str(config.get('zalo_group_id') or '') or None,
             payload={
                 'message': message,
                 'context': {

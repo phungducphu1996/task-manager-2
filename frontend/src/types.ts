@@ -181,6 +181,7 @@ export interface ReminderTickResult {
 }
 
 export interface GmailZaloConfig {
+  enabled: boolean
   gmail_address: string | null
   gmail_app_password_configured: boolean
   gmail_imap_host: string
@@ -240,6 +241,7 @@ export interface GmailZaloStatus {
 }
 
 export interface GmailZaloConfigPayload {
+  enabled?: boolean | null
   gmail_address?: string | null
   gmail_app_password?: string | null
   gmail_imap_host?: string | null
