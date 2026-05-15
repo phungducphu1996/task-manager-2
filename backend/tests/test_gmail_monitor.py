@@ -88,6 +88,36 @@ Ashlee </p>
 """
 
 
+SALE_WITH_THUMB_EML = b"""From: Etsy Transactions <transaction@etsy.com>
+To: lidude56169@gmail.com
+Subject: You made a sale on Etsy - Dispatch by May 21 - [US$130.13, Order #4054388316]
+Date: Sun, 10 May 2026 19:00:20 +0000
+Message-ID: <sale-thumb-message-id@example.test>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="etsy-boundary"
+
+--etsy-boundary
+Content-Type: text/plain; charset="utf-8"
+
+Shop:               Hazel Shop
+Buyer:              buyer123
+Transaction ID:     5072985898
+Item:               Personalized Jersey
+Quantity:           1
+Item price:         US$130.13
+Order Total:        US$130.13
+
+--etsy-boundary
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<img src="https://i.etsystatic.com/12345/r/il_570xN.1234567890_abcd.jpg" alt="Personalized Jersey" />
+</body></html>
+
+--etsy-boundary--
+"""
+
+
 def test_parse_etsy_sale_email_extracts_order_fields() -> None:
     parsed = parse_eml_bytes(SALE_EML)
 
@@ -105,6 +135,15 @@ def test_parse_etsy_sale_email_extracts_order_fields() -> None:
     assert parsed.items[0].quantity == 1
     assert parsed.items[0].details['Package'] == 'Single Jersey'
     assert parsed.items[0].details['Personalization'] == 'Waluigi - Name: Leo / Size L'
+
+
+def test_parse_etsy_sale_extracts_shop_and_thumbnail_from_html() -> None:
+    parsed = parse_eml_bytes(SALE_WITH_THUMB_EML)
+
+    assert parsed is not None
+    assert parsed.event_type == 'sale'
+    assert parsed.shop == 'Hazel Shop'
+    assert parsed.thumbnail_url == 'https://i.etsystatic.com/12345/r/il_570xN.1234567890_abcd.jpg'
 
 
 def test_parse_etsy_conversation_email_extracts_message_link() -> None:
@@ -151,6 +190,7 @@ def test_save_and_enqueue_gmail_event_dedupes_by_gmail_message_id(db_session) ->
     assert notification.event_type == 'gmail_sale_new'
     assert '[ETSY CÓ SALE MỚI]' in notification.payload['message']
     assert 'Đơn #4059129411' in notification.payload['message']
+    assert 'Shop: Ngoc Nguyen Ha' in notification.payload['message']
     assert 'Link:' not in notification.payload['message']
 
 
@@ -171,6 +211,8 @@ def test_gmail_daily_digest_summarizes_sales_and_messages(db_session) -> None:
     assert notification.event_type == 'gmail_daily_digest'
     assert '[ETSY TỔNG HỢP 11/05/2026]' in notification.payload['message']
     assert 'Sale mới: 1' in notification.payload['message']
+    assert 'Theo shop:' in notification.payload['message']
+    assert 'Ngoc Nguyen Ha: 1 sale' in notification.payload['message']
     assert 'US$39.40' in notification.payload['message']
 
 

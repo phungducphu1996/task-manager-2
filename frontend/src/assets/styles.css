@@ -1819,6 +1819,19 @@ textarea {
   align-items: center;
 }
 
+.event-main.has-thumb {
+  grid-template-columns: auto auto 1fr auto;
+}
+
+.event-thumb {
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.8);
+}
+
 .event-main strong {
   min-width: 0;
   overflow: hidden;

@@ -99,6 +99,7 @@ class ParsedGmailEvent:
     order_total_cents: int | None = None
     order_currency: str | None = None
     order_url: str | None = None
+    thumbnail_url: str | None = None
     dispatch_by: str | None = None
     shop: str | None = None
     buyer_username: str | None = None
@@ -154,6 +155,28 @@ def _message_text(message: Message) -> str:
         if content:
             parts.append(str(content))
     return _clean_text('\n\n'.join(parts))
+
+
+def _message_html(message: Message) -> str:
+    parts: list[str] = []
+    if message.is_multipart():
+        for part in message.walk():
+            if part.get_content_type() != 'text/html':
+                continue
+            try:
+                content = part.get_content()
+            except LookupError:
+                content = part.get_payload(decode=True).decode('utf-8', errors='replace')
+            if content:
+                parts.append(str(content))
+    elif message.get_content_type() == 'text/html':
+        try:
+            content = message.get_content()
+        except LookupError:
+            content = message.get_payload(decode=True).decode('utf-8', errors='replace')
+        if content:
+            parts.append(str(content))
+    return '\n\n'.join(parts)
 
 
 def _parse_date_header(value: str | None, fallback: datetime | None = None) -> datetime | None:
@@ -270,6 +293,23 @@ def _message_snippet(text: str) -> str | None:
     return ' / '.join(lines)[:500] if lines else None
 
 
+def _extract_thumbnail_url(html: str) -> str | None:
+    if not html:
+        return None
+    candidates = re.findall(r'<img\b[^>]*?\bsrc=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    for raw_url in candidates:
+        url = unescape(raw_url).strip()
+        normalized = url.casefold()
+        if not normalized.startswith(('http://', 'https://')):
+            continue
+        if 'etsy' not in normalized and 'etsystatic' not in normalized:
+            continue
+        if any(token in normalized for token in ['pixel', 'tracking', 'spacer', 'logo', 'avatar']):
+            continue
+        return url
+    return None
+
+
 def _classify_email(subject: str, sender: str | None, text: str) -> str | None:
     normalized_subject = subject.casefold()
     normalized_sender = (sender or '').casefold()
@@ -312,6 +352,7 @@ def parse_email_message(
     sender = _clean_text(str(message.get('From') or '')) or None
     recipient = _clean_text(str(message.get('To') or '')) or None
     text = _message_text(message)
+    html = _message_html(message)
     event_type = _classify_email(subject, sender, text)
     if event_type is None:
         return None
@@ -340,6 +381,7 @@ def parse_email_message(
         parsed.order_currency = currency
         parsed.dispatch_by = dispatch_by
         parsed.order_url = _first_match(r'(https?://(?:www\.)?etsy\.com/your/orders/[0-9]+)', text)
+        parsed.thumbnail_url = _extract_thumbnail_url(html)
         parsed.shop = _line_field('Shop', text)
         parsed.buyer_username = _line_field('Buyer', text)
         parsed.buyer_name = _first_match(r"<span class='name'>(.*?)</span>", text, re.DOTALL)
@@ -375,6 +417,7 @@ def parse_email_message(
         'message_note': parsed.message_note,
         'dispatch_by': parsed.dispatch_by,
         'shop': parsed.shop,
+        'thumbnail_url': parsed.thumbnail_url,
         'buyer_email': parsed.buyer_email,
     }
     return parsed
@@ -710,6 +753,8 @@ def _format_realtime_message(parsed: ParsedGmailEvent) -> str:
             lines.append(f'Đơn #{parsed.order_id}')
         if parsed.order_total:
             lines.append(f'Tổng: {parsed.order_total}')
+        if parsed.shop:
+            lines.append(f'Shop: {parsed.shop}')
         buyer = parsed.buyer_name or parsed.buyer_username
         if buyer:
             lines.append(f'Khách: {buyer}')
@@ -752,6 +797,8 @@ def _payload_for(parsed: ParsedGmailEvent, *, message: str) -> dict[str, Any]:
             'received_at': parsed.received_at.isoformat() if parsed.received_at else None,
             'order_id': parsed.order_id,
             'order_total': parsed.order_total,
+            'shop': parsed.shop,
+            'thumbnail_url': parsed.thumbnail_url,
             'buyer_username': parsed.buyer_username,
             'buyer_name': parsed.buyer_name,
             'order_url': parsed.order_url,
@@ -894,10 +941,18 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
     sales = [event for event in events if event.event_type == 'sale']
     messages = [event for event in events if event.event_type == 'message']
     total_by_currency: dict[str | None, int] = {}
+    shop_summary: dict[str, dict[str, Any]] = {}
     for event in sales:
+        shop = 'Không rõ shop'
+        if isinstance(event.payload, dict):
+            shop = str(event.payload.get('shop') or '').strip() or shop
+        summary = shop_summary.setdefault(shop, {'count': 0, 'totals': {}})
+        summary['count'] += 1
         if event.sale_total_cents is None:
             continue
         total_by_currency[event.sale_currency] = total_by_currency.get(event.sale_currency, 0) + event.sale_total_cents
+        totals = summary['totals']
+        totals[event.sale_currency] = totals.get(event.sale_currency, 0) + event.sale_total_cents
 
     lines = [
         f'[ETSY TỔNG HỢP {target_date:%d/%m/%Y}]',
@@ -908,13 +963,27 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
         totals = ', '.join(_format_money(cents, currency) for currency, cents in sorted(total_by_currency.items(), key=lambda item: item[0] or ''))
         lines.append(f'Tổng sale: {totals}')
 
+    if shop_summary:
+        lines.extend(['', 'Theo shop:'])
+        for shop, summary in sorted(shop_summary.items(), key=lambda item: item[0].casefold()):
+            totals = summary['totals']
+            total_label = ''
+            if totals:
+                total_label = ' | ' + ', '.join(
+                    _format_money(cents, currency) for currency, cents in sorted(totals.items(), key=lambda item: item[0] or '')
+                )
+            lines.append(f'- {shop}: {summary["count"]} sale{total_label}')
+
     if sales:
         lines.extend(['', 'Top sale:'])
         for index, event in enumerate(sales[:8], start=1):
             total = _format_money(event.sale_total_cents, event.sale_currency) if event.sale_total_cents is not None else 'không rõ tổng'
             buyer = event.buyer_username or event.buyer_name or 'không rõ khách'
             order = f'#{event.sale_order_id}' if event.sale_order_id else event.subject
-            lines.append(f'{index}. {order} | {total} | {buyer}')
+            shop = ''
+            if isinstance(event.payload, dict) and event.payload.get('shop'):
+                shop = f' | {event.payload["shop"]}'
+            lines.append(f'{index}. {order} | {total} | {buyer}{shop}')
 
     if messages:
         lines.extend(['', 'Tin nhắn mới:'])

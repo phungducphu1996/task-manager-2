@@ -218,6 +218,16 @@ function messageSender(event: GmailZaloEvent): string {
   return typeof sender === 'string' && sender ? sender : event.sender || 'Etsy buyer'
 }
 
+function eventShop(event: GmailZaloEvent): string {
+  const shop = event.payload.shop
+  return typeof shop === 'string' && shop ? shop : ''
+}
+
+function eventThumbnail(event: GmailZaloEvent): string {
+  const thumbnail = event.payload.thumbnail_url
+  return typeof thumbnail === 'string' && thumbnail ? thumbnail : ''
+}
+
 async function goBack() {
   await router.push('/manage')
 }
@@ -412,14 +422,21 @@ onMounted(async () => {
 
           <div class="integration-events">
             <article v-for="event in recentEvents" :key="event.id" class="integration-event">
-              <div class="event-main">
+              <div class="event-main" :class="{ 'has-thumb': eventThumbnail(event) }">
+                <img
+                  v-if="eventThumbnail(event)"
+                  class="event-thumb"
+                  :src="eventThumbnail(event)"
+                  alt=""
+                  loading="lazy"
+                />
                 <span class="event-type" :class="`event-${event.event_type}`">{{ event.event_type }}</span>
                 <strong>{{ event.sale_order_id ? `Order #${event.sale_order_id}` : event.subject }}</strong>
                 <small>{{ event.received_at_label || 'No received time' }}</small>
               </div>
               <p>
                 <template v-if="event.event_type === 'sale'">
-                  {{ money(event) }} · {{ event.buyer_username || event.buyer_name || 'Unknown buyer' }}
+                  {{ money(event) }} · {{ eventShop(event) || 'Unknown shop' }} · {{ event.buyer_username || event.buyer_name || 'Unknown buyer' }}
                 </template>
                 <template v-else>
                   {{ messageSender(event) }}
