@@ -687,50 +687,54 @@ def _event_key(event_type: str, gmail_message_id: str) -> str:
     return f'gmail:{event_type}:{token}'
 
 
-def _format_item_line(item: ParsedGmailItem) -> str:
+def _truncate_line(value: str | None, limit: int = 420) -> str:
+    cleaned = _clean_text(value)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)].rstrip() + '...'
+
+
+def _format_item_line(item: ParsedGmailItem, index: int) -> str:
     quantity = item.quantity if item.quantity is not None else 1
     suffix = f' - {item.item_price}' if item.item_price else ''
     details = ', '.join(f'{key}: {value}' for key, value in item.details.items())
     if details:
         suffix = f'{suffix} ({details})'
-    return f'- {quantity}x {item.title}{suffix}'
+    return f'{index}. {quantity}x {_truncate_line(item.title, 140)}{suffix}'
 
 
 def _format_realtime_message(parsed: ParsedGmailEvent) -> str:
     if parsed.event_type == 'sale':
-        lines = ['Etsy co sale moi']
+        lines = ['[ETSY SALE MOI]']
         if parsed.order_id:
-            lines.append(f'Don: #{parsed.order_id}')
+            lines.append(f'Don #{parsed.order_id}')
         if parsed.order_total:
             lines.append(f'Tong: {parsed.order_total}')
-        if parsed.buyer_username:
-            lines.append(f'Buyer: {parsed.buyer_username}')
-        if parsed.buyer_name:
-            lines.append(f'Khach: {parsed.buyer_name}')
+        buyer = parsed.buyer_name or parsed.buyer_username
+        if buyer:
+            lines.append(f'Khach: {buyer}')
+        if parsed.buyer_username and parsed.buyer_username != buyer:
+            lines.append(f'Username: {parsed.buyer_username}')
         if parsed.dispatch_by:
-            lines.append(f'Dispatch by: {parsed.dispatch_by}')
+            lines.append(f'Can ship: {parsed.dispatch_by}')
         if parsed.items:
-            lines.append('San pham:')
-            lines.extend(_format_item_line(item) for item in parsed.items[:5])
+            lines.extend(['', 'San pham:'])
+            lines.extend(_format_item_line(item, index) for index, item in enumerate(parsed.items[:5], start=1))
             if len(parsed.items) > 5:
-                lines.append(f'- ... con {len(parsed.items) - 5} san pham')
-        if parsed.order_url:
-            lines.append(f'Link: {parsed.order_url}')
+                lines.append(f'... con {len(parsed.items) - 5} san pham nua')
         return '\n'.join(lines)
 
     sender = parsed.message_sender_name or parsed.sender or 'Etsy buyer'
-    lines = [f'Etsy co tin nhan moi tu {sender}']
+    lines = ['[ETSY TIN NHAN MOI]', f'Tu: {sender}']
     if parsed.message_issue:
         lines.append(f'Van de: {parsed.message_issue}')
     if parsed.message_resolution:
         lines.append(f'Mong muon: {parsed.message_resolution}')
     if parsed.message_note:
-        lines.append(f'Noi dung: {parsed.message_note}')
+        lines.extend(['', 'Noi dung:', _truncate_line(parsed.message_note, 700)])
     if parsed.snippet:
         if parsed.snippet != parsed.message_note:
-            lines.append(f'Tom tat: {parsed.snippet}')
-    if parsed.message_url:
-        lines.append(f'Link: {parsed.message_url}')
+            lines.extend(['', 'Tom tat:', _truncate_line(parsed.snippet, 500)])
     return '\n'.join(lines)
 
 
@@ -895,25 +899,25 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
             continue
         total_by_currency[event.sale_currency] = total_by_currency.get(event.sale_currency, 0) + event.sale_total_cents
 
-    lines = [f'Tong hop Gmail ngay {target_date:%d/%m/%Y}', '', f'Sale moi: {len(sales)}', f'Tin nhan moi: {len(messages)}']
+    lines = [f'[ETSY TONG HOP {target_date:%d/%m/%Y}]', f'Sale moi: {len(sales)}', f'Tin nhan moi: {len(messages)}']
     if total_by_currency:
         totals = ', '.join(_format_money(cents, currency) for currency, cents in sorted(total_by_currency.items(), key=lambda item: item[0] or ''))
-        lines.append(f'Tong tien sale: {totals}')
+        lines.append(f'Tong sale: {totals}')
 
     if sales:
         lines.extend(['', 'Top sale:'])
-        for event in sales[:8]:
+        for index, event in enumerate(sales[:8], start=1):
             total = _format_money(event.sale_total_cents, event.sale_currency) if event.sale_total_cents is not None else 'khong ro tong'
             buyer = event.buyer_username or event.buyer_name or 'khong ro buyer'
             order = f'#{event.sale_order_id}' if event.sale_order_id else event.subject
-            lines.append(f'- {order} - {total} - {buyer}')
+            lines.append(f'{index}. {order} | {total} | {buyer}')
 
     if messages:
-        lines.extend(['', 'Tin nhan can xem:'])
-        for event in messages[:8]:
+        lines.extend(['', 'Tin nhan moi:'])
+        for index, event in enumerate(messages[:8], start=1):
             sender = event.payload.get('message_sender_name') if isinstance(event.payload, dict) else None
             sender = sender or event.sender or 'Etsy buyer'
-            lines.append(f'- {sender}: {(event.snippet or event.subject)[:160]}')
+            lines.append(f'{index}. {sender}: {_truncate_line(event.snippet or event.subject, 160)}')
 
     return '\n'.join(lines)
 

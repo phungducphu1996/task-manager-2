@@ -149,7 +149,9 @@ def test_save_and_enqueue_gmail_event_dedupes_by_gmail_message_id(db_session) ->
     notification = db_session.get(NotificationEvent, stored.notification_event_id)
     assert notification is not None
     assert notification.event_type == 'gmail_sale_new'
-    assert 'Don: #4059129411' in notification.payload['message']
+    assert '[ETSY SALE MOI]' in notification.payload['message']
+    assert 'Don #4059129411' in notification.payload['message']
+    assert 'Link:' not in notification.payload['message']
 
 
 def test_gmail_daily_digest_summarizes_sales_and_messages(db_session) -> None:
@@ -167,6 +169,7 @@ def test_gmail_daily_digest_summarizes_sales_and_messages(db_session) -> None:
     notification = db_session.get(NotificationEvent, result['notification_event_id'])
     assert notification is not None
     assert notification.event_type == 'gmail_daily_digest'
+    assert '[ETSY TONG HOP 11/05/2026]' in notification.payload['message']
     assert 'Sale moi: 1' in notification.payload['message']
     assert 'US$39.40' in notification.payload['message']
 
