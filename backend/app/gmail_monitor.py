@@ -705,36 +705,36 @@ def _format_item_line(item: ParsedGmailItem, index: int) -> str:
 
 def _format_realtime_message(parsed: ParsedGmailEvent) -> str:
     if parsed.event_type == 'sale':
-        lines = ['[ETSY SALE MOI]']
+        lines = ['[ETSY CÓ SALE MỚI]']
         if parsed.order_id:
-            lines.append(f'Don #{parsed.order_id}')
+            lines.append(f'Đơn #{parsed.order_id}')
         if parsed.order_total:
-            lines.append(f'Tong: {parsed.order_total}')
+            lines.append(f'Tổng: {parsed.order_total}')
         buyer = parsed.buyer_name or parsed.buyer_username
         if buyer:
-            lines.append(f'Khach: {buyer}')
+            lines.append(f'Khách: {buyer}')
         if parsed.buyer_username and parsed.buyer_username != buyer:
             lines.append(f'Username: {parsed.buyer_username}')
         if parsed.dispatch_by:
-            lines.append(f'Can ship: {parsed.dispatch_by}')
+            lines.append(f'Cần ship: {parsed.dispatch_by}')
         if parsed.items:
-            lines.extend(['', 'San pham:'])
+            lines.extend(['', 'Sản phẩm:'])
             lines.extend(_format_item_line(item, index) for index, item in enumerate(parsed.items[:5], start=1))
             if len(parsed.items) > 5:
-                lines.append(f'... con {len(parsed.items) - 5} san pham nua')
+                lines.append(f'... còn {len(parsed.items) - 5} sản phẩm nữa')
         return '\n'.join(lines)
 
     sender = parsed.message_sender_name or parsed.sender or 'Etsy buyer'
-    lines = ['[ETSY TIN NHAN MOI]', f'Tu: {sender}']
+    lines = ['[ETSY CÓ TIN NHẮN MỚI]', f'Từ: {sender}']
     if parsed.message_issue:
-        lines.append(f'Van de: {parsed.message_issue}')
+        lines.append(f'Vấn đề: {parsed.message_issue}')
     if parsed.message_resolution:
-        lines.append(f'Mong muon: {parsed.message_resolution}')
+        lines.append(f'Mong muốn: {parsed.message_resolution}')
     if parsed.message_note:
-        lines.extend(['', 'Noi dung:', _truncate_line(parsed.message_note, 700)])
+        lines.extend(['', 'Nội dung:', _truncate_line(parsed.message_note, 700)])
     if parsed.snippet:
         if parsed.snippet != parsed.message_note:
-            lines.extend(['', 'Tom tat:', _truncate_line(parsed.snippet, 500)])
+            lines.extend(['', 'Tóm tắt:', _truncate_line(parsed.snippet, 500)])
     return '\n'.join(lines)
 
 
@@ -899,21 +899,25 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
             continue
         total_by_currency[event.sale_currency] = total_by_currency.get(event.sale_currency, 0) + event.sale_total_cents
 
-    lines = [f'[ETSY TONG HOP {target_date:%d/%m/%Y}]', f'Sale moi: {len(sales)}', f'Tin nhan moi: {len(messages)}']
+    lines = [
+        f'[ETSY TỔNG HỢP {target_date:%d/%m/%Y}]',
+        f'Sale mới: {len(sales)}',
+        f'Tin nhắn mới: {len(messages)}',
+    ]
     if total_by_currency:
         totals = ', '.join(_format_money(cents, currency) for currency, cents in sorted(total_by_currency.items(), key=lambda item: item[0] or ''))
-        lines.append(f'Tong sale: {totals}')
+        lines.append(f'Tổng sale: {totals}')
 
     if sales:
         lines.extend(['', 'Top sale:'])
         for index, event in enumerate(sales[:8], start=1):
-            total = _format_money(event.sale_total_cents, event.sale_currency) if event.sale_total_cents is not None else 'khong ro tong'
-            buyer = event.buyer_username or event.buyer_name or 'khong ro buyer'
+            total = _format_money(event.sale_total_cents, event.sale_currency) if event.sale_total_cents is not None else 'không rõ tổng'
+            buyer = event.buyer_username or event.buyer_name or 'không rõ khách'
             order = f'#{event.sale_order_id}' if event.sale_order_id else event.subject
             lines.append(f'{index}. {order} | {total} | {buyer}')
 
     if messages:
-        lines.extend(['', 'Tin nhan moi:'])
+        lines.extend(['', 'Tin nhắn mới:'])
         for index, event in enumerate(messages[:8], start=1):
             sender = event.payload.get('message_sender_name') if isinstance(event.payload, dict) else None
             sender = sender or event.sender or 'Etsy buyer'
