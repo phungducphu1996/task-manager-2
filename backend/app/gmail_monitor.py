@@ -20,7 +20,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import GmailMonitorEvent, IntegrationConfig, NotificationChannel
+from .models import GmailMonitorEvent, IntegrationConfig, NotificationChannel, NotificationEvent
 from .notifications import NotificationSpec, dispatch_due_notification_events, enqueue_notification_event
 
 settings = get_settings()
@@ -29,6 +29,7 @@ GMAIL_OAUTH_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
 GMAIL_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 GMAIL_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 GMAIL_API_URL = 'https://gmail.googleapis.com/gmail/v1'
+DEFAULT_GMAIL_DAILY_DIGEST_TIME = '07:00'
 
 
 def _string_list(value: str | None) -> list[str]:
@@ -43,6 +44,10 @@ def gmail_zalo_config(db: Session | None = None) -> dict[str, Any]:
             payload = stored.payload
     return {
         'enabled': bool(payload.get('enabled', True)),
+        'notify_sale_realtime': bool(payload.get('notify_sale_realtime', True)),
+        'notify_message_realtime': bool(payload.get('notify_message_realtime', False)),
+        'daily_digest_enabled': bool(payload.get('daily_digest_enabled', True)),
+        'daily_digest_time': payload.get('daily_digest_time') or DEFAULT_GMAIL_DAILY_DIGEST_TIME,
         'gmail_address': payload.get('gmail_address') or settings.gmail_address,
         'gmail_app_password': payload.get('gmail_app_password') or settings.gmail_app_password,
         'gmail_oauth_client_id': payload.get('gmail_oauth_client_id') or settings.gmail_oauth_client_id,
@@ -810,6 +815,14 @@ def _payload_for(parsed: ParsedGmailEvent, *, message: str) -> dict[str, Any]:
     }
 
 
+def _realtime_enabled(config: dict[str, Any], event_type: str) -> bool:
+    if event_type == 'sale':
+        return bool(config.get('notify_sale_realtime', True))
+    if event_type == 'message':
+        return bool(config.get('notify_message_realtime', False))
+    return True
+
+
 def save_and_enqueue_gmail_event(
     db: Session,
     parsed: ParsedGmailEvent,
@@ -822,18 +835,20 @@ def save_and_enqueue_gmail_event(
     if existing:
         return existing, False
 
-    message = _format_realtime_message(parsed)
     config = config or gmail_zalo_config(db)
-    notification_event, _ = enqueue_notification_event(
-        db,
-        NotificationSpec(
-            event_key=_event_key(parsed.event_type, parsed.gmail_message_id),
-            event_type=f'gmail_{parsed.event_type}_new',
-            channel=NotificationChannel.group,
-            target_id=str(config.get('zalo_group_id') or '') or None,
-            payload=_payload_for(parsed, message=message),
-        ),
-    )
+    notification_event = None
+    if _realtime_enabled(config, parsed.event_type):
+        message = _format_realtime_message(parsed)
+        notification_event, _ = enqueue_notification_event(
+            db,
+            NotificationSpec(
+                event_key=_event_key(parsed.event_type, parsed.gmail_message_id),
+                event_type=f'gmail_{parsed.event_type}_new',
+                channel=NotificationChannel.group,
+                target_id=str(config.get('zalo_group_id') or '') or None,
+                payload=_payload_for(parsed, message=message),
+            ),
+        )
     event = GmailMonitorEvent(
         gmail_message_id=parsed.gmail_message_id,
         gmail_thread_id=parsed.gmail_thread_id,
@@ -851,7 +866,7 @@ def save_and_enqueue_gmail_event(
         buyer_name=parsed.buyer_name,
         buyer_username=parsed.buyer_username,
         order_url=parsed.order_url,
-        notification_event_id=notification_event.id,
+        notification_event_id=notification_event.id if notification_event else None,
         payload=parsed.raw_payload,
     )
     db.add(event)
@@ -995,19 +1010,45 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
     return '\n'.join(lines)
 
 
+def _parse_digest_time(value: Any) -> time:
+    raw = str(value or DEFAULT_GMAIL_DAILY_DIGEST_TIME).strip()
+    match = re.fullmatch(r'([01]?\d|2[0-3]):([0-5]\d)', raw)
+    if not match:
+        return time(7, 0)
+    return time(int(match.group(1)), int(match.group(2)))
+
+
+def _digest_skip_result(reason: str, *, target_date: date, event_count: int = 0) -> dict[str, Any]:
+    return {
+        'skipped': True,
+        'reason': reason,
+        'target_date': target_date.isoformat(),
+        'event_count': event_count,
+        'created': False,
+        'notification_event_id': None,
+        'dispatch': {'processed': 0, 'sent': 0, 'pending': 0, 'failed': 0},
+    }
+
+
 def run_gmail_daily_digest(db: Session, *, target_date: date | None = None) -> dict[str, Any]:
     config = gmail_zalo_config(db)
+    now = datetime.now(ZoneInfo(settings.notify_timezone))
+    is_manual_target = target_date is not None
+    target_date = target_date or now.date()
     if not config.get('enabled', True):
-        return {
-            'skipped': True,
-            'reason': 'Gmail/Zalo monitor is paused.',
-            'target_date': (target_date or datetime.now(ZoneInfo(settings.notify_timezone)).date()).isoformat(),
-            'event_count': 0,
-            'created': False,
-            'notification_event_id': None,
-            'dispatch': {'processed': 0, 'sent': 0, 'pending': 0, 'failed': 0},
-        }
-    target_date = target_date or datetime.now(ZoneInfo(settings.notify_timezone)).date()
+        return _digest_skip_result('Gmail/Zalo monitor is paused.', target_date=target_date)
+    if not config.get('daily_digest_enabled', True):
+        return _digest_skip_result('Gmail daily digest is disabled.', target_date=target_date)
+    if not is_manual_target:
+        scheduled_time = _parse_digest_time(config.get('daily_digest_time'))
+        scheduled_at = datetime.combine(target_date, scheduled_time, tzinfo=now.tzinfo)
+        if now < scheduled_at:
+            return _digest_skip_result(f'Gmail daily digest is scheduled for {scheduled_time:%H:%M}.', target_date=target_date)
+        existing_digest = db.scalar(
+            select(NotificationEvent).where(NotificationEvent.event_key == f'gmail:digest:{target_date.isoformat()}')
+        )
+        if existing_digest:
+            return _digest_skip_result('Gmail daily digest already sent for this date.', target_date=target_date)
     start, end = _local_day_bounds(target_date)
     events = db.scalars(
         select(GmailMonitorEvent)

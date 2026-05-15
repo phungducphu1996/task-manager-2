@@ -277,7 +277,7 @@ def test_poll_gmail_and_notify_reads_imap_app_password_messages(db_session, monk
     assert result['fetched'] == 3
     assert result['created'] == 3
     assert result['detected'] == {'sale': 1, 'message': 2}
-    assert result['dispatch']['sent'] == 3
+    assert result['dispatch']['sent'] == 1
     stored_events = db_session.scalars(select(GmailMonitorEvent).order_by(GmailMonitorEvent.gmail_message_id)).all()
     assert len(stored_events) == 3
     assert {event.gmail_message_id for event in stored_events} == {
@@ -285,6 +285,7 @@ def test_poll_gmail_and_notify_reads_imap_app_password_messages(db_session, monk
         'imap:INBOX:8',
         'imap:INBOX:9',
     }
+    assert sum(1 for event in stored_events if event.notification_event_id is not None) == 1
 
 
 def test_poll_gmail_and_notify_reads_gmail_api_oauth_messages(db_session, monkeypatch) -> None:
@@ -411,6 +412,10 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
             'gmail_oauth_client_secret': 'oauth-client-secret',
             'gmail_oauth_redirect_uri': 'https://hazeleo.com/task-api/admin/integrations/gmail-zalo/oauth/callback',
             'enabled': False,
+            'notify_sale_realtime': True,
+            'notify_message_realtime': False,
+            'daily_digest_enabled': True,
+            'daily_digest_time': '07:00',
             'zalo_worker_url': 'http://worker.local',
             'zalo_worker_token': 'worker-token',
             'zalo_shared_secret': 'shared-secret',
@@ -420,6 +425,10 @@ def test_admin_gmail_zalo_config_ui_masks_secrets_and_tests_delivery(client, mon
     assert update.status_code == 200
     config = update.json()['config']
     assert config['enabled'] is False
+    assert config['notify_sale_realtime'] is True
+    assert config['notify_message_realtime'] is False
+    assert config['daily_digest_enabled'] is True
+    assert config['daily_digest_time'] == '07:00'
     assert config['gmail_address'] == 'etsy@example.com'
     assert config['gmail_app_password_configured'] is True
     assert config['gmail_oauth_client_id'] == 'oauth-client-id'

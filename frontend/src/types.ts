@@ -182,6 +182,10 @@ export interface ReminderTickResult {
 
 export interface GmailZaloConfig {
   enabled: boolean
+  notify_sale_realtime: boolean
+  notify_message_realtime: boolean
+  daily_digest_enabled: boolean
+  daily_digest_time: string
   gmail_address: string | null
   gmail_app_password_configured: boolean
   gmail_oauth_client_id: string | null
@@ -249,6 +253,10 @@ export interface GmailZaloStatus {
 
 export interface GmailZaloConfigPayload {
   enabled?: boolean | null
+  notify_sale_realtime?: boolean | null
+  notify_message_realtime?: boolean | null
+  daily_digest_enabled?: boolean | null
+  daily_digest_time?: string | null
   gmail_address?: string | null
   gmail_app_password?: string | null
   gmail_oauth_client_id?: string | null

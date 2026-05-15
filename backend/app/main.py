@@ -156,6 +156,10 @@ class AdminNotificationPromptUpdate(BaseModel):
 
 class AdminGmailZaloConfigUpdate(BaseModel):
     enabled: bool | None = None
+    notify_sale_realtime: bool | None = None
+    notify_message_realtime: bool | None = None
+    daily_digest_enabled: bool | None = None
+    daily_digest_time: str | None = Field(default=None, max_length=5)
     gmail_address: str | None = Field(default=None, max_length=255)
     gmail_app_password: str | None = Field(default=None, max_length=255)
     gmail_oauth_client_id: str | None = Field(default=None, max_length=255)
@@ -1641,6 +1645,10 @@ def _admin_gmail_zalo_config_payload(db: Session) -> dict[str, Any]:
     payload = stored.payload if stored and isinstance(stored.payload, dict) else {}
     return {
         'enabled': bool(config.get('enabled', True)),
+        'notify_sale_realtime': bool(config.get('notify_sale_realtime', True)),
+        'notify_message_realtime': bool(config.get('notify_message_realtime', False)),
+        'daily_digest_enabled': bool(config.get('daily_digest_enabled', True)),
+        'daily_digest_time': config.get('daily_digest_time'),
         'gmail_address': config.get('gmail_address'),
         'gmail_app_password_configured': bool(config.get('gmail_app_password')),
         'gmail_oauth_client_id': config.get('gmail_oauth_client_id'),

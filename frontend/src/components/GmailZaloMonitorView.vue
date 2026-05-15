@@ -19,6 +19,10 @@ const status = ref<GmailZaloStatus | null>(null)
 
 const form = ref({
   enabled: true,
+  notify_sale_realtime: true,
+  notify_message_realtime: false,
+  daily_digest_enabled: true,
+  daily_digest_time: '07:00',
   gmail_address: '',
   gmail_app_password: '',
   gmail_oauth_client_id: '',
@@ -51,6 +55,10 @@ function applyConfig(next: GmailZaloStatus) {
   form.value = {
     ...form.value,
     enabled: cfg.enabled,
+    notify_sale_realtime: cfg.notify_sale_realtime,
+    notify_message_realtime: cfg.notify_message_realtime,
+    daily_digest_enabled: cfg.daily_digest_enabled,
+    daily_digest_time: cfg.daily_digest_time || '07:00',
     gmail_address: cfg.gmail_address ?? '',
     gmail_app_password: '',
     gmail_oauth_client_id: cfg.gmail_oauth_client_id ?? '',
@@ -75,6 +83,10 @@ function applyConfig(next: GmailZaloStatus) {
 function buildConfigPayload(): GmailZaloConfigPayload {
   const payload: GmailZaloConfigPayload = {
     enabled: form.value.enabled,
+    notify_sale_realtime: form.value.notify_sale_realtime,
+    notify_message_realtime: form.value.notify_message_realtime,
+    daily_digest_enabled: form.value.daily_digest_enabled,
+    daily_digest_time: form.value.daily_digest_time || '07:00',
     gmail_address: form.value.gmail_address,
     gmail_oauth_client_id: form.value.gmail_oauth_client_id,
     gmail_oauth_redirect_uri: form.value.gmail_oauth_redirect_uri || recommendedRedirectUri.value,
@@ -315,6 +327,34 @@ onMounted(async () => {
               <small>Systemd timers keep running, but backend skips Gmail work while paused.</small>
             </span>
           </label>
+
+          <div class="integration-switch-grid">
+            <label class="integration-toggle">
+              <input v-model="form.notify_sale_realtime" type="checkbox" />
+              <span>
+                <strong>Báo sale mới ngay</strong>
+                <small>Sale Etsy mới sẽ gửi thẳng về Zalo group.</small>
+              </span>
+            </label>
+            <label class="integration-toggle">
+              <input v-model="form.notify_message_realtime" type="checkbox" />
+              <span>
+                <strong>Báo tin nhắn ngay</strong>
+                <small>Tạm thời nên tắt để tin nhắn chỉ nằm trong tổng hợp ngày.</small>
+              </span>
+            </label>
+            <label class="integration-toggle">
+              <input v-model="form.daily_digest_enabled" type="checkbox" />
+              <span>
+                <strong>Tổng hợp hằng ngày</strong>
+                <small>Gửi sale và tin nhắn trong ngày theo giờ bên dưới.</small>
+              </span>
+            </label>
+            <label>
+              Giờ tổng hợp
+              <input v-model="form.daily_digest_time" type="time" />
+            </label>
+          </div>
 
           <div class="integration-form">
             <label>

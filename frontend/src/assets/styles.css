@@ -1793,6 +1793,21 @@ textarea {
   color: var(--muted);
 }
 
+.integration-switch-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.integration-switch-grid > label:not(.integration-toggle) {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
 .integration-events {
   display: grid;
   gap: 10px;

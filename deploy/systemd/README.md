@@ -18,7 +18,7 @@ bash deploy/systemd/install-gmail-timers.sh
 
 This installs:
 - `taskmanager-gmail-poll.timer`: calls `/internal/gmail/poll` every 2 minutes.
-- `taskmanager-gmail-digest.timer`: calls `/internal/gmail/digest` daily at 18:00.
+- `taskmanager-gmail-digest.timer`: checks `/internal/gmail/digest` every 5 minutes; the backend sends once daily at the time configured in the Gmail/Zalo UI.
 
 ## Verify Reminder
 
