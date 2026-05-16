@@ -760,40 +760,50 @@ def _truncate_line(value: str | None, limit: int = 420) -> str:
     return cleaned[: max(0, limit - 3)].rstrip() + '...'
 
 
-def _format_item_line(item: ParsedGmailItem, index: int) -> str:
+def _format_item_lines(item: ParsedGmailItem, index: int) -> list[str]:
     quantity = item.quantity if item.quantity is not None else 1
-    suffix = f' - {item.item_price}' if item.item_price else ''
-    details = ', '.join(f'{key}: {value}' for key, value in item.details.items())
-    if details:
-        suffix = f'{suffix} ({details})'
-    return f'{index}. {quantity}x {_truncate_line(item.title, 140)}{suffix}'
+    price = f' - {item.item_price}' if item.item_price else ''
+    lines = [f'{index}. {quantity}x {_truncate_line(item.title, 120)}{price}']
+    if item.details:
+        detail_text = ', '.join(f'{key}: {value}' for key, value in item.details.items())
+        lines.append(f'   {_truncate_line(detail_text, 160)}')
+    return lines
+
+
+def _money_map_label(totals: dict[str | None, int]) -> str:
+    if not totals:
+        return 'chưa rõ tổng'
+    return ', '.join(
+        _format_money(cents, currency) for currency, cents in sorted(totals.items(), key=lambda item: item[0] or '')
+    )
 
 
 def _format_realtime_message(parsed: ParsedGmailEvent) -> str:
     if parsed.event_type == 'sale':
-        lines = ['[ETSY CÓ SALE MỚI]']
+        lines = ['ETSY - CÓ SALE MỚI', '--------------------']
         if parsed.order_id:
-            lines.append(f'Đơn #{parsed.order_id}')
-        if parsed.order_total:
-            lines.append(f'Tổng: {parsed.order_total}')
+            lines.append(f'Đơn: #{parsed.order_id}')
         if parsed.shop:
             lines.append(f'Shop: {parsed.shop}')
+        if parsed.order_total:
+            lines.append(f'Tổng: {parsed.order_total}')
         buyer = parsed.buyer_name or parsed.buyer_username
         if buyer:
             lines.append(f'Khách: {buyer}')
         if parsed.buyer_username and parsed.buyer_username != buyer:
             lines.append(f'Username: {parsed.buyer_username}')
         if parsed.dispatch_by:
-            lines.append(f'Cần ship: {parsed.dispatch_by}')
+            lines.append(f'Ship trước: {parsed.dispatch_by}')
         if parsed.items:
-            lines.extend(['', 'Sản phẩm:'])
-            lines.extend(_format_item_line(item, index) for index, item in enumerate(parsed.items[:5], start=1))
+            lines.extend(['', 'SẢN PHẨM'])
+            for index, item in enumerate(parsed.items[:5], start=1):
+                lines.extend(_format_item_lines(item, index))
             if len(parsed.items) > 5:
                 lines.append(f'... còn {len(parsed.items) - 5} sản phẩm nữa')
         return '\n'.join(lines)
 
     sender = parsed.message_sender_name or parsed.sender or 'Etsy buyer'
-    lines = ['[ETSY CÓ TIN NHẮN MỚI]', f'Từ: {sender}']
+    lines = ['ETSY - CÓ TIN NHẮN MỚI', '--------------------', f'Từ: {sender}']
     if parsed.message_issue:
         lines.append(f'Vấn đề: {parsed.message_issue}')
     if parsed.message_resolution:
@@ -988,42 +998,39 @@ def _format_digest_message(events: list[GmailMonitorEvent], *, target_date: date
         totals[event.sale_currency] = totals.get(event.sale_currency, 0) + event.sale_total_cents
 
     lines = [
-        f'[ETSY TỔNG HỢP {target_date:%d/%m/%Y}]',
-        f'Sale mới: {len(sales)}',
-        f'Tin nhắn mới: {len(messages)}',
+        f'ETSY - TỔNG HỢP {target_date:%d/%m/%Y}',
+        '--------------------',
+        f'Sale mới: {len(sales)} đơn',
+        f'Doanh thu: {_money_map_label(total_by_currency)}',
+        f'Tin nhắn: {len(messages)}',
     ]
-    if total_by_currency:
-        totals = ', '.join(_format_money(cents, currency) for currency, cents in sorted(total_by_currency.items(), key=lambda item: item[0] or ''))
-        lines.append(f'Tổng sale: {totals}')
 
     if shop_summary:
-        lines.extend(['', 'Theo shop:'])
+        lines.extend(['', 'THEO SHOP'])
         for shop, summary in sorted(shop_summary.items(), key=lambda item: item[0].casefold()):
-            totals = summary['totals']
-            total_label = ''
-            if totals:
-                total_label = ' | ' + ', '.join(
-                    _format_money(cents, currency) for currency, cents in sorted(totals.items(), key=lambda item: item[0] or '')
-                )
-            lines.append(f'- {shop}: {summary["count"]} sale{total_label}')
+            total_label = _money_map_label(summary['totals'])
+            lines.append(f'• {shop}')
+            lines.append(f'  {summary["count"]} sale - {total_label}')
 
     if sales:
-        lines.extend(['', 'Top sale:'])
+        lines.extend(['', 'TOP SALE'])
         for index, event in enumerate(sales[:8], start=1):
             total = _format_money(event.sale_total_cents, event.sale_currency) if event.sale_total_cents is not None else 'không rõ tổng'
             buyer = event.buyer_username or event.buyer_name or 'không rõ khách'
             order = f'#{event.sale_order_id}' if event.sale_order_id else event.subject
-            shop = ''
+            shop = None
             if isinstance(event.payload, dict) and event.payload.get('shop'):
-                shop = f' | {event.payload["shop"]}'
-            lines.append(f'{index}. {order} | {total} | {buyer}{shop}')
+                shop = str(event.payload['shop'])
+            lines.append(f'{index}. {order} - {total}')
+            lines.append(f'   {buyer}' + (f' / {shop}' if shop else ''))
 
     if messages:
-        lines.extend(['', 'Tin nhắn mới:'])
+        lines.extend(['', 'TIN NHẮN'])
         for index, event in enumerate(messages[:8], start=1):
             sender = event.payload.get('message_sender_name') if isinstance(event.payload, dict) else None
             sender = sender or event.sender or 'Etsy buyer'
-            lines.append(f'{index}. {sender}: {_truncate_line(event.snippet or event.subject, 160)}')
+            lines.append(f'{index}. {sender}')
+            lines.append(f'   {_truncate_line(event.snippet or event.subject, 160)}')
 
     return '\n'.join(lines)
 

@@ -189,8 +189,8 @@ def test_save_and_enqueue_gmail_event_dedupes_by_gmail_message_id(db_session) ->
     notification = db_session.get(NotificationEvent, stored.notification_event_id)
     assert notification is not None
     assert notification.event_type == 'gmail_sale_new'
-    assert '[ETSY CÓ SALE MỚI]' in notification.payload['message']
-    assert 'Đơn #4059129411' in notification.payload['message']
+    assert 'ETSY - CÓ SALE MỚI' in notification.payload['message']
+    assert 'Đơn: #4059129411' in notification.payload['message']
     assert 'Shop: Ngoc Nguyen Ha' in notification.payload['message']
     assert 'Link:' not in notification.payload['message']
 
@@ -210,10 +210,11 @@ def test_gmail_daily_digest_summarizes_sales_and_messages(db_session) -> None:
     notification = db_session.get(NotificationEvent, result['notification_event_id'])
     assert notification is not None
     assert notification.event_type == 'gmail_daily_digest'
-    assert '[ETSY TỔNG HỢP 11/05/2026]' in notification.payload['message']
-    assert 'Sale mới: 1' in notification.payload['message']
-    assert 'Theo shop:' in notification.payload['message']
-    assert 'Ngoc Nguyen Ha: 1 sale' in notification.payload['message']
+    assert 'ETSY - TỔNG HỢP 11/05/2026' in notification.payload['message']
+    assert 'Sale mới: 1 đơn' in notification.payload['message']
+    assert 'THEO SHOP' in notification.payload['message']
+    assert '• Ngoc Nguyen Ha' in notification.payload['message']
+    assert '1 sale - US$39.40' in notification.payload['message']
     assert 'US$39.40' in notification.payload['message']
 
 
