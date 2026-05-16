@@ -99,7 +99,7 @@ Content-Type: multipart/alternative; boundary="etsy-boundary"
 --etsy-boundary
 Content-Type: text/plain; charset="utf-8"
 
-Shop:               Hazel Shop
+Shop:               Wrong Seller Name
 Buyer:              buyer123
 Transaction ID:     5072985898
 Item:               Personalized Jersey
@@ -112,6 +112,7 @@ Content-Type: text/html; charset="utf-8"
 
 <html><body>
 <img src="https://i.etsystatic.com/12345/r/il_570xN.1234567890_abcd.jpg" alt="Personalized Jersey" />
+<table><tr><td>Shop: AmzMageStore</td></tr></table>
 </body></html>
 
 --etsy-boundary--
@@ -142,7 +143,7 @@ def test_parse_etsy_sale_extracts_shop_and_thumbnail_from_html() -> None:
 
     assert parsed is not None
     assert parsed.event_type == 'sale'
-    assert parsed.shop == 'Hazel Shop'
+    assert parsed.shop == 'AmzMageStore'
     assert parsed.thumbnail_url == 'https://i.etsystatic.com/12345/r/il_570xN.1234567890_abcd.jpg'
 
 

@@ -233,6 +233,24 @@ def _line_field(name: str, text: str) -> str | None:
     return _first_match(rf'^{re.escape(name)}:\s*(.+)$', text, re.MULTILINE)
 
 
+def _line_fields(name: str, text: str) -> list[str]:
+    return [
+        _clean_text(match)
+        for match in re.findall(rf'^\s*{re.escape(name)}:\s*(.+)$', text, flags=re.MULTILINE)
+        if _clean_text(match)
+    ]
+
+
+def _extract_sale_shop(text: str, html: str) -> str | None:
+    # Etsy's plain-text "Shop:" can be the seller/display name. The product
+    # card in the HTML contains the storefront slug we want for routing.
+    html_text = _clean_text(re.sub(r'<[^>]+>', '\n', html))
+    html_shops = _line_fields('Shop', html_text)
+    if html_shops:
+        return html_shops[0]
+    return _line_field('Shop', text)
+
+
 def _extract_subject_sale(subject: str) -> tuple[str | None, str | None, str | None]:
     order_id = _first_match(r'Order\s+#([A-Za-z0-9_-]+)', subject, re.IGNORECASE)
     dispatch_by = _first_match(r'Dispatch by\s+(.+?)\s+-', subject, re.IGNORECASE)
@@ -387,7 +405,7 @@ def parse_email_message(
         parsed.dispatch_by = dispatch_by
         parsed.order_url = _first_match(r'(https?://(?:www\.)?etsy\.com/your/orders/[0-9]+)', text)
         parsed.thumbnail_url = _extract_thumbnail_url(html)
-        parsed.shop = _line_field('Shop', text)
+        parsed.shop = _extract_sale_shop(text, html)
         parsed.buyer_username = _line_field('Buyer', text)
         parsed.buyer_name = _first_match(r"<span class='name'>(.*?)</span>", text, re.DOTALL)
         parsed.buyer_email = _first_match(r'\*\s*Email\s+([^\s]+@[^\s]+)', text)
